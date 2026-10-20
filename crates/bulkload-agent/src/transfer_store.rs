@@ -436,6 +436,13 @@ pub enum RefusedOutput {
     /// seat's. Recorded under the seat's beside key with that file's
     /// identity, beside the live path's own record.
     BesideOccupied,
+    /// `--consolidate` (operator ruling 2026-10-20): the live path holds a
+    /// file this seat's class has no union for (or whose union held it),
+    /// with other bytes than the seat's: held
+    /// `HOMES_CONSOLIDATE_UNSUPPORTED`, nothing written. Recorded under the
+    /// seat's key with the live file's identity, so an unchanged rerun reads
+    /// nothing.
+    ConsolidateHeld,
 }
 
 impl RefusedOutput {
@@ -446,6 +453,7 @@ impl RefusedOutput {
             Self::ExchangeUnsupported => 2,
             Self::NotPrefix => 3,
             Self::BesideOccupied => 4,
+            Self::ConsolidateHeld => 5,
         }
     }
 
@@ -455,6 +463,7 @@ impl RefusedOutput {
             2 => Some(Self::ExchangeUnsupported),
             3 => Some(Self::NotPrefix),
             4 => Some(Self::BesideOccupied),
+            5 => Some(Self::ConsolidateHeld),
             _ => None,
         }
     }
@@ -467,6 +476,7 @@ impl RefusedOutput {
                 BulkloadRefusal::DestinationOccupied
             }
             Self::ExchangeUnsupported => BulkloadRefusal::DestinationExchangeUnsupported,
+            Self::ConsolidateHeld => BulkloadRefusal::HomesConsolidateUnsupported,
         }
     }
 }
@@ -844,7 +854,8 @@ impl Store {
                 CREATE TABLE IF NOT EXISTS refused_outputs (key BLOB PRIMARY KEY, kind INTEGER NOT NULL, identity BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS owned_outputs (key BLOB PRIMARY KEY, identity BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS prefix_extensions (path BLOB NOT NULL, prior_size INTEGER NOT NULL, prior_blake3 BLOB NOT NULL, identity BLOB NOT NULL, PRIMARY KEY (path, prior_size));
-                CREATE TABLE IF NOT EXISTS prefix_intents (path BLOB PRIMARY KEY, prior_size INTEGER NOT NULL, prior_blake3 BLOB NOT NULL, prior_identity BLOB NOT NULL);",
+                CREATE TABLE IF NOT EXISTS prefix_intents (path BLOB PRIMARY KEY, prior_size INTEGER NOT NULL, prior_blake3 BLOB NOT NULL, prior_identity BLOB NOT NULL);
+                CREATE TABLE IF NOT EXISTS consolidated (key BLOB PRIMARY KEY);",
             )
             .and_then(|()| {
                 conn.execute(
@@ -1241,6 +1252,39 @@ impl Store {
         self.conn
             .prepare_cached("SELECT EXISTS(SELECT 1 FROM outputs WHERE key = ?1)")
             .and_then(|mut statement| statement.query_row([key], |row| row.get(0)))
+            .map_err(sqlite_error)
+    }
+
+    /// `--consolidate` (operator ruling 2026-10-20): whether the seat under
+    /// `key` (its source identity) was consolidated into the live file on
+    /// an earlier pass. The source's bytes are in the destination's file
+    /// then, whatever the destination wrote since, so an unchanged seat is
+    /// reused and the source reads nothing.
+    ///
+    /// # Errors
+    /// Refuses database failures.
+    pub fn consolidated(&self, key: &[u8]) -> Result<bool> {
+        if !self.rows_trusted {
+            return Ok(false);
+        }
+        self.conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM consolidated WHERE key = ?1)")
+            .and_then(|mut statement| statement.query_row([key], |row| row.get(0)))
+            .map_err(sqlite_error)
+    }
+
+    /// Record that the seat under `key` is consolidated ([`Self::consolidated`]),
+    /// after the union's bytes are durable.
+    ///
+    /// # Errors
+    /// Refuses database failures.
+    pub fn record_consolidated(&self, key: &[u8]) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO consolidated VALUES (?1) ON CONFLICT(key) DO NOTHING",
+                [key],
+            )
+            .map(|_| ())
             .map_err(sqlite_error)
     }
 
@@ -2787,6 +2831,7 @@ mod tests {
             tables,
             [
                 "captures",
+                "consolidated",
                 "directories",
                 "output_hints",
                 "outputs",

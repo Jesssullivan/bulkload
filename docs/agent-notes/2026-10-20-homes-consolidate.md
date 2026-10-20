@@ -29,7 +29,7 @@ This lane owns three items:
 2. the structured-config merge;
 3. a report-only `--plan-only` for the homes.
 
-## Item 2: the structured-config merge (this commit)
+## Item 2: the structured-config merge (`80c505f`)
 
 Module `crates/bulkload-agent/src/consolidate/` (no new crate or
 dependency; R34 allows no JSON or TOML parser, so both are in-crate).
@@ -105,35 +105,110 @@ dependency; R34 allows no JSON or TOML parser, so both are in-crate).
   `HOMES_CONSOLIDATE_RACED`. The codes are strings in the refusal frame, so
   the wire frame version is unchanged.
 
-## Item 1: per-class dispatch (next)
+## The class interface (`7db6b11`)
 
-The dispatch belongs in the transfer engine's receive side, as a mode
-beside `--beside`, so the source's bytes are read once and nothing is
-staged beyond an entry's own private temporary. Plan:
+The #294 lane (append-log union) and the #278 lane (Codex SQLite row union)
+implement `consolidate::Union`:
 
-- `pull --consolidate` (the homes' default in `estate-move --sessions`,
-  replacing `--beside .LABEL` and `set_beside_always`) decides each
-  differing live file by class:
-  - **Append logs** (`*.jsonl`):
-    - a live prefix is extended in place (existing A-103 path);
-    - a live file the source is a prefix of is covered;
-    - a diverged one goes to the #294 lane's JSONL union.
-  - **Structured config:** `config::consolidate` with the staged bytes.
-  - **Codex SQLite:** the #278 lane's row union.
-  - **Other files:** equal bytes are adopted; differing bytes are a
-    `HOMES_CONSOLIDATE_UNSUPPORTED` hold, remembered under the settled
-    identities so an unchanged rerun reads nothing, and listed.
-- Until #294 and #278 land their unions, those two classes hold typed with
-  that code. They are listed and never besided.
-- The transfer record gets `consolidated` and `held` outcomes, which the
-  closure accounts for. A rerun with an unchanged source is stat-only.
+    pub type Union = fn(&Live<'_>, &Source<'_>, &Ledger) -> crate::Result<Outcome>;
 
-## Item 3: `--plan-only` for the homes (next)
+The coordinator relayed it. `union_of(Class::AppendLog | Class::Sqlite)`
+is `None` until they land: such files are held typed, listed, never
+besided. Per the coordinator's adjustment (a), the SQLite union is a row
+stream (`sqlite_union::consolidate`, fed by the source's `--sqlite-rows`
+session). So a Codex store and its `-wal`, `-shm` and `-journal` never
+take the file path. They are held at the decision, before any byte is
+read, whether or not the destination has one. Their conflicts go to this
+`Ledger` through `Ledger::connection()`.
 
-Report-only: every file of both homes with its class, its action
-(adopt, extend, covered, consolidate or hold, with the reason) and the
-sizes on both sides. Nothing is written. The operator sees it before
-anything lands.
+## Item 1: `pull --consolidate`, the `--sessions` default
+
+`copy`/`pull --consolidate [--consolidate-map SRC=DST]... [--plan-only]`.
+`--beside` and `--consolidate` exclude each other. A live destination file
+that differs from the seat is decided by its class
+(`transfer::plan_consolidating`):
+
+| Live file | Action |
+|---|---|
+| absent | landed, as any new path |
+| a link or another kind | held (`HOMES_CONSOLIDATE_UNSUPPORTED`) |
+| the seat's bytes | adopted |
+| append log, holds the seat's bytes as its first bytes | `covered`, nothing written |
+| append log, a proven prefix of the seat's | extended in place (A-103) |
+| append log, diverged | held until the #294 union lands |
+| JSON or TOML | received **in memory** (`memfd`), merged by `config::union`, dropped |
+| SQLite store or sidecar | held at the decision (adjustment a) |
+| anything else | held |
+
+- **No payload copy (SPEC rule 2, adjustment b).** A config's received
+  bytes are never on disk: `Destination::stage_in_memory` fills a
+  `memfd_create` file. The only temp beside the live file is the union's
+  atomic-rename temp of the merged result, which the exchange swaps in.
+  The tests check both:
+  - no payload byte in MOVE_STATE or in the destination state;
+  - no private name beside a live path.
+- **Never twice.**
+  - A consolidated or covered seat is recorded in the store's new
+    `consolidated` table (seat keys only), so an unchanged source is
+    reused with 0 source bytes even if the destination edited the merged
+    file since. The destination's later edits stand and are never undone
+    by a re-merge.
+  - A held seat is remembered (`RefusedOutput::ConsolidateHeld`, tag 5)
+    under the live file's settled identity: an unchanged rerun refuses it
+    again and reads nothing.
+- **Accounting.**
+  - A consolidated seat is a transfer-record row `consolidated` (new
+    `EntryOutcome`, appended so old records decode). The closure accounts
+    it as `covered`, with `"consolidation":"consolidate|covered"`, so the
+    closure schema is unchanged.
+  - Held seats are typed refusal rows, pending review, and hold the gate.
+- **`estate-move --sessions`.**
+  - Pulls both homes with `--consolidate`. The maps are the move's `--map`
+    set plus SOURCE_HOME → DEST_HOME, and the ledger is
+    `MOVE_STATE/consolidate/consolidate.sqlite`.
+  - Merges `~/.claude.json` by a `--file` pull. A source with none leaves
+    no record.
+  - There is no beside suffix and no always-beside Codex index.
+  - The re-seat gets no `--beside-suffix`.
+- **A-106 is a union now, never neo-wins.**
+  - `--replace-archived-dest` is no longer forwarded (`estate-move
+    a106=union-pending`).
+  - A source transcript or rollout whose live path is an archive link is
+    held at the pull.
+  - At the lane's key the re-seat keeps the destination's fork: its
+    archive link is regularized in place (OI-1003-Q198) and the archive is
+    untouched. Neo's copy is kept at its own key, `diverged`, so both are
+    kept until the append-log union merges them.
+
+## Item 3: `--plan-only` for the homes
+
+`estate-move --plan-only --sessions` runs the homes' pulls as a dry
+receive (`Consolidation::plan_only`). Every seat is decided and printed as
+`planned PATH class= action= source_size= live_size= [reason=]`; actions
+are create, adopt, extend, covered, consolidate or hold.
+
+What it never does:
+- stage, ask for chunks, create a directory or symlink, or write the store;
+- record a transfer (a plan never replaces a pass's record).
+
+Directories are answered `Skip`, and a planned file `Held{held:false}`, so
+the source records nothing either. A live home that does not exist yet is
+named, not made.
+
+## Known limits
+
+- An entry the source streams in place of its manifest (#77 F1, a source
+  that lost its manifest chunks) is staged as a stream is, on disk, before
+  it is judged. That temp is removed after the merge or hold. It is the one
+  path where rule 2's "no payload copy" holds only transiently.
+- On Darwin there is no `memfd`: a differing config is held typed there.
+  The homes destination is Linux.
+- With the Codex store held and no destination index, the re-seat refuses
+  `RESEAT_INDEX_ABSENT` until the row union lands. Where the destination
+  has an index, the source's rollouts are registered from their headers.
+- A writer that opened the live config before the union's exchange and
+  writes after its post-exchange check writes into the old inode. The
+  window is two syscalls long, the same class as A-106's residual.
 
 ## Receipts
 

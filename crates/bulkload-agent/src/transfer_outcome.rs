@@ -120,6 +120,12 @@ pub enum EntryOutcome {
     /// file. Appended after the earlier variants: a record from before it
     /// still decodes.
     AppliedBeside { beside: Vec<u8> },
+    /// `--consolidate` (operator ruling 2026-10-20): the seat's bytes are in
+    /// the differing live file, merged by its class's union (`consolidate`)
+    /// or already held by it (`covered`). Accounted: nothing was written
+    /// beside it. Appended after the earlier variants: a record from
+    /// before it still decodes.
+    Consolidated { action: String },
 }
 
 /// One path row of a session.
@@ -206,6 +212,14 @@ impl TransferRecord {
                         outcome: EntryOutcome::SidecarCovered,
                     });
                 }
+                for (path, action) in &stats.consolidated {
+                    record.entries.push(Entry {
+                        rel_path: path.clone(),
+                        outcome: EntryOutcome::Consolidated {
+                            action: action.clone(),
+                        },
+                    });
+                }
                 for (path, beside) in &stats.applied_beside {
                     record.entries.push(Entry {
                         rel_path: path.clone(),
@@ -268,6 +282,7 @@ fn entry_key(outcome: &EntryOutcome) -> String {
         EntryOutcome::Refused { refusal, .. } => refusal.code().to_owned(),
         EntryOutcome::SidecarCovered => "covered".to_owned(),
         EntryOutcome::AppliedBeside { .. } => "applied-beside".to_owned(),
+        EntryOutcome::Consolidated { .. } => "consolidated".to_owned(),
     }
 }
 

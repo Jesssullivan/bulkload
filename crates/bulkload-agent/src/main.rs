@@ -31,7 +31,7 @@ USAGE:
 SUBCOMMANDS:
     selftest    Hash a temporary file and round-trip a postcard frame
     walk PATH   Stat-walk PATH and print the row and refusal counts
-    copy [--file] [--beside SUFFIX] SOURCE DEST SOURCE_STATE DEST_STATE
+    copy [--file] [--beside SUFFIX | --consolidate [--consolidate-map SRC=DST]... [--plan-only]] SOURCE DEST SOURCE_STATE DEST_STATE
                 Native local copy with private resumable chunk stores; the
                 session's outcomes are recorded in
                 DEST_STATE/transfer.closure.d, one record per transfer, for
@@ -56,8 +56,25 @@ SUBCOMMANDS:
                 beside output is superseded. A live path is never replaced
                 under the flag. SUFFIX is one name component (e.g.
                 .neo-20261019). Without the flag a differing file is
-                refused DESTINATION_OCCUPIED and nothing is placed
-    pull [--file] [--beside SUFFIX] HOST SOURCE DEST SOURCE_STATE DEST_STATE [REMOTE_EXECUTABLE [SSH_CONFIG]]
+                refused DESTINATION_OCCUPIED and nothing is placed.
+                --consolidate (operator ruling 2026-10-20; SPEC RUL-10):
+                land into a live destination by union, never beside. A
+                differing file is judged by its class: an append log
+                (*.jsonl) is covered when the live file already holds
+                the source's bytes, extended when it is their prefix,
+                and otherwise held until the JSONL union lands (#294); a
+                JSON or TOML file is received in memory and merged key
+                by key into the live file (the later-modified side's
+                value kept where both differ, the other recorded in
+                DEST_STATE/consolidate/consolidate.sqlite); a SQLite
+                store, its sidecars and any other file are held. A held
+                file is refused HOMES_CONSOLIDATE_UNSUPPORTED with
+                nothing written. --consolidate-map SRC=DST: a source
+                path prefix is compared and written as DST. --plan-only:
+                every file is decided and printed (planned PATH class=
+                action= source_size= live_size=), and nothing is staged,
+                written or recorded
+    pull [--file] [--beside SUFFIX | --consolidate [--consolidate-map SRC=DST]... [--plan-only]] HOST SOURCE DEST SOURCE_STATE DEST_STATE [REMOTE_EXECUTABLE [SSH_CONFIG]]
                 Native SSH pull; remote bulkload-agent must be installed; the
                 session is recorded in DEST_STATE as copy's is. --file as
                 copy's, run on the source as serve --file; --beside as
@@ -1074,14 +1091,24 @@ fn global_flags(
 /// `copy [--file] ...` and `pull [--file] ...`: a leading `--file` (#232)
 /// names a single-file root.
 fn transfer_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
-    let args = beside_option(args)?;
-    let (kind, args) = root_kind(args);
-    let args = beside_option(args)?;
+    let (kind, consolidate, args) = transfer_options(args)?;
     let path = |index: usize| {
         args.get(index)
             .map(Path::new)
             .ok_or(BulkloadRefusal::RequiredFieldMissing)
     };
+    if let Some((maps, plan_only)) = consolidate {
+        // The ledger of the values a union did not keep, in DEST_STATE.
+        let state = match command {
+            "copy" => path(3)?,
+            _ => path(4)?,
+        };
+        bulkload_agent::transfer::set_consolidate(Some(bulkload_agent::transfer::Consolidation {
+            maps: bulkload_agent::consolidate::Maps::new(maps),
+            ledger: state.join("consolidate"),
+            plan_only,
+        }));
+    }
     match command {
         "copy" if args.len() == 4 => {
             // WP3 PR 4: the session's outcomes are closure rows.
@@ -1105,6 +1132,65 @@ fn serve_command(args: &[std::ffi::OsString]) -> Result<()> {
     // The reader thread owns stdin for the session; the process exit closes
     // the transport.
     bulkload_agent::transfer::serve_kind(input, &mut output.lock(), kind)
+}
+
+/// A transfer verb's leading options, in any order: `--file` (#232),
+/// `--beside SUFFIX` (C1/C2), and `--consolidate` with its
+/// `--consolidate-map SRC=DST` pairs and `--plan-only` (operator ruling
+/// 2026-10-20). `--beside` and `--consolidate` exclude each other;
+/// `--plan-only` and a map need `--consolidate`.
+#[allow(clippy::type_complexity)]
+fn transfer_options(
+    args: &[std::ffi::OsString],
+) -> Result<(
+    bulkload_agent::transfer::RootKind,
+    Option<(Vec<(String, String)>, bool)>,
+    &[std::ffi::OsString],
+)> {
+    let mut kind = bulkload_agent::transfer::RootKind::Tree;
+    let (mut consolidate, mut plan_only, mut beside) = (false, false, false);
+    let mut maps = Vec::new();
+    let mut rest = args;
+    loop {
+        let before = rest.len();
+        let (found, after) = root_kind(rest);
+        if after.len() < rest.len() {
+            kind = found;
+            rest = after;
+        }
+        let after = beside_option(rest)?;
+        if after.len() < rest.len() {
+            beside = true;
+            rest = after;
+        }
+        match rest.first().and_then(|word| word.to_str()) {
+            Some("--consolidate") => {
+                consolidate = true;
+                rest = rest.get(1..).unwrap_or_default();
+            }
+            Some("--plan-only") => {
+                plan_only = true;
+                rest = rest.get(1..).unwrap_or_default();
+            }
+            Some("--consolidate-map") => {
+                let pair = rest
+                    .get(1)
+                    .and_then(|pair| pair.to_str())
+                    .and_then(|pair| pair.split_once('='))
+                    .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+                maps.push((pair.0.to_owned(), pair.1.to_owned()));
+                rest = rest.get(2..).unwrap_or_default();
+            }
+            _ => {}
+        }
+        if rest.len() == before {
+            break;
+        }
+    }
+    if (beside && consolidate) || (!consolidate && (plan_only || !maps.is_empty())) {
+        return Err(BulkloadRefusal::FieldDomainViolation);
+    }
+    Ok((kind, consolidate.then_some((maps, plan_only)), rest))
 }
 
 /// Split a leading `--file` (#232) from a transfer verb's arguments: the
@@ -2515,16 +2601,6 @@ fn take_listed() -> Option<Vec<Vec<u8>>> {
         .take()
 }
 
-fn copy_recorded(source: &Path, dest: &Path, source_state: &Path, dest_state: &Path) -> Result<()> {
-    copy_recorded_kind(
-        bulkload_agent::transfer::RootKind::Tree,
-        source,
-        dest,
-        source_state,
-        dest_state,
-    )
-}
-
 // #232: `copy_recorded` of a root of `kind` (`copy --file`).
 fn copy_recorded_kind(
     kind: bulkload_agent::transfer::RootKind,
@@ -2533,6 +2609,20 @@ fn copy_recorded_kind(
     source_state: &Path,
     dest_state: &Path,
 ) -> Result<()> {
+    // `--plan-only`: nothing is recorded; the plan is printed.
+    if bulkload_agent::transfer::plan_only() {
+        bulkload_agent::transfer::copy_roots_apart_kind(
+            source,
+            dest,
+            source_state,
+            dest_state,
+            kind,
+        )?;
+        let stats =
+            bulkload_agent::transfer::copy_kind(source, dest, source_state, dest_state, kind)?;
+        keep_listed(&stats);
+        return report_transfer(&stats);
+    }
     let stats = bulkload_agent::transfer_outcome::record_session(
         dest_state,
         "copy",
@@ -2557,10 +2647,6 @@ fn copy_recorded_kind(
 // WP3 PR 4: a pull session's outcomes are closure rows, keyed on
 // HOST:SOURCE and the canonical DEST, recorded in DEST_STATE around the
 // session (`pull_command`, whose ssh child the S2 registry pins).
-fn pull_recorded(args: &[std::ffi::OsString]) -> Result<()> {
-    pull_recorded_kind(bulkload_agent::transfer::RootKind::Tree, args)
-}
-
 // #232: `pull_recorded` of a root of `kind` (`pull --file`).
 fn pull_recorded_kind(
     kind: bulkload_agent::transfer::RootKind,
@@ -2572,6 +2658,13 @@ fn pull_recorded_kind(
             .ok_or(BulkloadRefusal::RequiredFieldMissing)
     };
     let host = args.first().ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+    // `--plan-only`: nothing is recorded; the plan is printed.
+    if bulkload_agent::transfer::plan_only() {
+        bulkload_agent::transfer::receive_roots_apart_kind(path(2)?, path(4)?, kind)?;
+        let stats = pull_command(kind, args)?;
+        keep_listed(&stats);
+        return report_transfer(&stats);
+    }
     bulkload_agent::transfer_outcome::record_session(
         path(4)?,
         "pull",
@@ -2895,7 +2988,7 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
     println!(
         "completed={} reused={} bytes_received={} source_bytes_read={} refusals={} \
          source_engine_temporaries={} capped_subtrees={} sqlite_mode={} sqlite_snapshots={} \
-         sqlite_sidecars_covered={} applied_beside={}",
+         sqlite_sidecars_covered={} applied_beside={} consolidated={} held={} planned={}",
         stats.completed,
         stats.reused,
         stats.bytes_received,
@@ -2906,8 +2999,34 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
         bulkload_agent::transfer::sqlite_mode_label(stats.sqlite_mode),
         stats.sqlite_snapshots.len(),
         stats.sqlite_sidecars_covered.len(),
-        stats.applied_beside.len()
+        stats.applied_beside.len(),
+        stats.consolidated.len(),
+        stats.held.len(),
+        stats.planned.len(),
     );
+    for (path, action) in &stats.consolidated {
+        eprintln!("consolidated {} action={action}", path.escape_ascii());
+    }
+    for (path, reason) in &stats.held {
+        eprintln!(
+            "held {}: HOMES_CONSOLIDATE_UNSUPPORTED reason=\"{reason}\"",
+            path.escape_ascii()
+        );
+    }
+    // `--plan-only`: every seat and its action, on stdout.
+    for seat in &stats.planned {
+        println!(
+            "planned {} class={} action={} source_size={} live_size={}{}",
+            seat.rel_path.escape_ascii(),
+            seat.class,
+            seat.action,
+            seat.source_size,
+            seat.live_size
+                .map_or_else(|| "-".to_owned(), |size| size.to_string()),
+            seat.reason
+                .map_or_else(String::new, |reason| format!(" reason=\"{reason}\"")),
+        );
+    }
     for (path, beside) in &stats.applied_beside {
         eprintln!(
             "applied-beside {} at={}",

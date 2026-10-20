@@ -1445,6 +1445,30 @@ impl Destination {
             file: Arc::new(file),
             sealed: false,
             sqlite: false,
+            in_memory: false,
+        })
+    }
+
+    /// Stage `row` in memory, never on disk (operator ruling 2026-10-20;
+    /// SPEC rule 2): a consolidation's received bytes, which its union
+    /// reads and which are dropped with the file. It is filled as any
+    /// staged file is and never published.
+    ///
+    /// # Errors
+    /// `HOMES_CONSOLIDATE_UNSUPPORTED` where no in-memory file exists
+    /// (Darwin); an unsafe ancestor.
+    pub(crate) fn stage_in_memory(&self, row: &RowSchema) -> Result<StagedFile> {
+        let (parent, leaf) = self.shared_parent(&row.rel_path)?;
+        let file = crate::io::sys::memory_file()
+            .map_err(|_| BulkloadRefusal::HomesConsolidateUnsupported)?;
+        Ok(StagedFile {
+            parent,
+            temporary: CString::default(),
+            leaf,
+            file: Arc::new(File::from(file)),
+            sealed: false,
+            sqlite: false,
+            in_memory: true,
         })
     }
 
@@ -1571,6 +1595,9 @@ pub(crate) struct StagedFile {
     /// superseding exchange, first checks once more that no `-wal`,
     /// `-journal` or `-shm` sits beside the leaf (OI-1003-Q146).
     sqlite: bool,
+    /// Staged in memory ([`Destination::stage_in_memory`]): no temporary
+    /// name, never published.
+    in_memory: bool,
 }
 
 impl StagedFile {
@@ -1634,12 +1661,28 @@ impl StagedFile {
     /// # Errors
     /// Returns a failed unlink.
     pub(crate) fn discard(self) -> Result<()> {
+        if self.in_memory {
+            return Ok(());
+        }
         unlink(&self.parent, &self.temporary)
+    }
+
+    /// The directory the file was staged for, open.
+    pub(crate) const fn parent(&self) -> &Arc<File> {
+        &self.parent
+    }
+
+    /// The name it was staged for.
+    pub(crate) fn leaf(&self) -> &[u8] {
+        self.leaf.as_bytes()
     }
 
     /// Seal the data, then rename into place without replacing anything.
     /// The identity is taken from the open file after the rename.
     fn publish(mut self) -> Result<(StatIdentity, Arc<File>)> {
+        if self.in_memory {
+            return Err(BulkloadRefusal::ProtocolStateViolation);
+        }
         if let Err(error) = self.seal() {
             let _ = unlink(&self.parent, &self.temporary);
             return Err(error);
@@ -2920,6 +2963,82 @@ pub(crate) fn verify_existing(
         return Err(BulkloadRefusal::DestinationOccupied);
     }
     Ok(identity)
+}
+
+/// Whether `file` holds the manifest's bytes as its first bytes: it is at
+/// least as long, and every manifest chunk, read at its place, hashes to
+/// its digest. A live append log the source's is a prefix of (the
+/// destination continued it) covers the source's (operator ruling
+/// 2026-10-20). Nothing is written.
+///
+/// # Errors
+/// The read refusals.
+pub(crate) fn covers(file: &File, manifest: &Manifest) -> Result<bool> {
+    let Some(size) = manifest.size() else {
+        return Ok(false);
+    };
+    let before = file.metadata().refuse_at("materialize::covers")?;
+    if before.len() < size || !before.is_file() {
+        return Ok(false);
+    }
+    let mut buffer = vec![0; crate::hash::CDC_MAX_BYTES as usize];
+    let mut offset = 0_u64;
+    for chunk in &manifest.chunks {
+        let length = usize::try_from(chunk.size).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
+        let slot = buffer
+            .get_mut(..length)
+            .ok_or(BulkloadRefusal::BudgetExceeded)?;
+        let read =
+            crate::io::sys::pread_full(file, slot, offset).refuse_at("materialize::covers")?;
+        counters::add_len(Counter::DestVerifyRead, read);
+        if read != length || counters::hash(Counter::HashVerifyExisting, slot) != chunk.digest {
+            return Ok(false);
+        }
+        offset = offset.saturating_add(chunk.size);
+    }
+    Ok(
+        StatIdentity::from_metadata(&file.metadata().refuse_at("materialize::covers")?)
+            == StatIdentity::from_metadata(&before),
+    )
+}
+
+/// Whether `file` is shorter than the manifest's bytes and every manifest
+/// chunk that ends within it, read at its place, hashes to its digest: a
+/// planned prefix extension (`--plan-only`). The chunk it ends inside is
+/// not judged; the extension itself compares it before appending.
+///
+/// # Errors
+/// The read refusals.
+pub(crate) fn prefix_holds(file: &File, manifest: &Manifest) -> Result<bool> {
+    let Some(size) = manifest.size() else {
+        return Ok(false);
+    };
+    let held = file
+        .metadata()
+        .refuse_at("materialize::prefix_holds")?
+        .len();
+    if held >= size {
+        return Ok(false);
+    }
+    let mut buffer = vec![0; crate::hash::CDC_MAX_BYTES as usize];
+    let mut offset = 0_u64;
+    for chunk in &manifest.chunks {
+        let end = offset.saturating_add(chunk.size);
+        if end > held {
+            break;
+        }
+        let length = usize::try_from(chunk.size).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
+        let slot = buffer
+            .get_mut(..length)
+            .ok_or(BulkloadRefusal::BudgetExceeded)?;
+        let read = crate::io::sys::pread_full(file, slot, offset)
+            .refuse_at("materialize::prefix_holds")?;
+        if read != length || counters::hash(Counter::HashVerifyExisting, slot) != chunk.digest {
+            return Ok(false);
+        }
+        offset = end;
+    }
+    Ok(true)
 }
 
 /// The `(dev, ino)` of a directory record committed before its `mkdirat`

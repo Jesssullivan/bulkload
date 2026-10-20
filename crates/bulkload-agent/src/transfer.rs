@@ -346,6 +346,16 @@ pub struct TransferStats {
     /// reported `applied-beside` and is an `applied-beside` row of the
     /// session's transfer record, accounted in closure.
     pub applied_beside: Vec<(Vec<u8>, Vec<u8>)>,
+    /// `--consolidate`: seats whose bytes are now in a differing live file,
+    /// by path, with the action: `consolidate` (merged by the class's
+    /// union) or `covered` (the live file already held them). Each is a
+    /// `consolidated` row of the session's transfer record, accounted.
+    pub consolidated: Vec<(Vec<u8>, String)>,
+    /// `--consolidate`: seats held `HOMES_CONSOLIDATE_UNSUPPORTED`, nothing
+    /// written, with why. Each is also in [`Self::refusals`].
+    pub held: Vec<(Vec<u8>, &'static str)>,
+    /// `--plan-only`: every seat's planned action.
+    pub planned: Vec<PlannedSeat>,
 }
 
 impl TransferStats {
@@ -1432,6 +1442,107 @@ fn beside_always() -> HashSet<Vec<u8>> {
         .iter()
         .cloned()
         .collect()
+}
+
+/// `--consolidate`: land into a live destination by union, never beside.
+///
+/// Operator ruling 2026-10-20: the agent homes are consolidated, never
+/// landed beside (SPEC RUL-10, C10). A live destination
+/// file that differs from the seat is merged by its class's union
+/// ([`crate::consolidate::union_of`]); a class with no union yet, or a file
+/// its union cannot carry, is held `HOMES_CONSOLIDATE_UNSUPPORTED` with
+/// nothing written. The source's bytes are received in memory, never staged
+/// on disk (SPEC rule 2).
+#[derive(Debug, Clone)]
+pub struct Consolidation {
+    /// The `--map` set: a source host path is compared and written as the
+    /// destination's.
+    pub maps: crate::consolidate::Maps,
+    /// The directory of the consolidation ledger.
+    pub ledger: PathBuf,
+    /// `--plan-only`: every seat is decided and reported
+    /// ([`TransferStats::planned`]); nothing is staged, written or recorded.
+    pub plan_only: bool,
+}
+
+static CONSOLIDATE: Mutex<Option<Arc<Consolidation>>> = Mutex::new(None);
+
+/// The consolidation by canonical destination root, for tests that run
+/// sessions with and without it in one process.
+static CONSOLIDATE_OVERRIDE: Mutex<Vec<(PathBuf, Option<Arc<Consolidation>>)>> =
+    Mutex::new(Vec::new());
+
+/// Run every session of this process with `--consolidate` (`None`: off).
+pub fn set_consolidate(settings: Option<Consolidation>) {
+    *CONSOLIDATE.lock().unwrap_or_else(PoisonError::into_inner) = settings.map(Arc::new);
+}
+
+/// Run sessions into the canonical destination `root` with `settings`
+/// (`Some(None)`: off for this root; `None`: the process setting again).
+/// Test hook.
+#[doc(hidden)]
+pub fn set_consolidate_for(root: &Path, settings: Option<Option<Consolidation>>) {
+    let mut overrides = CONSOLIDATE_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    overrides.retain(|(at, _)| at != root);
+    if let Some(settings) = settings {
+        overrides.push((root.to_path_buf(), settings.map(Arc::new)));
+    }
+}
+
+/// The consolidation sessions into the canonical destination `root` run
+/// with.
+fn consolidation(root: &Path) -> Option<Arc<Consolidation>> {
+    CONSOLIDATE_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(at, _)| at == root)
+        .map_or_else(
+            || {
+                CONSOLIDATE
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone()
+            },
+            |(_, settings)| settings.clone(),
+        )
+}
+
+/// Whether this process's sessions only plan (`--plan-only`): nothing is
+/// written, and a recorded verb records nothing.
+#[must_use]
+pub fn plan_only() -> bool {
+    CONSOLIDATE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|settings| settings.plan_only)
+}
+
+/// Why an append log that diverged is held: its union is the #294 lane's.
+const APPEND_LOG_PENDING: &str = "append-log: diverged, and the JSONL union (#294) has not landed";
+/// Why a `SQLite` store (or its `-wal`, `-shm`, `-journal`) is held: its
+/// union is the #278 lane's row stream (`--sqlite-rows`), never this file
+/// path.
+const SQLITE_PENDING: &str = "sqlite: the row union (#278) has not landed";
+/// Why a live path of another kind is held.
+const OTHER_KIND: &str = "the live path is a link or another kind";
+
+/// One seat's planned action under `--plan-only`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedSeat {
+    pub rel_path: Vec<u8>,
+    /// [`crate::consolidate::Class::word`], or `symlink`.
+    pub class: &'static str,
+    /// `create`, `adopt`, `extend`, `covered`, `consolidate` or `hold`.
+    pub action: &'static str,
+    pub source_size: u64,
+    /// The live file's size, when there is one.
+    pub live_size: Option<u64>,
+    /// Why it is held.
+    pub reason: Option<&'static str>,
 }
 
 /// The prefixes of the seats a session lists ([`TransferStats::listed`]).
@@ -4435,6 +4546,8 @@ struct ReceiveContext<'a> {
     displaced: &'a SharedDisplaced,
     session: &'a SessionChunks,
     salvage: &'a Salvage,
+    /// `--consolidate` ([`Consolidation`]).
+    consolidate: Option<&'a Consolidation>,
 }
 
 /// Chunks of this store's orphaned temporaries (see
@@ -4527,6 +4640,8 @@ fn finish_receive(
     }
     stats.applied_beside.sort();
     stats.applied_beside.dedup();
+    stats.consolidated.sort();
+    stats.consolidated.dedup();
     counters::add(
         Counter::DestAppliedBeside,
         stats.applied_beside.len() as u64,
@@ -5445,6 +5560,14 @@ struct Inbound<'a, W> {
     redirects: HashMap<Vec<u8>, Vec<u8>>,
     /// The listing prefixes ([`set_listing`]).
     listing: Vec<Vec<u8>>,
+    /// `--consolidate` for this session's root ([`consolidation`]).
+    consolidate: Option<Arc<Consolidation>>,
+    /// The consolidation ledger, opened at the first union.
+    consolidate_ledger: Option<crate::consolidate::Ledger>,
+    /// Set when an entry's end answered it itself (a consolidation, or a
+    /// plan): `Held` with this value is sent at once, never awaited from a
+    /// group commit.
+    answered_now: Option<bool>,
 }
 
 /// A walk frame: what a batch of new directories holds back.
@@ -5738,6 +5861,7 @@ fn receive_session<R: Read, W: Write>(
             .iter()
             .any(|root| root == target.path());
         let beside = beside_suffix(target.path());
+        let consolidate = consolidation(target.path());
         let mut receiver = Inbound {
             output,
             hand,
@@ -5786,6 +5910,9 @@ fn receive_session<R: Read, W: Write>(
             always: beside_always(),
             redirects: HashMap::new(),
             listing: listing(),
+            consolidate,
+            consolidate_ledger: None,
+            answered_now: None,
         };
         drop(setup_timer);
         let source_bytes_read = {
@@ -6001,7 +6128,8 @@ impl<W: Write> Inbound<'_, W> {
     /// directories (see [`DirectoryBatch`]).
     fn walked(&mut self, frame: Walked) -> Result<()> {
         let cap = self.target.batch();
-        if cap <= 1 {
+        // A plan creates nothing: no directory is batched.
+        if cap <= 1 || self.planning() {
             return self.handle_walked(frame);
         }
         let directory = match &frame {
@@ -6194,6 +6322,13 @@ impl<W: Write> Inbound<'_, W> {
             None
         };
         let decided = match row.kind {
+            // `--plan-only`: a directory is never created, a symlink never
+            // made; each is reported.
+            FileKind::Directory if self.planning() => Ok(Decision::Skip),
+            FileKind::Symlink if self.planning() => {
+                self.plan_symlink(&row);
+                Ok(Decision::Skip)
+            }
             FileKind::Directory => self.batched.remove(&row.rel_path).map_or_else(
                 || self.decide_directory(&row),
                 |created| created.map(|()| Decision::Skip),
@@ -6607,6 +6742,9 @@ impl<W: Write> Inbound<'_, W> {
         snapshot: Option<&(Vec<u8>, [u8; 32])>,
         snapshot_mode: bool,
     ) -> Result<Decision> {
+        if let Some(settings) = self.consolidate.clone() {
+            return self.decide_consolidating(row, key, &settings);
+        }
         if !self.claim(&row.rel_path) {
             return Err(BulkloadRefusal::DestinationOccupied);
         }
@@ -6680,6 +6818,159 @@ impl<W: Write> Inbound<'_, W> {
                 Decision::Send
             },
         )
+    }
+
+    /// Whether this session only plans (`--plan-only`).
+    fn planning(&self) -> bool {
+        self.consolidate
+            .as_ref()
+            .is_some_and(|settings| settings.plan_only)
+    }
+
+    /// `--consolidate` (operator ruling 2026-10-20): a regular seat, decided
+    /// by its class. A `SQLite` store (and its sidecars) is the row union's,
+    /// never this file path's, and is held until that union lands; a live
+    /// path of another kind is held; a seat consolidated before, or this
+    /// store's own output, is reused; one refused before against the same
+    /// live file is refused again with nothing read. An absent live path is
+    /// landed as before; any other is asked for by manifest and judged when
+    /// it arrives ([`plan_consolidating`]).
+    fn decide_consolidating(
+        &mut self,
+        row: &RowSchema,
+        key: &[u8],
+        settings: &Consolidation,
+    ) -> Result<Decision> {
+        use crate::consolidate::{union_of, Class};
+        let class = Class::of(&row.rel_path, false);
+        let plan = settings.plan_only;
+        if class == Class::Sqlite && union_of(class).is_none() {
+            return self.hold_seat(row, class, None, SQLITE_PENDING, plan);
+        }
+        let identity = match self.target.identity(row) {
+            Ok(identity) => identity,
+            Err(
+                BulkloadRefusal::DestinationOccupied | BulkloadRefusal::DestinationKindMismatch,
+            ) => {
+                return self.hold_seat(row, class, None, OTHER_KIND, plan);
+            }
+            // A plan creates no directory: one the seat would be landed in
+            // is still absent.
+            Err(
+                BulkloadRefusal::Io(Some(libc::ENOENT)) | BulkloadRefusal::DestinationParentMissing,
+            ) if plan => None,
+            Err(refusal) => return Err(refusal),
+        };
+        let live_size = identity.as_ref().map(|identity| identity.size);
+        if self.store.consolidated(key)? {
+            return Ok(self.reuse_seat(row, class, "covered", live_size, plan));
+        }
+        let Some(identity) = identity else {
+            if plan {
+                self.plan_seat(row, class.word(), "create", None, None);
+                return Ok(Decision::Skip);
+            }
+            return Ok(if self.wants_manifest(row, false, std::iter::once(key))? {
+                Decision::WantManifest
+            } else {
+                Decision::Send
+            });
+        };
+        if self.store.output_matches(key, &identity)? {
+            return Ok(self.reuse_seat(row, class, "adopt", live_size, plan));
+        }
+        if let Some(refused) = self.remembered_refusal(row, key, &identity)? {
+            if plan {
+                self.plan_seat(
+                    row,
+                    class.word(),
+                    "hold",
+                    live_size,
+                    Some("held before, and unchanged since"),
+                );
+                return Ok(Decision::Skip);
+            }
+            return Err(refused.refusal());
+        }
+        Ok(Decision::WantManifest)
+    }
+
+    /// A seat reused (or, planning, reported as `action`).
+    fn reuse_seat(
+        &mut self,
+        row: &RowSchema,
+        class: crate::consolidate::Class,
+        action: &'static str,
+        live_size: Option<u64>,
+        plan: bool,
+    ) -> Decision {
+        if plan {
+            self.plan_seat(row, class.word(), action, live_size, None);
+            return Decision::Skip;
+        }
+        self.stats.reused += 1;
+        Decision::Reuse
+    }
+
+    /// A seat held `HOMES_CONSOLIDATE_UNSUPPORTED` at its decision, nothing
+    /// read (or, planning, reported held).
+    fn hold_seat(
+        &mut self,
+        row: &RowSchema,
+        class: crate::consolidate::Class,
+        live_size: Option<u64>,
+        reason: &'static str,
+        plan: bool,
+    ) -> Result<Decision> {
+        if plan {
+            self.plan_seat(row, class.word(), "hold", live_size, Some(reason));
+            return Ok(Decision::Skip);
+        }
+        self.stats.held.push((row.rel_path.clone(), reason));
+        Err(BulkloadRefusal::HomesConsolidateUnsupported)
+    }
+
+    /// Report a seat's planned action (`--plan-only`).
+    fn plan_seat(
+        &mut self,
+        row: &RowSchema,
+        class: &'static str,
+        action: &'static str,
+        live_size: Option<u64>,
+        reason: Option<&'static str>,
+    ) {
+        self.stats.planned.push(PlannedSeat {
+            rel_path: row.rel_path.clone(),
+            class,
+            action,
+            source_size: row.size,
+            live_size,
+            reason,
+        });
+    }
+
+    /// `--plan-only`: a symlink seat, judged by what its live path holds.
+    fn plan_symlink(&mut self, row: &RowSchema) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let live = self
+            .target
+            .path()
+            .join(std::ffi::OsStr::from_bytes(&row.rel_path));
+        let (action, reason) = match std::fs::symlink_metadata(&live) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => ("create", None),
+            Ok(found)
+                if found.file_type().is_symlink()
+                    && std::fs::read_link(&live)
+                        .ok()
+                        .as_deref()
+                        .map(|target| target.as_os_str().as_bytes().to_vec())
+                        == row.link_target =>
+            {
+                ("adopt", None)
+            }
+            _ => ("hold", Some(OTHER_KIND)),
+        };
+        self.plan_seat(row, "symlink", action, None, reason);
     }
 
     /// Whether `row` lands beside under `--beside` whatever its live path
@@ -6897,6 +7188,7 @@ impl<W: Write> Inbound<'_, W> {
     }
 
     /// Plan a manifest's entry and request only what cannot be filled here.
+    #[allow(clippy::too_many_lines)] // Validate, plan (consolidate, beside), ask, file.
     fn manifest(&mut self, entry: u64, root: [u8; 32], chunks: Vec<ChunkSpec>) -> Result<()> {
         if chunks.len() > MAX_MANIFEST_CHUNKS {
             return Err(BulkloadRefusal::FrameCodec);
@@ -6935,6 +7227,7 @@ impl<W: Write> Inbound<'_, W> {
                     displaced: &self.displaced,
                     session: &self.session,
                     salvage: &self.salvage,
+                    consolidate: self.consolidate.as_deref(),
                 },
                 // A snapshot's output is never extended (#218).
                 Planned {
@@ -6971,7 +7264,10 @@ impl<W: Write> Inbound<'_, W> {
             | Plan::Adopt(..)
             | Plan::NoExchange(_)
             | Plan::NotPrefix(_)
-            | Plan::BesideRefused { .. } => (Vec::new(), None),
+            | Plan::BesideRefused { .. }
+            | Plan::Covered
+            | Plan::Held { .. }
+            | Plan::Dry(_) => (Vec::new(), None),
         };
         self.claim_planned(&plan);
         write_control(
@@ -7182,6 +7478,7 @@ impl<W: Write> Inbound<'_, W> {
         // Every write of the entry lands before its file is checked,
         // published or discarded (item 3): its submit, so its seal, follows.
         self.settle_entry(entry)?;
+        self.answered_now = None;
         let incoming = self
             .incoming
             .remove(&entry)
@@ -7223,7 +7520,18 @@ impl<W: Write> Inbound<'_, W> {
         // capture, which therefore never costs a source read again. An
         // output queued under its beside path (`--beside`) is awaited
         // under that path, which the committer's outcome names.
+        let answered = self.answered_now.take();
         match outcome {
+            Ok(_) if answered.is_some() => {
+                self.release(entry);
+                write_control(
+                    self.output,
+                    &Control::Held {
+                        entry,
+                        held: answered.unwrap_or(false),
+                    },
+                )?;
+            }
             Ok(beside) => {
                 let held_as = match beside {
                     Some(beside) => {
@@ -7345,6 +7653,30 @@ impl<W: Write> Inbound<'_, W> {
             root,
             chunks: specs,
         };
+        // `--consolidate`: a streamed entry is judged by its class, as a
+        // planned one is; a plan writes nothing, whatever the path holds.
+        if let Some(settings) = self.consolidate.clone() {
+            let occupied = !matches!(self.target.existing(&row), Ok(None));
+            if checked.is_ok() && (adopt || settings.plan_only) && occupied {
+                return self.end_streamed_consolidating(
+                    staged,
+                    &row,
+                    (key, record, racy, root),
+                    &manifest,
+                    &settings,
+                );
+            }
+            if settings.plan_only {
+                if let Some(staged) = staged {
+                    let _ = staged.discard();
+                }
+                checked?;
+                let class = crate::consolidate::Class::of(&row.rel_path, snapshot);
+                self.plan_seat(&row, class.word(), "create", None, None);
+                self.answered_now = Some(false);
+                return Ok(None);
+            }
+        }
         // M2r2 A-103: a grown file with no owning record, extended from the
         // streamed copy (its whole prefix compared, `base` 0).
         let mut grown = None;
@@ -7519,6 +7851,7 @@ impl<W: Write> Inbound<'_, W> {
                         displaced: &self.displaced,
                         session: &self.session,
                         salvage: &self.salvage,
+                        consolidate: self.consolidate.as_deref(),
                     },
                     &beside,
                     &manifest,
@@ -7573,6 +7906,216 @@ impl<W: Write> Inbound<'_, W> {
         }
         self.publish(staged, &row, (key, record, racy, root), hints, supersede)
             .map(|()| land_beside)
+    }
+
+    /// `--consolidate`: the live file already holds the seat's bytes; the
+    /// seat is recorded consolidated, so an unchanged one is reused next
+    /// pass. Answered at once: nothing is published.
+    fn covered(&mut self, row: &RowSchema, key: &[u8], racy: bool) -> Result<Option<Vec<u8>>> {
+        if !racy {
+            self.store.record_consolidated(key)?;
+        }
+        self.stats
+            .consolidated
+            .push((row.rel_path.clone(), "covered".to_owned()));
+        self.stats.completed += 1;
+        self.answered_now = Some(true);
+        Ok(None)
+    }
+
+    /// `--consolidate`: merge the received bytes in `staged` (in memory)
+    /// into the live file by `class`'s union, then drop them. A held union
+    /// is remembered under the live file's identity; any other outcome
+    /// records the seat consolidated and answers it at once.
+    fn consolidate_staged(
+        &mut self,
+        staged: StagedFile,
+        row: &RowSchema,
+        key: &[u8],
+        class: crate::consolidate::Class,
+        racy: bool,
+    ) -> Result<Option<Vec<u8>>> {
+        let ran = self.run_union(&staged, row, class);
+        let _ = staged.discard();
+        let (outcome, before) = ran?;
+        match outcome.action {
+            crate::consolidate::Action::Held(reason) => {
+                self.stats.held.push((row.rel_path.clone(), reason));
+                self.remember_refusal(key, before, racy, RefusedOutput::ConsolidateHeld);
+                Err(BulkloadRefusal::HomesConsolidateUnsupported)
+            }
+            action => {
+                if !racy {
+                    self.store.record_consolidated(key)?;
+                }
+                self.stats
+                    .consolidated
+                    .push((row.rel_path.clone(), action.word().to_owned()));
+                self.stats.completed += 1;
+                self.answered_now = Some(true);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Run `class`'s union of `staged` into the live file, with the live
+    /// file's identity before it (what a hold is remembered under).
+    fn run_union(
+        &mut self,
+        staged: &StagedFile,
+        row: &RowSchema,
+        class: crate::consolidate::Class,
+    ) -> Result<(crate::consolidate::Outcome, Option<StatIdentity>)> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::ffi::OsStrExt as _;
+        let settings = self
+            .consolidate
+            .clone()
+            .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
+        let before = self
+            .target
+            .existing(row)
+            .ok()
+            .flatten()
+            .and_then(|(file, _)| file.metadata().ok())
+            .map(|found| StatIdentity::from_metadata(&found));
+        let Some(union) = crate::consolidate::union_of(class) else {
+            let reason = if class == crate::consolidate::Class::Sqlite {
+                SQLITE_PENDING
+            } else {
+                APPEND_LOG_PENDING
+            };
+            return Ok((
+                crate::consolidate::Outcome {
+                    action: crate::consolidate::Action::Held(reason),
+                    written: 0,
+                    recorded: 0,
+                },
+                before,
+            ));
+        };
+        if self.consolidate_ledger.is_none() {
+            self.consolidate_ledger = Some(crate::consolidate::Ledger::open(&settings.ledger)?);
+        }
+        let ledger = self
+            .consolidate_ledger
+            .as_ref()
+            .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
+        let live_path = self
+            .target
+            .path()
+            .join(std::ffi::OsStr::from_bytes(&row.rel_path));
+        // An in-memory file has no name: a union that opens by path opens
+        // this one.
+        let source_path = PathBuf::from(format!("/proc/self/fd/{}", staged.file().as_raw_fd()));
+        let outcome = union(
+            &crate::consolidate::Live {
+                dir: staged.parent(),
+                name: staged.leaf(),
+                path: &live_path,
+                rel: &row.rel_path,
+            },
+            &crate::consolidate::Source {
+                file: staged.file(),
+                path: &source_path,
+                size: row.size,
+                mtime_ns: row.mtime_ns,
+                maps: &settings.maps,
+            },
+            ledger,
+        )?;
+        Ok((outcome, before))
+    }
+
+    /// `--consolidate`: an entry streamed in place of its manifest (#77
+    /// review F1) whose live path was occupied when it was decided. Its
+    /// whole content is staged (as a stream is), so it is judged here as a
+    /// planned one is: adopted, covered, merged by a config union, or held.
+    /// Under `--plan-only` it is reported, and nothing is written.
+    fn end_streamed_consolidating(
+        &mut self,
+        staged: Option<StagedFile>,
+        row: &RowSchema,
+        (key, record, racy, root): (Vec<u8>, [u8; 32], bool, [u8; 32]),
+        manifest: &Manifest,
+        settings: &Consolidation,
+    ) -> Result<Option<Vec<u8>>> {
+        use crate::consolidate::Class;
+        let class = Class::of(&row.rel_path, false);
+        let drop_staged = |staged: Option<StagedFile>| {
+            if let Some(staged) = staged {
+                let _ = staged.discard();
+            }
+        };
+        let (file, parent) = match self.target.existing(row) {
+            Ok(Some(found)) => found,
+            Ok(None) => {
+                drop_staged(staged);
+                return Err(BulkloadRefusal::ProtocolStateViolation);
+            }
+            Err(_) => {
+                drop_staged(staged);
+                if settings.plan_only {
+                    self.plan_seat(row, class.word(), "hold", None, Some(OTHER_KIND));
+                    self.answered_now = Some(false);
+                    return Ok(None);
+                }
+                self.stats.held.push((row.rel_path.clone(), OTHER_KIND));
+                return Err(BulkloadRefusal::HomesConsolidateUnsupported);
+            }
+        };
+        let live_size = file.metadata().ok().map(|found| found.len());
+        let (verified, settled) = verify_settled(self.target.path(), &file, row, manifest);
+        let covered = class == Class::AppendLog
+            && matches!(verified, Err(BulkloadRefusal::DestinationOccupied))
+            && crate::materialize::covers(&file, manifest)?;
+        if settings.plan_only {
+            drop_staged(staged);
+            let (action, reason) = match (&verified, class) {
+                (Ok(_), _) => ("adopt", None),
+                _ if covered => ("covered", None),
+                (_, Class::Config(_)) => ("consolidate", None),
+                (_, Class::AppendLog) => ("hold", Some(APPEND_LOG_PENDING)),
+                (_, Class::Sqlite) => ("hold", Some(SQLITE_PENDING)),
+                (_, Class::Opaque) => ("hold", Some("opaque: the bytes differ")),
+            };
+            self.plan_seat(row, class.word(), action, live_size, reason);
+            self.answered_now = Some(false);
+            return Ok(None);
+        }
+        match verified {
+            Ok(identity) => {
+                drop_staged(staged);
+                return self
+                    .adopt_settling(file, parent, row, (key, record, racy, root), identity)
+                    .map(|()| None);
+            }
+            Err(BulkloadRefusal::DestinationOccupied) => {}
+            Err(refusal) => {
+                drop_staged(staged);
+                return Err(refusal);
+            }
+        }
+        if covered {
+            drop_staged(staged);
+            return self.covered(row, &key, racy);
+        }
+        match (class, staged) {
+            (Class::Config(_), Some(staged)) => {
+                self.consolidate_staged(staged, row, &key, class, racy)
+            }
+            (_, staged) => {
+                drop_staged(staged);
+                let reason = match class {
+                    Class::Sqlite => SQLITE_PENDING,
+                    Class::AppendLog => APPEND_LOG_PENDING,
+                    _ => "opaque: the bytes differ",
+                };
+                self.stats.held.push((row.rel_path.clone(), reason));
+                self.remember_refusal(&key, settled, racy, RefusedOutput::ConsolidateHeld);
+                Err(BulkloadRefusal::HomesConsolidateUnsupported)
+            }
+        }
     }
 
     /// A received snapshot's last checks before it is published (#218):
@@ -7668,6 +8211,17 @@ impl<W: Write> Inbound<'_, W> {
                 }
                 Err(refusal)
             }
+            Plan::Covered => self.covered(&row, &key, racy),
+            Plan::Held { identity, reason } => {
+                self.stats.held.push((row.rel_path.clone(), reason));
+                self.remember_refusal(&key, identity, racy, RefusedOutput::ConsolidateHeld);
+                Err(BulkloadRefusal::HomesConsolidateUnsupported)
+            }
+            Plan::Dry(planned) => {
+                self.stats.planned.push(planned);
+                self.answered_now = Some(false);
+                Ok(None)
+            }
             Plan::Write(mut staging) => {
                 self.open -= 1;
                 if let Some(failure) = failure {
@@ -7675,6 +8229,9 @@ impl<W: Write> Inbound<'_, W> {
                     return Err(failure.refusal);
                 }
                 fault_point!(ReceiveAfterChunks);
+                if let Some(class) = staging.consolidate {
+                    return self.consolidate_staged(staging.staged, &row, &key, class, racy);
+                }
                 if let Some(extend) = staging.extend.take() {
                     return self.finish_extend(
                         staging.staged,
@@ -8019,6 +8576,7 @@ impl<W: Write> Inbound<'_, W> {
                 displaced: &self.displaced,
                 session: &self.session,
                 salvage: &self.salvage,
+                consolidate: self.consolidate.as_deref(),
             };
             beside_existing(&context, &beside, out.file())
         };
@@ -8325,6 +8883,36 @@ enum Plan {
         live: Option<(StatIdentity, RefusedOutput)>,
         beside: Option<StatIdentity>,
     },
+    /// `--consolidate`: the live append log holds the seat's bytes as its
+    /// first bytes (the destination continued it). Nothing is written or
+    /// asked for; the seat is recorded consolidated.
+    Covered,
+    /// `--consolidate`: held `HOMES_CONSOLIDATE_UNSUPPORTED`, nothing staged
+    /// or asked for; remembered under the live file's settled identity,
+    /// when known.
+    Held {
+        identity: Option<StatIdentity>,
+        reason: &'static str,
+    },
+    /// `--plan-only`: the seat's planned action; nothing staged, asked for
+    /// or written.
+    Dry(PlannedSeat),
+}
+
+/// A decided plan, boxed.
+fn done(plan: Plan) -> Consolidating {
+    Consolidating::Done(Box::new(plan))
+}
+
+/// What [`plan_consolidating`] decides.
+enum Consolidating {
+    /// The entry's plan.
+    Done(Box<Plan>),
+    /// The seat's bytes are received in memory and merged by the class's
+    /// union when they are complete.
+    Stage(crate::consolidate::Class),
+    /// No live file: landed as any new path is.
+    Land,
 }
 
 /// [`verify_existing`], and, when the output holds other bytes than the
@@ -8384,6 +8972,9 @@ struct Staging {
     /// `--beside`: the staged file is published at this path, beside the
     /// live file the plan found differing, under the seat's beside row.
     beside: Option<Vec<u8>>,
+    /// `--consolidate`: the staged file is in memory, and its bytes are
+    /// merged into the live file by this class's union, never published.
+    consolidate: Option<crate::consolidate::Class>,
 }
 
 /// An existing destination file with no owning record whose first
@@ -8638,6 +9229,16 @@ fn plan_file(
     if offset != row.size {
         return Plan::Refuse(BulkloadRefusal::DigestMismatch);
     }
+    // `--consolidate` (operator ruling 2026-10-20): the seat is judged by
+    // its class against the live file; merged ones are staged in memory.
+    let mut consolidate_into = None;
+    if let Some(settings) = context.consolidate {
+        match plan_consolidating(context, planned, manifest, settings, salvaged_from) {
+            Consolidating::Done(plan) => return *plan,
+            Consolidating::Stage(class) => consolidate_into = Some(class),
+            Consolidating::Land => {}
+        }
+    }
     // `--beside` (plan of record 2026-10-19, C1/C2): a snapshot whose live
     // path has a sidecar beside it never lands there, whatever the path
     // holds; it lands beside.
@@ -8654,7 +9255,13 @@ fn plan_file(
     // what the live path's refusal may be remembered as (finding 3).
     let mut land_beside: Option<Vec<u8>> = None;
     let mut live_refused: Option<(StatIdentity, RefusedOutput)> = None;
-    let mut supersede = match context.target.existing(row) {
+    // A consolidation never supersedes the live file: its union writes it.
+    let existing = if consolidate_into.is_some() {
+        Ok(None)
+    } else {
+        context.target.existing(row)
+    };
+    let mut supersede = match existing {
         Ok(Some((file, parent))) => {
             // Under `--beside` a live path is never replaced, whoever wrote
             // it (review of #280, finding 1): this store's own output there,
@@ -8778,7 +9385,14 @@ fn plan_file(
             }
         }
     }
-    let staged = match context.target.stage(row) {
+    // A consolidation's bytes are received in memory, never on disk (SPEC
+    // rule 2).
+    let staged = if consolidate_into.is_some() {
+        context.target.stage_in_memory(row)
+    } else {
+        context.target.stage(row)
+    };
+    let staged = match staged {
         Ok(staged) => staged,
         Err(refusal) => return Plan::Refuse(refusal),
     };
@@ -8836,7 +9450,102 @@ fn plan_file(
         placed,
         extend: None,
         beside: land_beside,
+        consolidate: consolidate_into,
     })
+}
+
+/// `--consolidate` (operator ruling 2026-10-20): what the live file is to
+/// the seat, by the seat's class ([`crate::consolidate::Class`]).
+///
+/// - No live file: landed as any new path is.
+/// - A live path of another kind: held.
+/// - The seat's bytes: adopted.
+/// - Otherwise, by class:
+///   - an append log is covered when the live file holds the seat's bytes
+///     as its first bytes, extended when it is a proven prefix of them
+///     (M2r2 A-103), and otherwise merged by its union, or held while it
+///     has none;
+///   - a config file is received in memory and merged;
+///   - a `SQLite` store or an opaque file is held.
+///
+/// Under `--plan-only` each answer is a [`Plan::Dry`] instead, and nothing
+/// is staged or written.
+fn plan_consolidating(
+    context: &ReceiveContext<'_>,
+    planned: Planned<'_>,
+    manifest: &Manifest,
+    settings: &Consolidation,
+    salvaged_from: &mut Vec<usize>,
+) -> Consolidating {
+    use crate::consolidate::{union_of, Class};
+    let row = planned.row;
+    let class = Class::of(&row.rel_path, planned.snapshot);
+    let plan = settings.plan_only;
+    let dry = |action, live_size, reason| {
+        done(Plan::Dry(PlannedSeat {
+            rel_path: row.rel_path.clone(),
+            class: class.word(),
+            action,
+            source_size: row.size,
+            live_size,
+            reason,
+        }))
+    };
+    let held = |identity, live_size, reason| {
+        if plan {
+            dry("hold", live_size, Some(reason))
+        } else {
+            done(Plan::Held { identity, reason })
+        }
+    };
+    let (file, parent) = match context.target.existing(row) {
+        Ok(Some(found)) => found,
+        Ok(None) if plan => return dry("create", None, None),
+        Ok(None) => return Consolidating::Land,
+        Err(BulkloadRefusal::DestinationOccupied | BulkloadRefusal::DestinationKindMismatch) => {
+            return held(None, None, OTHER_KIND)
+        }
+        Err(refusal) => return done(Plan::Refuse(refusal)),
+    };
+    let live_size = file.metadata().ok().map(|found| found.len());
+    let (verified, settled) = verify_settled(context.target.path(), &file, row, manifest);
+    match verified {
+        Ok(_) if plan => return dry("adopt", live_size, None),
+        Ok(identity) => return done(Plan::Adopt(file, parent, Some(identity), None)),
+        Err(BulkloadRefusal::DestinationOccupied) => {}
+        Err(refusal) => return done(Plan::Refuse(refusal)),
+    }
+    match class {
+        Class::AppendLog => {
+            match crate::materialize::covers(&file, manifest) {
+                Ok(true) if plan => return dry("covered", live_size, None),
+                Ok(true) => return done(Plan::Covered),
+                Ok(false) => {}
+                Err(refusal) => return done(Plan::Refuse(refusal)),
+            }
+            let union = union_of(class);
+            if plan {
+                return match crate::materialize::prefix_holds(&file, manifest) {
+                    Ok(true) => dry("extend", live_size, None),
+                    Ok(false) if union.is_some() => dry("consolidate", live_size, None),
+                    Ok(false) => dry("hold", live_size, Some(APPEND_LOG_PENDING)),
+                    Err(refusal) => done(Plan::Refuse(refusal)),
+                };
+            }
+            match plan_extend(context, row, manifest, (file, parent), salvaged_from) {
+                Plan::Adopt(..) | Plan::NotPrefix(_) if union.is_some() => {
+                    Consolidating::Stage(class)
+                }
+                Plan::Adopt(..) => held(settled, live_size, APPEND_LOG_PENDING),
+                Plan::NotPrefix(identity) => held(Some(identity), live_size, APPEND_LOG_PENDING),
+                other => done(other),
+            }
+        }
+        Class::Config(_) if plan => dry("consolidate", live_size, None),
+        Class::Config(_) => Consolidating::Stage(class),
+        Class::Sqlite => held(settled, live_size, SQLITE_PENDING),
+        Class::Opaque => held(settled, live_size, "opaque: the bytes differ"),
+    }
 }
 
 /// M2r2 A-103: an existing regular file with no owning record whose bytes
@@ -8860,6 +9569,7 @@ fn plan_file(
 /// (`Inbound::finish_extend`). A file that is not a candidate keeps
 /// today's answer: `Plan::Adopt`, which refuses it `DESTINATION_OCCUPIED`
 /// when its bytes are not the manifest's.
+#[allow(clippy::too_many_lines)] // Prove the prefix, stage the tail, fill it.
 fn plan_extend(
     context: &ReceiveContext<'_>,
     row: &RowSchema,
@@ -8967,6 +9677,7 @@ fn plan_extend(
             straddle,
         })),
         beside: None,
+        consolidate: None,
     })
 }
 
