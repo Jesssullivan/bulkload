@@ -3558,6 +3558,43 @@ fn p129_a_nonrepo_dir_beside_an_existing_copy_refuses_typed() {
     }
 }
 
+/// P129b NONREPO-DUPLICATE-DETACHED (verification of #286, the tin2835
+/// shape): the earlier copy `<path>.neo-20261016` (a hand plan's linked
+/// landing) exists but detached, so no branch is held. A bare `--adopt`
+/// (no `--beside`) still never registers the equal non-repo directory as
+/// a second copy: the registered worktree bulkload landed beside it is
+/// found, `GIT_DESTINATION_NONREPO_DUPLICATE`, nothing written to either
+/// copy, `git worktree list` unchanged.
+#[test]
+fn p129b_a_detached_earlier_copy_blocks_a_bare_adopt_too() {
+    let world = Gftb::new();
+    let (run, wt, dmain, dwt) = nonrepo_world(&world);
+    let beside = beside_of(&dwt);
+    let hand = named_run(&world, "hand", &[(&wt, &dmain, Some(&beside))]);
+    hand.capture();
+    private_dir(&hand.applied);
+    let ran = hand.apply(&[]);
+    assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    git(&beside, &["checkout", "--quiet", "--detach"]);
+    assert_eq!(
+        git(&beside, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        "HEAD",
+        "the earlier copy is detached"
+    );
+    let before = (entries_of(&dwt), freeze_all(&beside));
+    let listed = git(&dmain, &["worktree", "list", "--porcelain"]);
+    let ran = run.apply(&["--adopt"]);
+    let row = receipt(&receipts(&ran.stdout), &wt).clone();
+    assert_eq!(row.1, "refused", "{row:?}");
+    assert!(
+        row.2.contains("GIT_DESTINATION_NONREPO_DUPLICATE"),
+        "{row:?}"
+    );
+    assert!(!dwt.join(".git").exists());
+    assert_eq!((entries_of(&dwt), freeze_all(&beside)), before);
+    assert_eq!(git(&dmain, &["worktree", "list", "--porcelain"]), listed);
+}
+
 /// P134 NONREPO-STALE-RELATIVE (review of #286, finding 3): a stale
 /// registration of the repository that names the directory by a relative
 /// `gitdir` (`worktree.useRelativePaths`) is found as an absolute one is:

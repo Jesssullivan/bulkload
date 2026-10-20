@@ -2195,6 +2195,15 @@ pub fn apply_workspace(
     // rewriting a file in it; a standalone item's has no registration to
     // re-create. Either refusal leaves it as it is, and `--beside` lands
     // the capture beside it.
+    // Verification of #286: a pass that does not adopt a non-repo
+    // directory clears this item's own half-made registration of it (a
+    // crash before its gitfile), ownership-checked, then refuses as before.
+    if !standalone && !landing.beside && nonrepo(workspace) && !policy.adopt {
+        if planned(target.repository)?.is_some() {
+            super::abandon_nonrepo(target.repository, workspace, target.source, landing.item)?;
+        }
+        return Err(BulkloadRefusal::GitDestinationOccupied);
+    }
     if policy.adopt && !landing.beside && nonrepo(workspace) {
         if planned(target.repository)?.is_none() {
             return Err(BulkloadRefusal::GitDestinationOccupied);
@@ -3163,6 +3172,9 @@ pub(super) fn check_nonrepo(
     if beside.is_some_and(|beside| fs::symlink_metadata(beside).is_ok()) {
         return Err(BulkloadRefusal::GitDestinationNonrepoDuplicate);
     }
+    if registered_copy(repository, destination, source, item)? {
+        return Err(BulkloadRefusal::GitDestinationNonrepoDuplicate);
+    }
     Ok(NonrepoProof {
         checked,
         prints,
@@ -3268,12 +3280,60 @@ pub(super) fn unlock_registration(admin: &Path) -> Result<()> {
     }
 }
 
-/// Remove this item's registration of `destination` a crash cut short
-/// before its gitfile (review of #286, finding 6), when a later pass does
-/// not adopt it: the administration directory [`register`] wrote (still
-/// locked "initializing", holding only what it writes, and `destination`
-/// still without `.git`), then the landing intent and its marker. Anything
-/// else stays. Run under the destination lock.
+/// Whether a registered worktree of `repository` other than `destination`
+/// is another copy of this item's worktree (verification of #286, the
+/// tin2835 shape), with or without `--beside` and whatever its HEAD
+/// (detached included): bulkload's landing of this item (its workspace
+/// ledger under `source` names `item`), or a `<destination>.<suffix>`
+/// sibling bulkload landed under any source (the in-place hand plans'
+/// copies; one whose ledger cannot be read counts too). Read-only.
+fn registered_copy(
+    repository: &Path,
+    destination: &Path,
+    source: &str,
+    item: &str,
+) -> Result<bool> {
+    let mut sibling = destination.as_os_str().as_bytes().to_vec();
+    sibling.push(b'.');
+    for (path, _) in worktrees(repository)? {
+        if same_path(&path, destination) {
+            continue;
+        }
+        let named = path.as_os_str().as_bytes().starts_with(&sibling);
+        let ours = match super::beside::ledger_of(&path, source) {
+            Ok(Some(ledger)) => ledger.item == item,
+            Ok(None) => false,
+            Err(_) => named,
+        };
+        if ours || (named && landed_any(&path)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether bulkload landed the worktree at `path` under any source: a
+/// workspace ledger in its git directory (or one that cannot be read).
+fn landed_any(path: &Path) -> bool {
+    let Ok(Some(git_dir)) = landed::worktree_git_dir(path) else {
+        return fs::symlink_metadata(path.join(".git")).is_ok();
+    };
+    fs::read_dir(git_dir.join(landed::LEDGER_ROOT)).is_ok_and(|mut sources| {
+        sources.any(|entry| {
+            entry.map_or(true, |entry| {
+                fs::symlink_metadata(entry.path().join(landed::WORKSPACE_LANDED)).is_ok()
+            })
+        })
+    })
+}
+
+/// Remove this item's registration of `destination` a crash or a refusal
+/// cut short before its gitfile named it (review of #286, finding 6 and
+/// its verification), when a pass does not adopt it: the administration
+/// directory [`register`] wrote (still locked "initializing" and holding
+/// only what it writes, no `.git` at `destination` naming it), then the
+/// landing intent and its marker. Anything else stays. Run under the
+/// destination lock.
 ///
 /// # Errors
 /// IO.
@@ -3283,10 +3343,16 @@ pub(super) fn abandon_registration(
     landing_intent: &Path,
 ) -> Result<()> {
     const SITE: &str = "git_carry::converge::abandon_registration";
-    if !nonrepo(destination) {
-        return Ok(());
-    }
     if let Some(admin) = registration_of(common, destination)? {
+        // Registered (its gitfile names this administration directory):
+        // the recovery's to finish, never abandoned.
+        if landed::worktree_git_dir(destination)
+            .ok()
+            .flatten()
+            .is_some_and(|git_dir| same_dir(&git_dir, &admin))
+        {
+            return Ok(());
+        }
         let ours = fs::read(admin.join("locked")).is_ok_and(|bytes| bytes == INITIALIZING);
         let only_ours = fs::read_dir(&admin).refuse_at(SITE)?.all(|entry| {
             entry.is_ok_and(|entry| {

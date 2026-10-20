@@ -7691,25 +7691,13 @@ pub(crate) fn adopt_nonrepo_linked(
         (landing.observed_ns, landing.exclude_union.is_some()),
     ) {
         Ok(proof) => proof,
-        // Review of #286, finding 6: this item's registration a crash cut
-        // short before its gitfile is removed when the directory is not
-        // adopted after all, under the lock; anything else stays.
-        Err(
-            refusal @ (BulkloadRefusal::GitDestinationNonrepoDiffers
-            | BulkloadRefusal::GitDestinationNonrepoDuplicate),
-        ) => {
-            let common = common_repository(repository)?;
-            let intent_path =
-                landed::landing_intent_path(&landed::ledger_dir(&common, source), destination);
-            if landed::read::<landed::LandingIntent>(&intent_path)?
-                .is_some_and(|intent| intent.item == landing.item)
-            {
-                let _lock = landed::lock(&common, source)?;
-                converge::abandon_registration(&common, destination, &intent_path)?;
-            }
+        // Review of #286, finding 6, and its verification: on any refusal
+        // this item's registration a crash cut short before its gitfile is
+        // removed, under the lock; anything else stays.
+        Err(refusal) => {
+            abandon_nonrepo(repository, destination, source, landing.item)?;
             return Err(refusal);
         }
-        Err(other) => return Err(other),
     };
     let checked = proof.checked;
     let heads = checked.heads.clone();
@@ -7748,32 +7736,52 @@ pub(crate) fn adopt_nonrepo_linked(
             intended_branch: plan.head.intended.clone(),
         },
     )?;
-    // A foreign repository: the branch `worktree add -b` would create,
-    // created only where it is still absent.
-    if let (Some(_), Some(branch)) = (&plan.create, &plan.head.head.symbolic) {
-        let mut line = b"create ".to_vec();
-        line.extend_from_slice(branch.as_bytes());
-        line.push(0);
-        line.extend_from_slice(plan.head.head.oid.as_bytes());
-        line.push(0);
-        native_refs::update_refs(&checked.repository, None, &line, &[branch.as_str()])?;
-    }
-    let admin = converge::register(&plan.common, destination, &plan.head.head)?;
-    fault_point!(EstateApplyNonrepoRegistered);
-    {
-        let mut gitfile = b"gitdir: ".to_vec();
-        gitfile.extend_from_slice(admin.as_os_str().as_bytes());
-        gitfile.push(b'\n');
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o644)
-            .open(destination.join(".git"))
-            .refuse_at(SITE)?;
-        file.write_all(&gitfile).refuse_at(SITE)?;
-        file.sync_all().refuse_at(SITE)?;
-        landed::sync_dir(destination)?;
-    }
+    // The registration, up to the gitfile; a refusal on the way removes
+    // what it made (the lock is held), never leaving it locked.
+    let registered = || -> Result<PathBuf> {
+        // A foreign repository: the branch `worktree add -b` would create,
+        // created only where it is still absent.
+        if let (Some(_), Some(branch)) = (&plan.create, &plan.head.head.symbolic) {
+            let mut line = b"create ".to_vec();
+            line.extend_from_slice(branch.as_bytes());
+            line.push(0);
+            line.extend_from_slice(plan.head.head.oid.as_bytes());
+            line.push(0);
+            native_refs::update_refs(&checked.repository, None, &line, &[branch.as_str()])?;
+        }
+        let admin = converge::register(&plan.common, destination, &plan.head.head)?;
+        fault_point!(EstateApplyNonrepoRegistered);
+        {
+            let mut gitfile = b"gitdir: ".to_vec();
+            gitfile.extend_from_slice(admin.as_os_str().as_bytes());
+            gitfile.push(b'\n');
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o644)
+                .open(destination.join(".git"))
+                .refuse_at(SITE)?;
+            let written = file
+                .write_all(&gitfile)
+                .and_then(|()| file.sync_all())
+                .refuse_at(SITE)
+                .and_then(|()| landed::sync_dir(destination));
+            // A gitfile this call created and could not finish is its own:
+            // removed, so the directory keeps no partial `.git`.
+            if let Err(refusal) = written {
+                let _ = fs::remove_file(destination.join(".git"));
+                return Err(refusal);
+            }
+        }
+        Ok(admin)
+    };
+    let admin = match registered() {
+        Ok(admin) => admin,
+        Err(refusal) => {
+            converge::abandon_registration(&plan.common, destination, &landing_intent)?;
+            return Err(refusal);
+        }
+    };
     converge::unlock_registration(&admin)?;
     fault_point!(EstateConvergeLinkedAdded);
     if text(git(destination).args(["rev-parse", "--verify", "HEAD"]))? != head {
@@ -7824,6 +7832,33 @@ pub(crate) fn adopt_nonrepo_linked(
     custody.count("adopted-nonrepo");
     custody.add("adopted-seats", seats);
     Ok(converge::Applied::adopted(&custody))
+}
+
+/// Remove this item's half-made registration of the non-repo directory at
+/// `destination` (a crash or a refusal before its gitfile named it), when
+/// a pass does not adopt it, under the destination lock
+/// ([`converge::abandon_registration`], ownership-checked): only when the
+/// landing intent there names this item.
+///
+/// # Errors
+/// IO.
+pub(crate) fn abandon_nonrepo(
+    repository: &Path,
+    destination: &Path,
+    source: &str,
+    item: &str,
+) -> Result<()> {
+    let Ok(common) = common_repository(repository) else {
+        return Ok(());
+    };
+    let intent_path =
+        landed::landing_intent_path(&landed::ledger_dir(&common, source), destination);
+    if landed::read::<landed::LandingIntent>(&intent_path)?.is_none_or(|intent| intent.item != item)
+    {
+        return Ok(());
+    }
+    let _lock = landed::lock(&common, source)?;
+    converge::abandon_registration(&common, destination, &intent_path)
 }
 
 /// Finish a non-repo adoption ([`adopt_nonrepo_linked`]) a crash cut short

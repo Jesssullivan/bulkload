@@ -142,6 +142,9 @@ pub enum EstateAdopt {
     /// `NonrepoAdopt` crashed before its gitfile, then a captured seat
     /// edited, so the rerun does not adopt it (review of #286, finding 6).
     NonrepoAbandon,
+    /// `NonrepoAdopt` crashed before its gitfile, then a pass without
+    /// `--adopt` (verification of #286).
+    NonrepoNoAdopt,
 }
 
 impl EstateAdopt {
@@ -149,7 +152,10 @@ impl EstateAdopt {
     const fn nonrepo(self) -> bool {
         matches!(
             self,
-            Self::NonrepoAdopt | Self::NonrepoTampered | Self::NonrepoAbandon
+            Self::NonrepoAdopt
+                | Self::NonrepoTampered
+                | Self::NonrepoAbandon
+                | Self::NonrepoNoAdopt
         )
     }
 }
@@ -589,6 +595,7 @@ fn scenario(point: Point, nth: u64, kind: EstateAdopt) {
         EstateAdopt::NonrepoAdopt => Some(nonrepo_adopt),
         EstateAdopt::NonrepoTampered => Some(nonrepo_tampered),
         EstateAdopt::NonrepoAbandon => Some(nonrepo_abandon),
+        EstateAdopt::NonrepoNoAdopt => Some(nonrepo_no_adopt),
         _ => None,
     };
     if let Some(row) = besides {
@@ -1380,4 +1387,49 @@ fn nonrepo_abandon(world: &World, label: &str, point: Point, nth: u64) {
     assert!(left.is_empty(), "{label}: {left:?}");
     assert!(!wt.join(".git").exists(), "{label}");
     assert_eq!(entries_of(&wt), before, "{label}: the rerun wrote");
+}
+
+/// The `NonrepoNoAdopt` row (verification of #286): the adoption crashed
+/// before its gitfile; then a pass without `--adopt`. It refuses
+/// `GIT_DESTINATION_OCCUPIED` as before and clears this item's half-made
+/// registration (its administration directory, still locked
+/// "initializing", the landing intent and marker): nothing stays locked
+/// for `git worktree prune` or `git branch -f` to trip over, and nothing
+/// in the directory is written.
+fn nonrepo_no_adopt(world: &World, label: &str, point: Point, nth: u64) {
+    let wt = world.base.join("dst-wt");
+    crash(world, &format!("{}:{nth}", point.name()));
+    assert_eq!(
+        registrations_of(world, &wt).len(),
+        1,
+        "{label}: left by the crash"
+    );
+    let before = entries_of(&wt);
+    let rows = world.apply(false);
+    assert_eq!(rows.len(), 1, "{label}");
+    assert_eq!(rows[0].0, "refused", "{label}: {rows:?}");
+    assert!(
+        rows[0]
+            .1
+            .as_deref()
+            .is_some_and(|reason| reason.contains("GIT_DESTINATION_OCCUPIED")),
+        "{label}: {rows:?}"
+    );
+    assert!(
+        registrations_of(world, &wt).is_empty(),
+        "{label}: still registered (locked)"
+    );
+    let ledger = world.dst().join(".git/bulkload/v1/neo");
+    let left: Vec<String> = fs::read_dir(&ledger).map_or_else(
+        |_| Vec::new(),
+        |entries| {
+            entries
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("landing-"))
+                .collect()
+        },
+    );
+    assert!(left.is_empty(), "{label}: {left:?}");
+    assert!(!wt.join(".git").exists(), "{label}");
+    assert_eq!(entries_of(&wt), before, "{label}: the pass wrote");
 }

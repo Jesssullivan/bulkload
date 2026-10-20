@@ -121,12 +121,24 @@ with no `.git` entry:
 | preview | `estate-move` printed `action=refuse reason=not-git` | fixed: `moving::nonrepo_preview` says `adopt` (`nonrepo-adopt-or-beside`) for a linked item's non-repo directory with a held capture; a standalone one's and a file stay `refuse`; unit test |
 | Darwin | P126-P128 refuse `DESTINATION_SPACE_INSUFFICIENT` on pzm's free-space floor (the 38 baseline failures' cause) | no Darwin defect (coordinator's A/B at `f70dd0c`) |
 
+## Verification of #286 (coordinator, at `11ea7c2`)
+
+| # | Defect | Disposition |
+| --- | --- | --- |
+| V1 | bare `--adopt` (no `--beside`) adopted the equal directory while the item's `<path>.neo-YYYYMMDD` copy existed detached (tin2835 shape): the duplicate check saw `<path>SUFFIX` only when the suffix was passed | fixed: `converge::registered_copy` refuses `GIT_DESTINATION_NONREPO_DUPLICATE` whenever a registered worktree other than the path is bulkload's landing of this item (its workspace ledger names the item) or a `<path>.<suffix>` sibling with a bulkload workspace ledger under any source, independent of `--beside` and HEAD; P129b (hand-plan copy, detached, bare `--adopt`) |
+| V2 | `locked` "initializing" stayed after a crash at `nonrepo_registered` and a pass without `--adopt` (OCCUPIED), and after a failed `.git` create | fixed: the pass without `--adopt` runs `git_carry::abandon_nonrepo` before refusing OCCUPIED; every refusal of `check_nonrepo` does; the registration steps (branch create, `register`, gitfile) run in one closure whose failure removes a partial gitfile it created and then abandons; `abandon_registration`'s guard is now "no `.git` names this administration directory" (a stranger's `.git` no longer protects our half-made one); fault row `estate_apply_nonrepo_no_adopt` |
+
 ## Open
 
 - (superseded by the review fix above: the preview now says `adopt` for a
   linked item's non-repo directory.)
 - Finding 1's equal-beside path waits for #289: this lane refuses the
   duplicate; it does not yet move the branch or retire the beside.
+- V1's sibling rule is conservative: a different item whose worktree sits
+  at `<path>.<anything>` with a bulkload ledger also makes the directory
+  refuse DUPLICATE (a refusal, never a write); none of td01's six has one.
+- V2: a branch the adoption created before a later registration step
+  failed stays (a ref, not a lock); the rerun reuses it.
 - A stale registration of the repository that names the path (an admin
   directory left by a pruned worktree whose `gitdir` still names
   `<path>/.git`) makes the directory `GIT_DESTINATION_NONREPO_DIFFERS`

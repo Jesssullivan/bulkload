@@ -1536,6 +1536,8 @@ scenarios! {
     // (finding 6).
     estate_apply_nonrepo_tampered => EstateConvergeLinkedAdded: 1, EstateAdopt::NonrepoTampered;
     estate_apply_nonrepo_abandon => EstateApplyNonrepoRegistered: 1, EstateAdopt::NonrepoAbandon;
+    // Verification of #286: the same crash, then a pass without --adopt.
+    estate_apply_nonrepo_no_adopt => EstateApplyNonrepoRegistered: 1, EstateAdopt::NonrepoNoAdopt;
     // M2r2 b: a capture-refused item carried as files, crashed after its
     // carry record and before its outcome.
     estate_carry_recorded => EstateCarryRecorded: 1, EstateCarried::Workspace;

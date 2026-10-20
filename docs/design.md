@@ -1294,6 +1294,11 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   landing exists at `<path>SUFFIX`, it refuses
   `GIT_DESTINATION_NONREPO_DUPLICATE`, nothing written, pending review
   (retiring a beside proven equal, as #289 retires one, is the follow-up).
+  Its verification (2026-10-19): the same refusal, with or without
+  `--beside` and whatever the copy's HEAD (the tin2835 shape is a detached
+  `<path>.neo-YYYYMMDD`), when any registered worktree of the repository is
+  bulkload's landing of this item (its workspace ledger names the item) or
+  a `<path>.<suffix>` sibling bulkload landed under any source.
   The adoption's landing intent carries a marker: a crash past the gitfile
   is finished by proving every seat again (content and mode, read from the
   capture imported into the repository) and writing none, a missing or
@@ -1302,8 +1307,14 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   until the gitfile is written, as `git worktree add` holds it; a relative
   `gitdir` names the directory as an absolute one does; the re-check runs
   under the lock before the import, the native ref step and any exclude
-  append; and a later pass that does not adopt it removes the registration
-  a crash left before the gitfile.
+  append; and a later pass that does not adopt it (a refusal, or a pass
+  without `--adopt`) removes the registration a crash left before the
+  gitfile, as does a failure of the adopting pass itself before its
+  gitfile names the registration (a partial gitfile it created is removed
+  first): nothing stays `locked` "initializing" for `git worktree prune`
+  or `git branch -f` to trip over. The removal is ownership-checked: only
+  an administration directory still locked "initializing", holding only
+  what the adoption writes, no `.git` naming it, and this item's intent.
 - **Beside landings converge, and a beside path is adopted by proof (gap
   C12, plan of record rev 2; operator ruling A-115, 2026-10-18,
   "Landings placed beside refuse every later pass once neo changes" →
