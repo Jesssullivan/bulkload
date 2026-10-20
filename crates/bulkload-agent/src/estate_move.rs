@@ -375,18 +375,35 @@ fn same_home(live: &Path, real: &Path) -> Result<()> {
     }
 }
 
-/// Write a session's source listing (NUL-ended relative paths).
+/// Write a session's source listing (NUL-ended relative paths, sorted).
+///
+/// Provenance is sticky (verification of #280, N4 across passes): the
+/// listing is cumulative, every path an earlier pass listed and this pass's,
+/// so a session the source pruned since stays the source's (its earlier
+/// typed outcome stands until dispositioned). A pass that listed nothing
+/// (its session did not walk) keeps the earlier listing as it is.
 fn write_listing(path: &Path, listed: Option<Vec<Vec<u8>>>) -> Result<()> {
-    let _ = std::fs::remove_file(path);
-    if let Some(listed) = listed {
-        let mut bytes = Vec::new();
-        for entry in listed {
-            bytes.extend_from_slice(&entry);
-            bytes.push(0);
-        }
-        moving::write_report(path, &bytes)?;
+    let Some(listed) = listed else {
+        return Ok(());
+    };
+    let mut all = std::collections::BTreeSet::new();
+    match std::fs::read(path) {
+        Ok(bytes) => all.extend(
+            bytes
+                .split(|byte| *byte == 0)
+                .filter(|entry| !entry.is_empty())
+                .map(<[u8]>::to_vec),
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).refuse_at("estate_move::write_listing"),
     }
-    Ok(())
+    all.extend(listed);
+    let mut bytes = Vec::new();
+    for entry in all {
+        bytes.extend_from_slice(&entry);
+        bytes.push(0);
+    }
+    moving::write_report(path, &bytes)
 }
 
 /// The destination half's arguments.

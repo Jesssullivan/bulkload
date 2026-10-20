@@ -720,7 +720,10 @@ fn a_seat_over_a_destination_symlink_lands_beside_or_refuses_typed() {
     );
     // A symlink where a regular output lands is the wrong kind of node
     // (#283's code); a directory over one is occupied.
-    assert!(codes.contains(&("AGENTS.md".to_owned(), "DESTINATION_KIND_MISMATCH".to_owned())));
+    assert!(codes.contains(&(
+        "AGENTS.md".to_owned(),
+        "DESTINATION_KIND_MISMATCH".to_owned()
+    )));
     assert!(codes.contains(&("d".to_owned(), "DESTINATION_OCCUPIED".to_owned())));
 
     settle(&beside.corpus);
