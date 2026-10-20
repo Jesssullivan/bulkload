@@ -763,6 +763,14 @@ fn r1_a_redundant_beside_tree_is_reported_then_retired() {
     fs::create_dir_all(&empty_live).unwrap();
     let empty = world.path(&format!("sting/other{SUFFIX}"));
     fs::create_dir(&empty).unwrap();
+    // One inside the live checkout's `.worktrees` directory is found too;
+    // nothing else inside a checkout is walked.
+    let inner_live = world.sting().join(".worktrees/inner");
+    fs::create_dir_all(&inner_live).unwrap();
+    let inner = world.sting().join(format!(".worktrees/inner{SUFFIX}"));
+    fs::create_dir(&inner).unwrap();
+    fs::create_dir_all(world.sting().join(format!("src/hidden{SUFFIX}"))).unwrap();
+    fs::create_dir_all(world.sting().join("src/hidden")).unwrap();
     let state = world.path("retire-state");
     let frozen = (
         tree(&world.sting()),
@@ -787,10 +795,12 @@ fn r1_a_redundant_beside_tree_is_reported_then_retired() {
         assert!(line.split_whitespace().any(|w| w == held), "{held}: {line}");
     }
     assert!(line_of(&report.stdout, &empty).contains("verdict=retirable shape=empty"));
+    assert!(line_of(&report.stdout, &inner).contains("verdict=retirable shape=empty"));
+    assert!(!report.stdout.contains("hidden"), "{}", report.stdout);
     assert!(
         report
             .stdout
-            .contains("estate-beside-retire summary mode=report candidates=2 retirable=2"),
+            .contains("estate-beside-retire summary mode=report candidates=3 retirable=3"),
         "{}",
         report.stdout
     );
@@ -803,6 +813,10 @@ fn r1_a_redundant_beside_tree_is_reported_then_retired() {
         frozen,
         "report mode wrote"
     );
+    fs::remove_dir(&inner).unwrap();
+    fs::remove_dir_all(world.sting().join(".worktrees")).unwrap();
+    fs::remove_dir_all(world.sting().join(format!("src/hidden{SUFFIX}"))).unwrap();
+    fs::remove_dir_all(world.sting().join("src/hidden")).unwrap();
     assert!(!state.exists(), "report mode made STATE");
 
     let own = Own::of(&world);

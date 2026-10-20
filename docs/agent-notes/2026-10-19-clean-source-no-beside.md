@@ -131,6 +131,35 @@ One adversarial read-only review (a refuter subagent, nothing run) at
 | m8 | live tips counted remote-tracking refs and the stash | fixed: excluded |
 | m9 | carry-files: a crash after the mkdir leaves an empty directory forever; a partial transfer leaves a non-empty beside | first fixed (an empty beside destination is removed on refusal); the second left: a partial transfer's bytes are its resume state, recorded in its transfer rows |
 
+## Report-only run on sting (read-only)
+
+2026-10-20 ~05:55Z, `estate-beside-retire --scan /srv/fast-local/jess/git
+.neo-20261016 neo <absent STATE>` with the honey-built agent at `3e44c8b`
+(sha256 `813f3c98...68b1`, copied to sting, run `nice -n 19 ionice -c3`;
+no STATE made, nothing written). Full report:
+`/srv/fast-local/jess/bulkload/receipts/beside-retire-report-sting-20261020-3e44c8b.txt`.
+
+- 137 candidates (a `*.neo-20261016` directory with a live path; 24 more
+  have no live path, and the `.worktrees` directories inside checkouts were
+  not yet scanned by that binary).
+- **62 retirable, 16.8 GB allocated**: 53 standalone (16.0 GB), 7 linked
+  (0.79 GB), 2 empty (the two `oauth-mux` leftovers). Retiring them would
+  place 29,243 untracked/ignored files into their live checkouts, land
+  3,043 as `<file>.neo-20261016`, and create 10 refs under the namespace.
+- 75 refused, typed: `tracked-changes` 25 (neo's uncommitted work: what a
+  beside tree is for), `live-not-a-checkout` 20, `unreachable:logged` 11
+  (a reflog names a commit the live repository lacks; telefreeze, A-nix-src,
+  B-nixos-nix among them), `unreachable:head` 3 (DarwinNicUtil and the two
+  `l54-pr*` worktrees: their HEADs are not in sting's refs yet; a clean
+  pass of this build brings them in), `unknown-git` 5 (`modules` 2,
+  `lost-found`, `COMMIT_MSG_A/B` in `upstream/nix{,-src}`), `live-absent` 4,
+  `refs` 2, `nested` 2, `unborn`, `other-repository`, `not-a-checkout` 1
+  each.
+- The first run (`46cdaa6`) refused 57 standalone bulkload landings
+  `unknown-git:carry-config` and 9 `worktrees` (prunable copies of neo's
+  worktree administration); `067c6b0` ledgers the receipts and proves a
+  gone worktree's HEAD and reflogs instead.
+
 ## Open
 
 - `estate-diff` / `estate-move --plan-only` still preview `beside=landing`
@@ -147,3 +176,7 @@ One adversarial read-only review (a refuter subagent, nothing run) at
 - A session whose cwd is inside a retired tree is left in a deleted
   directory (no process inspection, as for the advance retirement).
 - The ruling's intent-ledger entry (above).
+- **Reflog-only commits** (11 trees on sting): the proof requires every
+  commit a beside tree's reflogs name to be in the live repository. They
+  are history Git itself expires; whether to drop them, or to carry them
+  in under `refs/<ns>-logged/` before a retirement, is the operator's call.

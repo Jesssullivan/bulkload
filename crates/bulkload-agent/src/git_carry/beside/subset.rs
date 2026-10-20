@@ -1065,8 +1065,9 @@ pub fn retire(
 /// The beside trees under `root`, sorted.
 ///
 /// Every directory to `depth` levels below it (never following a link,
-/// never into a checkout or a `.git`) whose name ends with `suffix` and
-/// whose live path (the name without it) exists.
+/// never into a `.git`, and into a checkout only through its `.worktrees`
+/// directory) whose name ends with `suffix` and whose live path (the name
+/// without it) exists.
 ///
 /// # Errors
 /// Whatever reading a directory refuses.
@@ -1097,8 +1098,19 @@ pub fn scan(root: &Path, suffix: &str, depth: usize) -> Result<Vec<PathBuf>> {
                     continue;
                 }
             }
-            if level + 1 < depth && retire::lstat(&path.join(".git"))?.is_none() {
+            if level + 1 >= depth {
+                continue;
+            }
+            // A checkout's tree is never walked, but its `.worktrees`
+            // directory (the estate's convention for its linked worktrees,
+            // which may hold beside trees) is.
+            if retire::lstat(&path.join(".git"))?.is_none() {
                 pending.push((path, level + 1));
+            } else {
+                let worktrees = path.join(".worktrees");
+                if retire::lstat(&worktrees)?.is_some_and(|meta| meta.is_dir()) {
+                    pending.push((worktrees, level + 1));
+                }
             }
         }
     }
