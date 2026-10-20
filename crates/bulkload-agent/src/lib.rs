@@ -62,6 +62,7 @@ macro_rules! fault_mid_read {
 
 pub mod child;
 pub mod closure;
+pub mod consolidate;
 pub mod counters;
 pub mod disposition;
 pub mod estate;
