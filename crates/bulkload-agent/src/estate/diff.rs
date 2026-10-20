@@ -58,6 +58,11 @@ pub struct DiffOptions {
     /// `--beside SUFFIX`: what `estate-apply --adopt --beside SUFFIX` does
     /// with a diverged item (M2 round 2 item c).
     pub beside: Option<String>,
+    /// `--advance-ancestor` (operator ruling 2026-10-19): a diverged live
+    /// checkout the apply would advance reads `adopt:"advance"`; one whose
+    /// advance would refuse keeps `diverged` with the component
+    /// `advance-refused=<CODE>` (read-only, the apply's own proof).
+    pub advance_ancestor: bool,
     /// `--side-root ROOT` (M2r2 item e): what `estate-apply --side-root`
     /// would seat is reported (`kind:"seat"` rows), and each item spelled
     /// through such a link is answered at the directory it names, which is
@@ -421,7 +426,12 @@ fn item_row(
             &target,
             &landing,
             options.since,
-            (&options.activate_origin, items, options.beside.as_deref()),
+            (
+                &options.activate_origin,
+                items,
+                options.beside.as_deref(),
+                options.advance_ancestor,
+            ),
         )?
     } else {
         converge::diff::refs_only(

@@ -92,6 +92,11 @@ pub struct Applied {
     pub converged: bool,
     /// Custody counts, as `key=value` words.
     pub custody: Option<String>,
+    /// `--advance-ancestor` (operator ruling 2026-10-19): this apply
+    /// advanced a live checkout bulkload did not land to the capture
+    /// ([`advance`]), or finished such an advance a crash cut short, or
+    /// found the advance of this capture already done.
+    pub advanced: bool,
 }
 
 /// Custody words that describe the ordinary work of a landing. A first
@@ -123,6 +128,7 @@ impl Applied {
         Self {
             converged: false,
             custody: custody.words(),
+            advanced: false,
         }
     }
 
@@ -134,6 +140,7 @@ impl Applied {
         Self {
             converged,
             custody: shown.words(),
+            advanced: false,
         }
     }
 }
@@ -154,6 +161,14 @@ pub struct Policy<'a> {
     /// Every item id of the run's plan: A11b never re-keys a ledger that
     /// names one of them (review of 2026-10-16, finding 2).
     pub items: &'a [String],
+    /// `--advance-ancestor` (operator ruling 2026-10-19, "Yes, advance
+    /// those"): under `adopt`, a live checkout bulkload did not land whose
+    /// adopt proof finds it differs is advanced to the capture when it is
+    /// clean, its HEAD an ancestor of the captured HEAD and its branch the
+    /// captured one, free to move ([`advance`]); otherwise a typed
+    /// `GIT_ADVANCE_*` refusal, with nothing written. It holds the beside
+    /// suffix (`--beside SUFFIX`) a file-level beside takes.
+    pub advance: Option<&'a str>,
     /// `--beside SUFFIX`, when given: a non-repo directory whose item has a
     /// beside landing at `<path>SUFFIX` is never registered as a second
     /// copy (review of #286, finding 1).
@@ -1399,6 +1414,39 @@ impl Engine<'_> {
         Ok(())
     }
 
+    /// The print of a regular seat this converge just renamed into place,
+    /// from the descriptor it wrote (review of #289, finding 6: a later
+    /// `lstat` of the path took a write in between, or a file renamed over
+    /// it, as bulkload's own output). `before` is that descriptor's
+    /// metadata before the rename: the rename moves only its ctime, so a
+    /// size or mtime that moved since is a write into it, and the print
+    /// recorded is the one before (it matches nothing the seat holds now,
+    /// so the next converge proves the seat modified). The path holding
+    /// another inode is likewise never recorded as this converge's.
+    fn record_written(
+        &mut self,
+        relative: &[u8],
+        file: &fs::File,
+        before: &fs::Metadata,
+    ) -> Result<()> {
+        let now = file
+            .metadata()
+            .refuse_at("git_carry::converge::record_written")?;
+        let kept = |meta: &fs::Metadata| {
+            let (a, b) = (
+                crate::freshness::StatIdentity::from_metadata(meta),
+                crate::freshness::StatIdentity::from_metadata(before),
+            );
+            a.ino == b.ino && a.size == b.size && a.mtime_ns == b.mtime_ns
+        };
+        let chosen = if kept(&now) { &now } else { before };
+        self.written.insert(
+            relative.to_vec(),
+            SeatPrint::of(relative, chosen).ok_or_else(interrupted)?,
+        );
+        Ok(())
+    }
+
     /// The print the seat at `seat` must have before it is replaced or
     /// removed: the proof's (fresh), or its print now when its content is
     /// the old side's (settling). `Ok(None)`: not the landed seat.
@@ -1578,7 +1626,12 @@ impl Engine<'_> {
             return Err(interrupted());
         }
         self.writable(&seat.parent)?;
-        write_temp(seat, new, &mut self.objects)?;
+        let file = write_temp(seat, new, &mut self.objects)?;
+        let before = file
+            .as_ref()
+            .map(fs::File::metadata)
+            .transpose()
+            .refuse_at("git_carry::converge::add")?;
         let directory = seat.directory()?;
         if let Err(error) =
             crate::io::sys::rename_exclusive_at(&directory, &seat.temp, &directory, &seat.leaf)
@@ -1592,7 +1645,10 @@ impl Engine<'_> {
         }
         landed::sync_dir(&seat.parent)?;
         self.custody.count("seats-added");
-        self.record(seat, &op.path)
+        match (&file, &before) {
+            (Some(file), Some(before)) => self.record_written(&op.path, file, before),
+            _ => self.record(seat, &op.path),
+        }
     }
 
     fn replace(&mut self, seat: &Seat, op: &Op) -> Result<()> {
@@ -1621,7 +1677,12 @@ impl Engine<'_> {
             }
         }
         self.writable(&seat.parent)?;
-        write_temp(seat, new, &mut self.objects)?;
+        let file = write_temp(seat, new, &mut self.objects)?;
+        let before = file
+            .as_ref()
+            .map(fs::File::metadata)
+            .transpose()
+            .refuse_at("git_carry::converge::replace")?;
         fault_point!(EstateConvergeSeatBeforeExchange);
         let directory = seat.directory()?;
         if let Err(error) = crate::io::exchange(&directory, &seat.temp, &seat.leaf) {
@@ -1654,7 +1715,10 @@ impl Engine<'_> {
             fs::remove_file(&seat.temp_path).refuse_at("git_carry::converge::replace")?;
             landed::sync_dir(&seat.parent)?;
             self.custody.count("seats-replaced");
-            return self.record(seat, &op.path);
+            return match (&file, &before) {
+                (Some(file), Some(before)) => self.record_written(&op.path, file, before),
+                _ => self.record(seat, &op.path),
+            };
         }
         // Not the landed seat: it goes back, this converge's file is removed.
         crate::io::exchange(&directory, &seat.temp, &seat.leaf)
@@ -1809,15 +1873,20 @@ fn sweep_probes(worktree: &Path) -> Result<u64> {
 /// Returns the entries digest of the index it installed (or found already
 /// installed), which the ledger records (review 3 finding 3: never a
 /// re-read, which would take an operator's `git add` since for landed).
+/// `before` names the tree the replaced index holds (a converge's old
+/// capture's staged tree; an advance's live HEAD tree), for the two-way
+/// `read-tree -m`. `held` is the marker of an `index.lock` the caller
+/// already holds (an advance holds its own from the proof under the lock
+/// on, review of #289 finding 1): the index is published through it, and a
+/// refusal leaves it held for the caller to put back or keep.
 fn publish_index(
     worktree: &Path,
     git_dir: &Path,
-    metas: (&Meta, &Meta),
+    (before, after): (&str, &Meta),
     old: [u8; 32],
-    tag: &str,
+    (tag, held): (&str, Option<&[u8]>),
 ) -> Result<[u8; 32]> {
     const SITE: &str = "git_carry::converge::publish_index";
-    let (before, after) = metas;
     let lock = git_dir.join("index.lock");
     let index = git_dir.join("index");
     let fresh = git_dir.join(format!("bulkload-index-{tag}-fresh"));
@@ -1843,18 +1912,28 @@ fn publish_index(
     )?;
     super::restore_intent_to_add(worktree, Some(&fresh), &after.heads())?;
     let target = index_digest(worktree, Some(&fresh))?;
-    // A lock this converge left (a crash while holding it, finding 5).
+    // The caller's own lock, or one this converge left (a crash while
+    // holding it, finding 5).
+    let mut holding = false;
     if lstat(&lock)?.is_some() {
-        let ours = fs::read(&lock).is_ok_and(|bytes| bytes == marker.as_bytes())
-            || index_digest(worktree, Some(&lock)).is_ok_and(|found| found == target);
-        if !ours {
-            cleanup();
-            return Err(interrupted());
+        let content = fs::read(&lock).ok();
+        if held.is_some_and(|held| content.as_deref() == Some(held)) {
+            holding = true;
+        } else {
+            let ours = content.is_some_and(|bytes| bytes == marker.as_bytes())
+                || index_digest(worktree, Some(&lock)).is_ok_and(|found| found == target);
+            if !ours {
+                cleanup();
+                return Err(interrupted());
+            }
+            fs::remove_file(&lock).refuse_at(SITE)?;
         }
-        fs::remove_file(&lock).refuse_at(SITE)?;
     }
     let current = index_digest(worktree, None)?;
     if current == target {
+        if let (true, Some(held)) = (holding, held) {
+            native_refs::remove_owned_lock(&lock, &[held.to_vec()])?;
+        }
         cleanup();
         return Ok(target);
     }
@@ -1862,23 +1941,25 @@ fn publish_index(
         cleanup();
         return Err(interrupted());
     }
-    // The marker exists before the lock's name (review 4: a lock created
-    // empty and left so by a power loss proved nothing, and wedged every
-    // rerun and the operator's Git).
-    if !native_refs::publish_lock(&lock, marker.as_bytes())? {
-        cleanup();
-        return Err(interrupted());
-    }
-    fault_point!(EstateConvergeIndexLocked);
-    if index_digest(worktree, None)? != old {
-        let _ = fs::remove_file(&lock);
-        cleanup();
-        return Err(interrupted());
+    if !holding {
+        // The marker exists before the lock's name (review 4: a lock
+        // created empty and left so by a power loss proved nothing, and
+        // wedged every rerun and the operator's Git).
+        if !native_refs::publish_lock(&lock, marker.as_bytes())? {
+            cleanup();
+            return Err(interrupted());
+        }
+        fault_point!(EstateConvergeIndexLocked);
+        if index_digest(worktree, None)? != old {
+            let _ = fs::remove_file(&lock);
+            cleanup();
+            return Err(interrupted());
+        }
     }
     fs::copy(&index, &merged).refuse_at(SITE)?;
     let two_way = super::read_tree(
         git(worktree).env("GIT_INDEX_FILE", &merged),
-        &[&staged(before)?, &staged(after)?],
+        &[before, &staged(after)?],
     )
     .and_then(|()| super::restore_intent_to_add(worktree, Some(&merged), &after.heads()))
     .and_then(|()| index_digest(worktree, Some(&merged)));
@@ -1894,6 +1975,11 @@ fn publish_index(
     landed::sync_dir(git_dir)?;
     cleanup();
     Ok(target)
+}
+
+// The tree a capture's index holds, as `read-tree` names it.
+fn staged_tree(meta: &Meta) -> Result<String> {
+    Ok(format!("{}^{{tree}}", meta.get("staged")?))
 }
 
 /// The entries digest of the index a landing of `meta` installs in the
@@ -2014,9 +2100,47 @@ struct Place<'a> {
     /// standalone beside checkout is its own repository and converges as
     /// any standalone landing does.
     beside: bool,
+    /// `--advance-ancestor` (operator ruling 2026-10-19): the record of
+    /// the advance that made this live checkout bulkload's, when one did
+    /// ([`advance::Advanced`]). Its converges never touch what the advance
+    /// left to the live checkout, never replace its `info/exclude`, and
+    /// move its branch as the advance did, by compare-and-swap from the
+    /// value bulkload left it at.
+    advanced: Option<advance::Advanced>,
 }
 
 impl Place<'_> {
+    /// The seat operations a converge of this checkout runs: for an
+    /// advanced one, none at a path the advance left to the live checkout
+    /// (an ignored entry, its subtree, or the directory itself).
+    fn untouched(&self, ops: Vec<Op>) -> Vec<Op> {
+        match &self.advanced {
+            Some(advanced) => ops
+                .into_iter()
+                .filter(|op| !advanced.leaves(&op.path))
+                .collect(),
+            None => ops,
+        }
+    }
+
+    /// The sides whose directories a converge seals at their captured
+    /// mode: an advanced checkout's kept directories keep their own.
+    fn mode_sides(&self, new: &BTreeMap<Vec<u8>, Side>) -> BTreeMap<Vec<u8>, Side> {
+        new.iter()
+            .filter(|(path, _)| self.advanced.as_ref().is_none_or(|a| !a.leaves(path)))
+            .map(|(path, side)| (path.clone(), side.clone()))
+            .collect()
+    }
+
+    /// The sides a converge's workspace ledger records: an advanced
+    /// checkout's kept entries are the live checkout's, never bulkload's.
+    fn ledger_sides(&self, new: &BTreeMap<Vec<u8>, Side>) -> BTreeMap<Vec<u8>, Side> {
+        new.iter()
+            .filter(|(path, _)| self.advanced.as_ref().is_none_or(|a| !a.keeps(path)))
+            .map(|(path, side)| (path.clone(), side.clone()))
+            .collect()
+    }
+
     fn workspace_dir(&self) -> PathBuf {
         landed::ledger_dir(&self.git_dir, self.source)
     }
@@ -2224,7 +2348,8 @@ pub fn apply_workspace(
     }
     let git_dir =
         landed::worktree_git_dir(workspace)?.ok_or(BulkloadRefusal::GitDestinationOccupied)?;
-    let place = Place {
+    let advanced = advance::read_advanced(&landed::ledger_dir(&git_dir, target.source))?;
+    let mut place = Place {
         worktree: workspace,
         // A standalone item's plan base, or a linked item's that the
         // apply deferred (dogfood F2): imported before the capture, after
@@ -2235,6 +2360,7 @@ pub fn apply_workspace(
         source: target.source,
         standalone,
         beside: landing.beside && !standalone,
+        advanced,
     };
     let ledger_path = place.workspace_dir().join(landed::WORKSPACE_LANDED);
     // A12: no ledger, not bulkload's (checked before any write), unless a
@@ -2242,17 +2368,40 @@ pub fn apply_workspace(
     // short (#216's residual), finished forward under the lock.
     let destination = super::linked_destination(workspace)?;
     let landing_intent = landed::landing_intent_path(&place.ref_dir(), &destination);
-    let recovering = !landed::exists(&ledger_path)?;
+    let mut recovering = !landed::exists(&ledger_path)?;
+    // `--advance-ancestor` (operator ruling 2026-10-19): an advance a crash
+    // cut short (before its ledger, or between its ledger and the intent's
+    // removal) is settled forward first, under the lock, before anything
+    // reads this checkout as one bulkload did or did not land. One that
+    // wrote nothing but its intent is dropped, and the checkout is proved
+    // afresh.
+    let mut prior = Custody::default();
+    let mut advanced_now = false;
+    if advance::pending(&place)? {
+        let lock = landed::lock(&place.common, place.source)?;
+        prior = settle_repository(workspace, &place.common, place.source)?;
+        prior.add("probe-removed", sweep_probes(workspace)?);
+        if let Some(done) = advance::settle(&place, landing)? {
+            prior.merge(done);
+            advanced_now = true;
+        }
+        drop(lock);
+        recovering = !landed::exists(&ledger_path)?;
+        place.advanced = advance::read_advanced(&place.workspace_dir())?;
+    }
     if recovering && (standalone || !landed::exists(&landing_intent)?) {
         // A11a (#226): with `--adopt`, an existing checkout bulkload never
-        // landed becomes bulkload's when it proves equal to the capture.
+        // landed becomes bulkload's when it proves equal to the capture;
+        // with `--advance-ancestor`, one that differs is advanced to it
+        // when it may be ([`advance`]).
         if policy.adopt {
-            return adopt::workspace(staged, target, landing, &place);
+            return adopt::workspace(staged, target, landing, &place, policy.advance);
         }
         return Err(BulkloadRefusal::GitDestinationOccupied);
     }
     let _lock = landed::lock(&place.common, place.source)?;
     let mut custody = settle_repository(workspace, &place.common, place.source)?;
+    custody.merge(prior);
     // Review 3 finding 9: probe files a crashed pass left.
     custody.add("probe-removed", sweep_probes(workspace)?);
     if recovering {
@@ -2311,16 +2460,33 @@ pub fn apply_workspace(
     }
     let meta0 = Meta::read(workspace, place.source, &ledger.instance)?;
     let old = handoff::landed_sides(workspace, &place.git_dir, place.source, &meta0)?;
+    // An advanced checkout's `info/exclude` is the live checkout's: never
+    // bulkload's to prove.
+    let own_exclude = standalone && place.advanced.is_none();
+    // The advance of this capture, done now or before (a crash between
+    // its ledger and the item's journal): the caller still retires the
+    // beside landing it made redundant.
+    let advanced = advanced_now
+        || place
+            .advanced
+            .as_ref()
+            .is_some_and(|advanced| advanced.capture == landing.capture);
     if ledger.capture == landing.capture {
         // A6 (finding 15a): the ledger is ahead of the journal; prove it.
-        prove(workspace, &place.common, &ledger, standalone, &old)?;
+        prove(workspace, &place.common, &ledger, own_exclude, &old)?;
         custody.count("journal-recovered");
-        return Ok(Applied::of(converged, &custody));
+        let mut applied = if advanced_now {
+            Applied::adopted(&custody)
+        } else {
+            Applied::of(converged, &custody)
+        };
+        applied.advanced = advanced;
+        return Ok(applied);
     }
     if landing.observed_ns <= ledger.observed_ns {
         return Err(BulkloadRefusal::GitConvergeStaleCapture);
     }
-    let proof = prove(workspace, &place.common, &ledger, standalone, &old)?;
+    let proof = prove(workspace, &place.common, &ledger, own_exclude, &old)?;
     custody.merge(converge(
         &place,
         staged,
@@ -2329,7 +2495,9 @@ pub fn apply_workspace(
         (&meta0, &old),
         &proof,
     )?);
-    Ok(Applied::of(true, &custody))
+    let mut applied = Applied::of(true, &custody);
+    applied.advanced = advanced_now;
+    Ok(applied)
 }
 
 /// Gap C12: why the checkout at `target`'s workspace, whose workspace
@@ -2399,7 +2567,7 @@ fn converge(
     let meta1 = Meta::read(worktree, place.source, &instance)?;
     shape(meta0, &meta1)?;
     let new = sides(worktree, &meta1)?;
-    let ops = delta(old, &new);
+    let ops = place.untouched(delta(old, &new));
     // TIN-6569: a file the hand-off created where the source now adds one
     // is bulkload's own when it is exactly its recorded block: lifted
     // before the clash check (design 6.3).
@@ -2472,8 +2640,25 @@ fn converge(
         plan.intended.clone_from(&symbolic);
         plan.line = Some("head-detached-beside");
     }
+    // `--advance-ancestor`: an advanced checkout's branch is moved as the
+    // advance moved it, by compare-and-swap from the value bulkload left
+    // it at (its own unchanged output, LIVE-30), never detached for being
+    // a foreign repository's.
+    if let Some(moved) = advance::branch_plan(
+        place,
+        ledger,
+        symbolic.as_deref(),
+        (&native, &others),
+        meta1.get("head")?,
+    ) {
+        plan = moved;
+    }
     let exclude_bytes = meta1.exclude(worktree)?;
-    let exclude = (place.standalone && exclude_digest(&exclude_bytes) != ledger.exclude)
+    // An advanced checkout's `info/exclude` is the live checkout's, never
+    // replaced.
+    let exclude = (place.standalone
+        && place.advanced.is_none()
+        && exclude_digest(&exclude_bytes) != ledger.exclude)
         .then(|| (ledger.exclude, exclude_digest(&exclude_bytes)));
     let mut intent = WorkspaceIntent {
         from: ledger.capture,
@@ -2519,16 +2704,16 @@ fn converge(
             engine.run(op)?;
             fault_point!(EstateConvergeAfterSeat);
         }
-        engine.modes(&new)?;
+        engine.modes(&place.mode_sides(&new))?;
         engine.objects.finish()?;
         place.exclude(intent.exclude, &exclude_bytes)?;
         super::restore_gitlink_directories(worktree, meta1.get("staged")?, &meta1.heads())?;
         let index = publish_index(
             worktree,
             &place.git_dir,
-            (meta0, &meta1),
+            (&staged_tree(meta0)?, &meta1),
             ledger.index,
-            &tag,
+            (&tag, None),
         )?;
         fault_point!(EstateConvergeAfterIndex);
         set_head(worktree, &ledger.head, &plan.head, plan.branch.as_ref())
@@ -2552,7 +2737,7 @@ fn converge(
             (landing.capture, landing.observed_ns, &instance),
             (plan.head, plan.intended),
             (index, intent.exclude.map_or(ledger.exclude, |(_, new)| new)),
-            &new,
+            &place.ledger_sides(&new),
             &proof.prints,
             &engine.written,
         )?;
@@ -2630,19 +2815,19 @@ fn settle(place: &Place<'_>, ledger: &LandedWorkspace) -> Result<Custody> {
         written: BTreeMap::new(),
         custody: Custody::default(),
     };
-    for op in delta(&old, &new) {
+    for op in place.untouched(delta(&old, &new)) {
         engine.run(&op)?;
     }
-    engine.modes(&new)?;
+    engine.modes(&place.mode_sides(&new))?;
     engine.objects.finish()?;
     place.exclude(intent.exclude, &meta1.exclude(worktree)?)?;
     super::restore_gitlink_directories(worktree, meta1.get("staged")?, &meta1.heads())?;
     let index = publish_index(
         worktree,
         &place.git_dir,
-        (&meta0, &meta1),
+        (&staged_tree(&meta0)?, &meta1),
         intent.index_old,
-        &intent.tag,
+        (&intent.tag, None),
     )?;
     let head_old = intent.head.0.clone();
     let current = head_of(worktree)?;
@@ -2740,7 +2925,7 @@ fn settle(place: &Place<'_>, ledger: &LandedWorkspace) -> Result<Custody> {
         (intent.to, intent.to_observed_ns, &intent.to_instance),
         (intent.head.1.clone(), intent.intended_branch.clone()),
         (index, intent.exclude.map_or(ledger.exclude, |(_, new)| new)),
-        &new,
+        &place.ledger_sides(&new),
         &kept,
         &engine.written,
     )?;
@@ -2902,11 +3087,13 @@ pub fn pending(workspace: Option<&Path>, repository: &Path, source: &str) -> Res
     let Some((git_dir, common)) = locate(workspace, repository)? else {
         return Ok(Pending::default());
     };
+    let workspace_dir = landed::ledger_dir(&git_dir, source);
     Ok(Pending {
         refs: landed::exists(&landed::ledger_dir(&common, source).join(landed::REFS_INTENT))?,
-        workspace: landed::exists(
-            &landed::ledger_dir(&git_dir, source).join(landed::WORKSPACE_INTENT),
-        )?,
+        // An advance a crash cut short (`--advance-ancestor`) is pending
+        // too: a rerun with or without the flag settles it.
+        workspace: landed::exists(&workspace_dir.join(landed::WORKSPACE_INTENT))?
+            || landed::exists(&workspace_dir.join(advance::INTENT))?,
     })
 }
 
@@ -3803,6 +3990,7 @@ pub(super) fn finish_landing(
 }
 
 mod adopt;
+pub mod advance;
 pub(super) use adopt::{prove_seats, seats_still};
 pub mod diff;
 pub mod handoff;

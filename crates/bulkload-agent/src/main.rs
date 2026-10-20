@@ -77,7 +77,7 @@ SUBCOMMANDS:
                 Append selected items in one linear plan update
     estate-capture PLAN PRIVATE_STATE CORPUS JOBS [--include-rebuildable]
                 Capture reviewed Git items with successful capture reuse (jobs 1 or 2)
-    estate-apply [--adopt] [--exclude-union] [--beside SUFFIX] [--refs-in] [--activate-origin PREFIX]... [--side-root ROOT]... PLAN CORPUS PRIVATE_STATE SOURCE JOBS
+    estate-apply [--adopt] [--exclude-union] [--beside SUFFIX] [--refs-in] [--advance-ancestor] [--activate-origin PREFIX]... [--side-root ROOT]... PLAN CORPUS PRIVATE_STATE SOURCE JOBS
                 Import refs and restore only explicitly selected absent workspaces.
                 A landed checkout bulkload proves unchanged converges to the
                 current capture. --adopt (#226, OI-1003-Q171/Q172): an existing
@@ -165,6 +165,45 @@ SUBCOMMANDS:
                 included as refs/NS-stash/N, and closure prints refs_in on the
                 refused row. A ref named refs/NS itself refuses the item
                 GIT_DESTINATION_OCCUPIED before it writes anything.
+                --advance-ancestor (operator ruling 2026-10-19, 'Yes, advance
+                those'; needs --adopt and --beside): a live checkout bulkload
+                did not land that differs from the capture is advanced in
+                place instead of landing beside, when (proved before any
+                write and again under the destination lock) its HEAD is an
+                ancestor of the captured HEAD (else GIT_ADVANCE_NOT_ANCESTOR),
+                its branch is the captured one, or both are detached (else
+                GIT_ADVANCE_BRANCH_MISMATCH: never detached or switched), that
+                branch is a plain ref at the live HEAD no other worktree or
+                pending intent holds (else GIT_ADVANCE_BRANCH_BUSY), and its
+                worktree and index are clean: nothing staged, unstaged or
+                untracked but ignored files, no operation in progress, no
+                assume-unchanged or skip-worktree entry (else
+                GIT_ADVANCE_NOT_CLEAN); a change since the proof refuses
+                GIT_ADVANCE_RACED. The advance moves that branch (or the
+                detached HEAD) by compare-and-swap from the proved tip, then
+                lays down the captured tree, dirty and untracked files and
+                index as a landing does; an ignored entry of the live
+                checkout where the capture lands one is never touched (left,
+                counted advance-kept=N), and the captured file there lands
+                beside it as PATHSUFFIX, create-only
+                (advance-file-besides=N); nor are other branches, the stash,
+                other worktrees, configuration or info/exclude. The checkout is
+                then landed (workspace-restored, ledgered; recorded in its
+                .git as advanced), the captured refs and stash entries go in
+                under --refs-in, and the item's beside landing, brought to
+                the capture as every beside pass brings it, is retired
+                (renamed aside, then removed) only when it is this item's
+                and proves equal to the live tree (HEAD, index, every file,
+                a sealed hand-off block the one difference allowed; nothing
+                its Git holds unreachable from the live repository), else
+                kept with a reason (receipt advance-beside=retired|kept|
+                absent advance-beside-reason=...); a kept beside is a
+                duplicate: closure holds the item refused-pending-review
+                GIT_ADVANCE_BESIDE_KEPT until closure-dispose. A refused advance writes
+                nothing at the live checkout, lands beside in the same pass,
+                and is recorded in PRIVATE_STATE ITEM-SOURCE.advance: closure
+                holds the item refused-pending-review with that code until
+                closure-dispose. A crash is finished by the rerun.
                 --side-root ROOT (repeatable; M2r2 item e; needs --adopt):
                 after the preflights and before any item, each planned path
                 spelled through a symlink whose one hop names a directory
@@ -202,7 +241,7 @@ SUBCOMMANDS:
                 Each pass writes its mark to move-source.started first and,
                 once every item answered, to move-source.done. MOVE_STATE is
                 0700 and flocked
-    estate-move --label LABEL --source SOURCE [--plan-only] [--exclude-union] [--no-hand-off]
+    estate-move --label LABEL --source SOURCE [--plan-only] [--exclude-union] [--advance-ancestor] [--no-hand-off]
                 [--activate-origin PREFIX]... [--side-root ROOT]... [--jobs N] [--dispositions LEDGER]
                 [--sessions SOURCE_HOME [--codex-source-root DIR] [--dest-home DIR]
                  [--map SRC=DST]... [--reseat-arg ARG]...]
@@ -235,7 +274,8 @@ SUBCOMMANDS:
                 captured. --plan-only stops here, recording nothing, after an
                 estate-diff preview (MOVE_STATE/diff.jsonl). 3 apply:
                 estate-apply --adopt --beside .LABEL --refs-in (with
-                --exclude-union, --activate-origin, --side-root as given)
+                --exclude-union, --advance-ancestor, --activate-origin,
+                --side-root as given)
                 into MOVE_STATE/private, --jobs N (default 2); when every
                 item answered, item
                 refusals are each item's and the pass goes on, else it stops.
@@ -271,7 +311,7 @@ SUBCOMMANDS:
                 interrupted undo is finished, never re-seated). Refuses
                 RECEIPT_BINDING_INVALID, changing no path, when either path no
                 longer holds what the seat left.
-    estate-diff [--since NS] [--scan DIR]... [--activate-origin PREFIX]... [--side-root ROOT]... [--beside SUFFIX] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
+    estate-diff [--since NS] [--scan DIR]... [--activate-origin PREFIX]... [--side-root ROOT]... [--beside SUFFIX] [--advance-ancestor] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
                 Read-only: classify each plan item against the destination now
                 (identical, source-only, source-ahead, dest-ahead, diverged with a
                 ledger; differs with a hint without one), with what estate-apply
@@ -280,7 +320,11 @@ SUBCOMMANDS:
                 rebuildable omissions and the origin a first landing activates;
                 plus worktrees of planned repositories no item plans and, with
                 --scan, Git directories under DIR in no planned family
-                (dest-only). One bulkload.estate-diff.v1 JSON line per row
+                (dest-only). With --advance-ancestor, a diverged live checkout
+                estate-apply --advance-ancestor would advance reads
+                adopt:advance, one it would refuse keeps diverged with the
+                component advance-refused=CODE (estate-move --plan-only with
+                the flag passes it). One bulkload.estate-diff.v1 JSON line per row
     estate-handoff [--check | --clear [--clear-carried] | --dry-run] [--item ID]...
                 [--workspace PATH]... [--sibling LANDED_PREFIX=LIVE_PREFIX]...
                 [--readme] [--renew] [--as-of NS] PLAN CORPUS PRIVATE_STATE SOURCE
@@ -1734,8 +1778,11 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
             if rest.len() != 5 || options.since.is_some() || !options.scan.is_empty() {
                 return Err(BulkloadRefusal::RequiredFieldMissing);
             }
-            // `--refs-in` names its refs under the `--beside` namespace.
-            if options.refs_in && (options.beside.is_none() || !options.adopt) {
+            // `--refs-in` names its refs under the `--beside` namespace;
+            // `--advance-ancestor` falls back to the beside landing.
+            if (options.refs_in || options.advance_ancestor)
+                && (options.beside.is_none() || !options.adopt)
+            {
                 return Err(BulkloadRefusal::RequiredFieldMissing);
             }
             let path = |i: usize| -> Result<&Path> {
@@ -1761,6 +1808,7 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
                         exclude_union: options.exclude_union,
                         beside: options.beside,
                         refs_in: options.refs_in,
+                        advance_ancestor: options.advance_ancestor,
                     },
                 ),
                 &receipt,
@@ -1793,6 +1841,7 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
                     scan: options.scan,
                     activate_origin: options.activate_origin,
                     beside: options.beside,
+                    advance_ancestor: options.advance_ancestor,
                     side_roots: options.side_roots,
                 },
                 &mut |line| writeln!(output, "{line}").refuse_at("main::estate_command"),
@@ -2192,12 +2241,15 @@ fn handoff_options(
 
 /// The options `estate-apply` and `estate-diff` take before their
 /// positional arguments (#226).
+// Each bool is one independent command-line flag.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Default)]
 struct EstateOptions {
     adopt: bool,
     exclude_union: bool,
     beside: Option<String>,
     refs_in: bool,
+    advance_ancestor: bool,
     activate_origin: Vec<String>,
     since: Option<i128>,
     scan: Vec<PathBuf>,
@@ -2220,6 +2272,10 @@ fn estate_options(args: &[std::ffi::OsString]) -> Result<(EstateOptions, &[std::
             }
             "--refs-in" if !options.refs_in => {
                 options.refs_in = true;
+                at += 1;
+            }
+            "--advance-ancestor" if !options.advance_ancestor => {
+                options.advance_ancestor = true;
                 at += 1;
             }
             "--beside" if options.beside.is_none() => {

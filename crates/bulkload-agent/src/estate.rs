@@ -2332,8 +2332,31 @@ fn apply_item(
     if journal.try_exists().refuse_at("estate::apply_item")? {
         let pending =
             git_carry::converge::pending(item.workspace.as_deref(), &item.repository, source)?;
-        if !pending.workspace {
-            let done: String = read(&journal)?;
+        let done: String = read(&journal)?;
+        // `--advance-ancestor` (operator ruling 2026-10-19): a beside journal
+        // of this capture does not end an item whose live checkout may be
+        // advanced now (or whose advance a crash cut short); one whose
+        // advance would refuse keeps it, its refusal recorded for closure.
+        let retry = done == "workspace-beside"
+            && options.advance_ancestor
+            && advance_retry(item, state, (&identity, source), &captured.digest)?;
+        // A beside retirement a crash cut short is finished by a rerun,
+        // with or without the flag, and one put back for a transient
+        // reason (a write or a process inside it) is tried again.
+        let retiring = retire_record_path(state, &identity, source)
+            .try_exists()
+            .refuse_at("estate::apply_item")?
+            || (done == "workspace-restored"
+                && git_carry::converge::advance::read_record(&advance_record_path(
+                    state, &identity, source,
+                ))?
+                .is_some_and(|record| {
+                    record.item == identity
+                        && record.capture == captured.digest
+                        && record.outcome == "advanced"
+                        && record.beside == "pending"
+                }));
+        if !pending.workspace && !retry && !retiring {
             let outcome = match done.as_str() {
                 "workspace-restored" => "previous-workspace-restoration-not-revalidated",
                 "workspace-beside" => "previous-workspace-beside-not-revalidated",
@@ -2440,8 +2463,18 @@ fn apply_item(
         adopt: options.adopt,
         origins: &options.activate_origin,
         items,
+        advance: options
+            .beside
+            .as_deref()
+            .filter(|_| options.advance_ancestor),
         beside: options.beside.as_deref(),
     };
+    // `--advance-ancestor` (review of #289, finding 3): a beside
+    // retirement a crash cut short is finished, or its tree put back,
+    // before the item's workspace step, whatever that step answers; its
+    // outcome is recorded for closure (a tree left under its private name
+    // is listed pending, never silent).
+    let retired_before = settle_retirement(state, (&identity, source))?;
     let (outcome, mut applied) = if item.workspace.is_some() {
         let landed_before = landed_before(state, &identity, source, &journal)?;
         let (outcome, applied) = match git_carry::converge::apply_workspace(
@@ -2454,15 +2487,21 @@ fn apply_item(
             Ok(applied) => ("workspace-restored", applied),
             // M2 round 2 item c: the planned checkout exists, its adopt
             // proof refused (nothing written), and it stays as it is; the
-            // capture lands beside it. Review B2: no other refusal does.
-            // 2026-10-19 (the td01 batch): a non-repo directory at a linked
-            // item's planned path that does not prove equal, or a standalone
-            // item's, is left as it is and the capture lands beside it too;
-            // the code is the beside landing's recorded reason.
-            Err(
-                reason @ (BulkloadRefusal::GitDestinationDiverged
-                | BulkloadRefusal::GitDestinationNonrepoDiffers),
-            ) if options.adopt => {
+            // capture lands beside it. Review B2: no other refusal does,
+            // but these. 2026-10-19 (the td01 batch): a non-repo directory
+            // at a linked item's planned path that does not prove equal, or
+            // a standalone item's, is left as it is and the capture lands
+            // beside it too; the code is the beside landing's recorded
+            // reason. `--advance-ancestor` (operator rulings 2026-10-19):
+            // each refused advance or switch is recorded in STATE for
+            // closure (pending review) and the capture lands beside the
+            // live checkout in this same pass, as without the flag.
+            Err(reason)
+                if options.adopt
+                    && (reason == BulkloadRefusal::GitDestinationDiverged
+                        || reason == BulkloadRefusal::GitDestinationNonrepoDiffers
+                        || reason.is_advance_refusal()) =>
+            {
                 let Some(suffix) = options.beside.as_deref() else {
                     return Err(reason);
                 };
@@ -2474,13 +2513,39 @@ fn apply_item(
                 {
                     return Err(reason);
                 }
+                let refused = reason.is_advance_refusal().then(|| reason.clone());
+                if let (Some(refused), Some(workspace)) = (&refused, item.workspace.as_deref()) {
+                    record_advance(
+                        state,
+                        (&identity, source, captured.digest),
+                        workspace,
+                        refused,
+                    )?;
+                    // A process inside the live checkout (the coordinator's
+                    // decision on #289, C19): retried by the next pass, and
+                    // no beside written while one already exists.
+                    if refused.is_advance_in_use()
+                        && fs::symlink_metadata(git_carry::beside::path(workspace, suffix)).is_ok()
+                    {
+                        return Err(refused.clone());
+                    }
+                }
                 match beside_item(
                     &staged,
                     &target,
                     &landing,
                     (state, &policy, suffix, &reason),
                 ) {
-                    Ok(applied) => ("workspace-beside", applied),
+                    Ok(mut applied) => {
+                        if let Some(refused) = &refused {
+                            let words = format!("advance-refused={}", refused.code());
+                            applied.custody = Some(match applied.custody.take() {
+                                Some(more) => format!("{more} {words}"),
+                                None => words,
+                            });
+                        }
+                        ("workspace-beside", applied)
+                    }
                     // Gap C12 (A-115): the tree waits for review beside the
                     // live checkout, but the item's refs go in now, branches,
                     // tags and stash entries, create-only under `refs/<ns>/`
@@ -2520,22 +2585,51 @@ fn apply_item(
     // M2 item 7 (`estate-move`): refs-in after an adopt, a landing or a
     // converge, before the journal, so a crash is finished by the rerun. A
     // beside landing took every captured ref under the namespace already.
+    // An advanced live checkout's stash is the live one's, never touched,
+    // so the captured stash entries go in as `refs/<ns>-stash/<n>` too.
     if options.refs_in && outcome != "workspace-beside" {
         let suffix = options
             .beside
             .as_deref()
             .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+        // An advanced checkout (now or by an earlier pass) keeps its own
+        // stash: the capture's entries go in under the namespace.
+        let stash = applied.advanced
+            || match item.workspace.as_deref() {
+                Some(workspace) => {
+                    git_carry::converge::advance::advanced_at(workspace, source)?.is_some()
+                }
+                None => false,
+            };
         let words = refs_in(
             item,
             &staged,
             &target,
             (state, &identity, suffix),
-            (captured.digest, false),
+            (captured.digest, stash),
         )?;
         applied.custody = Some(match applied.custody.take() {
             Some(more) => format!("{more} {words}"),
             None => words,
         });
+    }
+    // `--advance-ancestor`: after an advance (now, or finished after a
+    // crash), its record in STATE, then the beside landing it made
+    // redundant retired once proved equal to the live tree; a retirement a
+    // crash cut short is finished first. Before the journal, so a crash is
+    // finished by the rerun.
+    if outcome == "workspace-restored" {
+        if let Some(words) = advanced_item(
+            item,
+            (&staged, &target, &landing, &policy),
+            (state, &identity, source, captured.digest),
+            (options, applied.advanced, retired_before),
+        )? {
+            applied.custody = Some(match applied.custody.take() {
+                Some(more) => format!("{more} {words}"),
+                None => words,
+            });
+        }
     }
     write(&journal, &outcome.to_owned())?;
     let mut done = Completion::clean(outcome).naming(nested);
@@ -2744,6 +2838,371 @@ pub fn refs_in_record_path(state: &Path, identity: &str, source: &str) -> PathBu
         "{identity}-{}.refs-in",
         blake3::hash(source.as_bytes()).to_hex()
     ))
+}
+
+/// Where an item's `--advance-ancestor` outcome is recorded (operator
+/// ruling 2026-10-19): `{item}-{blake3(source)}.advance` in STATE, a
+/// [`git_carry::converge::advance::AdvanceRecord`].
+#[must_use]
+pub fn advance_record_path(state: &Path, identity: &str, source: &str) -> PathBuf {
+    state.join(format!(
+        "{identity}-{}.advance",
+        blake3::hash(source.as_bytes()).to_hex()
+    ))
+}
+
+/// Where an item's beside retirement under way is recorded:
+/// `{item}-{blake3(source)}.retire` in STATE, a
+/// [`git_carry::beside::retire::RetireIntent`].
+#[must_use]
+pub fn retire_record_path(state: &Path, identity: &str, source: &str) -> PathBuf {
+    state.join(format!(
+        "{identity}-{}.retire",
+        blake3::hash(source.as_bytes()).to_hex()
+    ))
+}
+
+// Record that `capture`'s advance of the live checkout at `workspace` was
+// refused with `refusal` (closure holds the item pending review, its
+// detail printed), unless the record already says so for the same live
+// HEAD and untracked files.
+fn record_advance(
+    state: &Path,
+    (identity, source, capture): (&str, &str, [u8; 32]),
+    workspace: &Path,
+    refusal: &BulkloadRefusal,
+) -> Result<()> {
+    use git_carry::converge::advance;
+    let path = advance_record_path(state, identity, source);
+    let (live, branch) = advance::live_head(workspace).unwrap_or_default();
+    // The colliding paths, so a rerun proves the item again once one is
+    // gone (an ignored one is in no untracked digest).
+    let paths = match refusal {
+        BulkloadRefusal::GitAdvanceUntrackedCollides(listed)
+        | BulkloadRefusal::GitSwitchUntrackedCollides(listed) => listed
+            .split(|byte| *byte == b'\n')
+            .filter(|path| !path.is_empty() && !path.starts_with(b"+"))
+            .map(<[u8]>::to_vec)
+            .collect(),
+        _ => Vec::new(),
+    };
+    let record = advance::AdvanceRecord {
+        item: identity.to_owned(),
+        capture,
+        live,
+        branch,
+        outcome: refusal.code().to_owned(),
+        detail: refusal.to_string(),
+        paths,
+        untracked: advance::untracked_digest(workspace, source)
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+        ..advance::AdvanceRecord::default()
+    };
+    if advance::read_record(&path)?.as_ref() != Some(&record) {
+        advance::write_record(&path, &record)?;
+    }
+    Ok(())
+}
+
+// `--advance-ancestor`: whether an item whose beside journal closed its
+// current capture is proved again ([`git_carry::converge::advance::gate`]):
+// not when the live path is no checkout, nor when an advance would refuse
+// now (recorded), nor when this capture's advance was refused for a reason
+// the capture, the live HEAD and its untracked files alone decide (not an
+// ancestor, another branch, a collision) and none of them moved since.
+fn advance_retry(
+    item: &Item,
+    state: &Path,
+    (identity, source): (&str, &str),
+    capture: &[u8; 32],
+) -> Result<bool> {
+    use git_carry::converge::advance;
+    use std::os::unix::ffi::OsStrExt as _;
+    let Some(workspace) = item.workspace.as_deref() else {
+        return Ok(false);
+    };
+    match advance::gate(workspace, source)? {
+        advance::Gate::Leave => Ok(false),
+        advance::Gate::Refused(refusal) => {
+            record_advance(state, (identity, source, *capture), workspace, &refusal)?;
+            Ok(false)
+        }
+        advance::Gate::Try(untracked) => {
+            let decided = advance::read_record(&advance_record_path(state, identity, source))?
+                .filter(|record| {
+                    record.item == identity
+                        && record.capture == *capture
+                        && record.untracked == untracked
+                        && matches!(
+                            record.outcome.as_str(),
+                            "GIT_ADVANCE_NOT_ANCESTOR"
+                                | "GIT_ADVANCE_BRANCH_MISMATCH"
+                                | "GIT_ADVANCE_UNTRACKED_COLLIDES"
+                                | "GIT_SWITCH_UNTRACKED_COLLIDES"
+                        )
+                });
+            Ok(match decided {
+                Some(record) => {
+                    advance::live_head(workspace).ok() != Some((record.live, record.branch))
+                        || !record.paths.iter().all(|path| {
+                            workspace
+                                .join(std::ffi::OsStr::from_bytes(path))
+                                .symlink_metadata()
+                                .is_ok()
+                        })
+                }
+                None => true,
+            })
+        }
+    }
+}
+
+// `--advance-ancestor`, after an item's workspace outcome: the advance
+// record in STATE (`advanced`, with the live HEAD it moved from), a
+// retirement a crash cut short finished, then (when this pass advanced or
+// finished an advance a flagged pass began) the item's beside landing
+// retired once proved equal to the live tree. Its receipt words, `None`
+// when the item was not advanced.
+#[allow(clippy::too_many_lines)]
+fn advanced_item(
+    item: &Item,
+    (staged, target, landing, policy): (
+        &git_carry::StagedBundle,
+        &git_carry::converge::Target<'_>,
+        &git_carry::converge::Landing<'_>,
+        &git_carry::converge::Policy<'_>,
+    ),
+    (state, identity, source, capture): (&Path, &str, &str, [u8; 32]),
+    (options, advanced, pending): (
+        &ApplyOptions,
+        bool,
+        Option<git_carry::beside::retire::Retired>,
+    ),
+) -> Result<Option<String>> {
+    use git_carry::converge::advance;
+    use std::fmt::Write as _;
+    let Some(workspace) = item.workspace.as_deref() else {
+        return Ok(None);
+    };
+    let record_path = advance_record_path(state, identity, source);
+    let retire_path = retire_record_path(state, identity, source);
+    if !advanced && pending.is_none() {
+        return Ok(None);
+    }
+    let held = advance::read_record(&record_path)?
+        .filter(|record| record.item == identity && record.capture == capture);
+    let mut record = match held {
+        Some(record) if record.outcome == "advanced" => record,
+        _ => {
+            let done = advance::advanced_at(workspace, source)?;
+            advance::AdvanceRecord {
+                item: identity.to_owned(),
+                capture,
+                live: done
+                    .as_ref()
+                    .map(|done| done.from.oid.clone())
+                    .unwrap_or_default(),
+                branch: done
+                    .as_ref()
+                    .and_then(|done| done.from.symbolic.clone())
+                    .unwrap_or_default(),
+                outcome: "advanced".to_owned(),
+                beside: "pending".to_owned(),
+                reason: String::new(),
+                kept: done.as_ref().map_or(0, |done| {
+                    u64::try_from(done.left.kept.len()).unwrap_or(u64::MAX)
+                }),
+                besides: done.as_ref().map_or(0, |done| {
+                    u64::try_from(done.left.besides.len()).unwrap_or(u64::MAX)
+                }),
+                switched: done.as_ref().is_some_and(advance::Advanced::switched),
+                ..advance::AdvanceRecord::default()
+            }
+        }
+    };
+    advance::write_record(&record_path, &record)?;
+    // A retirement put back for a transient reason before the workspace
+    // step is tried again now.
+    let pending = pending.filter(|done| !transient(done));
+    let mut carried = git_carry::beside::retire::Carried::default();
+    let decided = match (pending, options.beside.as_deref()) {
+        (Some(done), _) => Some(Some(done)),
+        // The advance was begun under `--advance-ancestor`: its beside
+        // landing is retired even by a rerun that finishes it without.
+        (None, Some(suffix)) if record.beside == "pending" => Some(
+            retire_beside(
+                workspace,
+                (staged, target, landing, policy),
+                (
+                    &retire_path,
+                    &exclude_union_path(state, identity, source),
+                    identity,
+                    capture,
+                ),
+                suffix,
+            )?
+            .map(|(done, carry)| {
+                carried = carry;
+                done
+            }),
+        ),
+        (None, _) => None,
+    };
+    if let Some(done) = decided {
+        note_retired(&mut record, done.as_ref());
+        advance::write_record(&record_path, &record)?;
+    }
+    // What a standalone beside carried into the live repository first, created
+    // only where absent (the coordinator's decision on #289).
+    let mut carried_words = String::new();
+    for (name, count) in [
+        ("advance-config-added", carried.config),
+        ("advance-exclude-appended", carried.exclude),
+    ] {
+        if count > 0 {
+            let _ = write!(carried_words, " {name}={count}");
+        }
+    }
+    Ok(Some(format!(
+        "advance-file-besides={} advance-beside={}{}{}{carried_words}",
+        record.besides,
+        record.beside,
+        if record.reason.is_empty() {
+            String::new()
+        } else {
+            format!(" advance-beside-reason={}", record.reason)
+        },
+        if record.switched {
+            format!(" advance-switched-from={}@{}", record.branch, record.live)
+        } else {
+            String::new()
+        }
+    )))
+}
+
+// Whether a retirement was put back for a reason the next try may not
+// meet (a write while it was proved, a process inside it): its tree is
+// back at its path, its record gone, and it is tried again.
+fn transient(done: &git_carry::beside::retire::Retired) -> bool {
+    matches!(done.reason(), "raced" | "in-use" | "written-since")
+}
+
+// What became of an advance's beside landing (`None`: the beside path held
+// nothing), in its record: `retired`; `absent`; `pending` (put back for a
+// transient reason, tried again); else `kept`. A beside not retired is a
+// duplicate: closure holds it pending review with
+// `GIT_ADVANCE_BESIDE_KEPT` and the reason (the coordinator's decision 4
+// on #289).
+fn note_retired(
+    record: &mut git_carry::converge::advance::AdvanceRecord,
+    done: Option<&git_carry::beside::retire::Retired>,
+) {
+    use git_carry::beside::retire::Retired;
+    let (beside, reason) = match done {
+        Some(Retired::Retired) => ("retired", ""),
+        None => ("absent", ""),
+        Some(Retired::Kept(reason)) if reason == "gone" => ("absent", ""),
+        Some(kept @ Retired::Kept(reason)) => (
+            if transient(kept) { "pending" } else { "kept" },
+            reason.as_str(),
+        ),
+    };
+    beside.clone_into(&mut record.beside);
+    reason.clone_into(&mut record.reason);
+    record.detail = if reason.is_empty() {
+        String::new()
+    } else {
+        BulkloadRefusal::GitAdvanceBesideKept(reason.as_bytes().to_vec()).to_string()
+    };
+}
+
+// `--advance-ancestor` (review of #289, finding 3): finish the beside
+// retirement a crash cut short (or put its tree back) before the item's
+// workspace step, and record its outcome in the item's advance record.
+fn settle_retirement(
+    state: &Path,
+    (identity, source): (&str, &str),
+) -> Result<Option<git_carry::beside::retire::Retired>> {
+    use git_carry::converge::advance;
+    let Some(done) =
+        git_carry::beside::retire::settle(&retire_record_path(state, identity, source))?
+    else {
+        return Ok(None);
+    };
+    let path = advance_record_path(state, identity, source);
+    if let Some(mut record) = advance::read_record(&path)?
+        .filter(|record| record.item == identity && record.outcome == "advanced")
+    {
+        note_retired(&mut record, Some(&done));
+        advance::write_record(&path, &record)?;
+    }
+    Ok(Some(done))
+}
+
+// Retire the beside landing at `<workspace>SUFFIX` an advance made
+// redundant ([`git_carry::beside::retire`]): absent, nothing to do; else
+// brought to the capture first, as every beside pass brings it (gap C12:
+// converged, re-keyed or adopted by proof, never laid down), kept when
+// that refuses or when its ledger does not then name this item and
+// capture (never one the item does not own), and retired only once proved
+// equal to the live tree.
+fn retire_beside(
+    workspace: &Path,
+    (staged, target, landing, policy): (
+        &git_carry::StagedBundle,
+        &git_carry::converge::Target<'_>,
+        &git_carry::converge::Landing<'_>,
+        &git_carry::converge::Policy<'_>,
+    ),
+    (retire_path, exclude_path, identity, capture): (&Path, &Path, &str, [u8; 32]),
+    suffix: &str,
+) -> Result<
+    Option<(
+        git_carry::beside::retire::Retired,
+        git_carry::beside::retire::Carried,
+    )>,
+> {
+    use git_carry::beside::retire::{self, Carried, Retired};
+    let beside = git_carry::beside::path(workspace, suffix);
+    if fs::symlink_metadata(&beside).is_err() {
+        return Ok(None);
+    }
+    let beside_landing = git_carry::converge::Landing {
+        beside: true,
+        ..*landing
+    };
+    if let Err(refusal) =
+        git_carry::beside::land(staged, target, &beside_landing, policy, (&beside, false))
+    {
+        return Ok(Some((
+            Retired::Kept(format!("refused:{}", refusal.code())),
+            Carried::default(),
+        )));
+    }
+    let owned = git_carry::beside::ledger_of(&beside, target.source)?
+        .is_some_and(|ledger| ledger.item == identity && ledger.capture == capture);
+    if !owned {
+        return Ok(Some((
+            Retired::Kept("not-owned".to_owned()),
+            Carried::default(),
+        )));
+    }
+    // The live checkout's own untracked files the advance left as they
+    // were are never the beside landing's.
+    let left = git_carry::converge::advance::advanced_at(workspace, target.source)?
+        .map(|done| done.left)
+        .unwrap_or_default();
+    let ns = git_carry::beside::namespace(suffix)?;
+    retire::retire(
+        (retire_path, exclude_path),
+        &beside,
+        workspace,
+        (identity, capture),
+        (&left, &ns, target.source),
+    )
+    .map(Some)
 }
 
 /// `estate-apply --refs-in` (M2 item 7).
@@ -3047,6 +3506,13 @@ pub struct LedgerEntry {
     /// refs `--refs-in` imported, which closure prints on a refused row (a
     /// beside landing refused, its refs in all the same). `None` otherwise.
     pub refs_in: Option<RefsInSummary>,
+    /// `--advance-ancestor` (operator ruling 2026-10-19): what the item's
+    /// `{item}-{blake3(SOURCE)}.advance` record (the last state directory
+    /// holding one) says of its current capture, when it names the item
+    /// and that capture: advanced (and what became of its beside landing)
+    /// or refused with a `GIT_ADVANCE_*` code, which closure holds pending
+    /// review on a beside row. `None` otherwise.
+    pub advance: Option<AdvanceSummary>,
     /// 2026-10-19: the reason the item's capture landed beside (its
     /// `.beside-reason` record in the last state directory holding one),
     /// which closure prints on an `applied-beside` row.
@@ -3058,6 +3524,54 @@ pub struct LedgerEntry {
     /// `envelope-unreadable`, `holder-partial-clone`,
     /// `holder-git-too-old`).
     pub unknown_because: Option<&'static str>,
+}
+
+/// What an item's `--advance-ancestor` record says of its current capture
+/// (operator ruling 2026-10-19).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdvanceSummary {
+    /// `advanced`, or the `GIT_ADVANCE_*` code that refused the advance.
+    pub outcome: String,
+    /// After an advance, its beside landing: `pending`, `absent`,
+    /// `retired` or `kept`; empty after a refusal.
+    pub beside: String,
+    /// Why the beside landing was kept.
+    pub reason: String,
+    /// How many captured entries the advance left to the live checkout.
+    pub kept: u64,
+    /// A refusal's detail (the colliding paths, or a kept beside's
+    /// reason, escaped).
+    pub detail: String,
+    /// How many captured files landed as file-level besides.
+    pub besides: u64,
+    /// The live HEAD the advance was decided against: its commit and its
+    /// branch (empty when detached).
+    pub live: String,
+    pub branch: String,
+    /// The advance switched the live checkout from `branch` to the
+    /// capture's (operator ruling 2026-10-19, "Switch when clean").
+    pub switched: bool,
+    /// A beside retirement of the item is under way in STATE (its tree
+    /// under its private name; review of #289, finding 3).
+    pub retiring: bool,
+}
+
+impl AdvanceSummary {
+    /// The `GIT_ADVANCE_*` or `GIT_SWITCH_*` code that refused the advance,
+    /// when one did; or, after an advance, `GIT_ADVANCE_BESIDE_KEPT` when
+    /// the beside landing it made redundant was not retired (kept, put
+    /// back to be tried again, or a retirement under way): a duplicate,
+    /// pending review.
+    #[must_use]
+    pub fn refusal(&self) -> Option<&str> {
+        if self.outcome == "advanced" {
+            return (self.retiring || matches!(self.beside.as_str(), "kept" | "pending"))
+                .then_some("GIT_ADVANCE_BESIDE_KEPT");
+        }
+        ((self.outcome.starts_with("GIT_ADVANCE_") || self.outcome.starts_with("GIT_SWITCH_"))
+            && crate::outcome::is_typed_code(&self.outcome))
+        .then_some(self.outcome.as_str())
+    }
 }
 
 /// The refs an item's refs-in imported for its current capture (gap C12).
@@ -3093,6 +3607,41 @@ fn refs_in_summary(
         ns: record.ns,
         created: u64::try_from(record.created.len()).unwrap_or(u64::MAX),
         kept: u64::try_from(record.kept.len()).unwrap_or(u64::MAX),
+    })
+}
+
+// `--advance-ancestor`: what the last `.advance` record of `identity` in
+// `states` says of the current capture (`capture`, lowercase hex), when it
+// names both.
+fn advance_summary(
+    states: &[PathBuf],
+    identity: &str,
+    source: &str,
+    capture: Option<&str>,
+) -> Option<AdvanceSummary> {
+    let path = states
+        .iter()
+        .rev()
+        .map(|state| advance_record_path(state, identity, source))
+        .find(|path| path.is_file())?;
+    let record = git_carry::converge::advance::read_record(&path).ok()??;
+    let current = capture.is_some_and(|capture| {
+        blake3::Hash::from_bytes(record.capture).to_hex().as_str() == capture
+    });
+    let retiring = states
+        .iter()
+        .any(|state| retire_record_path(state, identity, source).is_file());
+    (record.item == identity && current).then_some(AdvanceSummary {
+        outcome: record.outcome,
+        beside: record.beside,
+        reason: record.reason,
+        kept: record.kept,
+        detail: record.detail,
+        besides: record.besides,
+        live: record.live,
+        branch: record.branch,
+        switched: record.switched,
+        retiring,
     })
 }
 
@@ -3219,6 +3768,7 @@ pub fn ledger_with(
         let carried = carried::prove(states, &identity, source, item);
         let beside = beside_proof(states, &identity, source, capture.as_deref());
         let refs_in = refs_in_summary(states, &identity, source, capture.as_deref());
+        let advance = advance_summary(states, &identity, source, capture.as_deref());
         let beside_reason = states
             .iter()
             .rev()
@@ -3235,6 +3785,7 @@ pub fn ledger_with(
             carried,
             beside,
             refs_in,
+            advance,
             beside_reason,
             unknown_because,
             item: identity,
@@ -3496,6 +4047,8 @@ fn space_plan(
 /// What one `estate-apply` run may do beyond the default (#226,
 /// OI-1003-Q171/Q172). Explicit per run, never inferred; each receipt it
 /// changes says so.
+// Each bool is one independent command-line flag.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ApplyOptions {
     /// `--adopt`: an existing checkout or repository bulkload never landed
@@ -3537,6 +4090,16 @@ pub struct ApplyOptions {
     /// `refs/<ns>/` (the `--beside` namespace), create-only, recorded in
     /// STATE ([`git_carry::beside::RefsInRecord`]).
     pub refs_in: bool,
+    /// `--advance-ancestor` (operator ruling 2026-10-19, "Yes, advance
+    /// those"; needs `adopt` and `beside`): a live checkout bulkload did
+    /// not land that differs from the capture is advanced in place when it
+    /// is clean, its HEAD an ancestor of the captured HEAD and its branch
+    /// the captured one, free to move ([`git_carry::converge::advance`]);
+    /// any other such checkout refuses with a typed `GIT_ADVANCE_*` code,
+    /// recorded in STATE for closure, and lands beside in the same pass.
+    /// After an advance, the item's beside landing is retired once proved
+    /// equal to the live tree ([`git_carry::beside::retire`]).
+    pub advance_ancestor: bool,
 }
 
 /// Apply explicit restores only; common Git administration is serialized.
@@ -3668,6 +4231,11 @@ pub fn apply_reporting(
         git_carry::beside::namespace(suffix)?;
     }
     if options.refs_in && options.beside.is_none() {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
+    }
+    // `--advance-ancestor` acts on an adopt proof's difference, and falls
+    // back to the beside landing.
+    if options.advance_ancestor && (!options.adopt || options.beside.is_none()) {
         return Err(BulkloadRefusal::RequiredFieldMissing);
     }
     // A seated tree is an existing checkout: only `--adopt` lands into it.

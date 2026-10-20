@@ -99,6 +99,20 @@
 //! names the beside path. 2026-10-19 adds `beside_reason` to an
 //! `applied-beside` row: the refusal code that sent the capture beside
 //! (`GIT_DESTINATION_DIVERGED`, `GIT_DESTINATION_NONREPO_DIFFERS`).
+//! `--advance-ancestor` (operator ruling
+//! 2026-10-19) adds one key to a row whose item's `.advance` record names
+//! its current capture, `advance` (`outcome`: `advanced` or the
+//! `GIT_ADVANCE_*` code; `detail`, the refusal's, such as the colliding
+//! paths; `beside`: `pending`, `absent`, `retired` or `kept`; `reason`;
+//! `kept`, the entries the advance left to the live checkout;
+//! `file_besides`, the captured files it landed as `<path>SUFFIX`). It
+//! classifies an `applied-beside` row whose advance refused
+//! `refused-pending-review` with that code, and an `applied` row whose
+//! advance kept its beside landing `refused-pending-review` with
+//! `GIT_ADVANCE_BESIDE_KEPT` (a duplicate on the destination; the
+//! coordinator's decision on #289). Either is printed as `refusal`, its
+//! detail as `refusal_detail`, and bound to the code, the live HEAD it was
+//! decided against and the detail: the operator disposes what stays.
 //!
 //! v4 was `bulkload.closure.v4` (#226 item 5; v3 from WP3 PR 4,
 //! v2 from WP3 PR 3, v1 before). v4 adds one top-level block after
@@ -205,7 +219,21 @@ pub fn instance(entry: &LedgerEntry) -> String {
         CaptureId::Unreadable => (1, String::new()),
         CaptureId::Digest(digest) => (2, digest),
     };
+    let advance = advance_refusal(entry).zip(entry.advance.as_ref());
     let (record_tag, record) = match &entry.record {
+        // `--advance-ancestor`: a beside row's advance refusal is bound to
+        // the refusal and the live HEAD it was decided against, not to the
+        // beside outcome record, which a journal rerun rewrites.
+        Some(Ok(_)) if advance.is_some() => advance.map_or((4, Vec::new()), |(code, summary)| {
+            (
+                4,
+                format!(
+                    "{code}\0{}\0{}\0{}",
+                    summary.live, summary.branch, summary.detail
+                )
+                .into_bytes(),
+            )
+        }),
         None => (0_u8, Vec::new()),
         Some(Err(why)) => (1, why.reason().as_bytes().to_vec()),
         // A decoded record always re-encodes (its path came from postcard).
@@ -254,12 +282,34 @@ pub fn classify(entry: &LedgerEntry) -> Disposition {
                 (_, false) => Disposition::Unaccounted("outcome-workspace-mismatch"),
                 (None, true) => Disposition::Unaccounted("beside-record-missing"),
                 (Some(Err(why)), true) => Disposition::Unaccounted(why),
-                (Some(Ok(())), true) => journal("workspace-beside", Disposition::AppliedBeside),
+                // `--advance-ancestor` (operator ruling 2026-10-19): the
+                // capture landed beside because its advance of the live
+                // checkout refused; that typed refusal is the row's, pending
+                // review, so the operator decides what stays beside.
+                (Some(Ok(())), true) => advance_refusal(entry).map_or_else(
+                    || journal("workspace-beside", Disposition::AppliedBeside),
+                    |code| {
+                        journal(
+                            "workspace-beside",
+                            Disposition::RefusedPendingReview(code.to_owned()),
+                        )
+                    },
+                ),
             }
         }
         Outcome::WorkspaceRestored | Outcome::PreviousWorkspaceRestorationNotRevalidated => {
             if entry.has_workspace {
-                journal("workspace-restored", Disposition::Applied)
+                // `--advance-ancestor`: an advanced checkout whose beside
+                // landing was kept holds that duplicate pending review.
+                advance_refusal(entry).map_or_else(
+                    || journal("workspace-restored", Disposition::Applied),
+                    |code| {
+                        journal(
+                            "workspace-restored",
+                            Disposition::RefusedPendingReview(code.to_owned()),
+                        )
+                    },
+                )
             } else {
                 Disposition::Unaccounted("outcome-workspace-mismatch")
             }
@@ -301,6 +351,33 @@ pub fn classify(entry: &LedgerEntry) -> Disposition {
             }
             Some(Ok(_)) => Disposition::Carried,
         },
+    }
+}
+
+// `--advance-ancestor`: the typed refusal an item's advance record holds
+// for its current capture: on a beside row, the `GIT_ADVANCE_*` code that
+// refused the advance; on a restored row (the live checkout advanced),
+// `GIT_ADVANCE_BESIDE_KEPT` when its beside landing was kept, a duplicate.
+fn advance_refusal(entry: &LedgerEntry) -> Option<&str> {
+    let outcome = match &entry.record {
+        Some(Ok(record)) => &record.outcome,
+        _ => return None,
+    };
+    let code = entry
+        .advance
+        .as_ref()
+        .and_then(crate::estate::AdvanceSummary::refusal)?;
+    let kept = code == "GIT_ADVANCE_BESIDE_KEPT";
+    match outcome {
+        Outcome::WorkspaceBeside | Outcome::PreviousWorkspaceBesideNotRevalidated if !kept => {
+            Some(code)
+        }
+        Outcome::WorkspaceRestored | Outcome::PreviousWorkspaceRestorationNotRevalidated
+            if kept =>
+        {
+            Some(code)
+        }
+        _ => None,
     }
 }
 
@@ -448,6 +525,9 @@ pub struct Row {
     /// `Display`, which names the beside path), printed as
     /// `refusal_detail`.
     pub detail: Option<String>,
+    /// `--advance-ancestor` (operator ruling 2026-10-19): what the item's
+    /// advance record says of its current capture, printed as `advance`.
+    pub advance: Option<crate::estate::AdvanceSummary>,
     /// 2026-10-19: on an `applied-beside` row, the refusal code that sent
     /// the capture beside (`GIT_DESTINATION_DIVERGED`,
     /// `GIT_DESTINATION_NONREPO_DIFFERS`), printed as `beside_reason`.
@@ -604,6 +684,7 @@ impl Report {
                     .cloned(),
                 refs_in: entry.refs_in.clone(),
                 detail: beside_foreign_detail(entry),
+                advance: entry.advance.clone(),
                 beside_reason: entry.beside_reason.clone(),
             });
         }
@@ -1032,8 +1113,43 @@ impl Report {
                         .map_or_else(|| "null".to_owned(), |errno| errno.to_string()),
                 );
             }
+            // `--advance-ancestor`: a beside row whose advance refused holds
+            // that typed refusal (the outcome is the beside landing's).
+            if row.outcome.as_ref().and_then(Outcome::refusal).is_none()
+                && row
+                    .advance
+                    .as_ref()
+                    .and_then(crate::estate::AdvanceSummary::refusal)
+                    .is_some()
+            {
+                if let Some(code) = row.disposition.refusal() {
+                    let _ = write!(out, ",\"refusal\":{}", json_string(code));
+                }
+            }
             if let Disposition::Unaccounted(why) = &row.disposition {
                 let _ = write!(out, ",\"unaccounted_reason\":{}", json_string(why));
+            }
+            if let Some(advance) = &row.advance {
+                // A beside row held by its advance's refusal names that
+                // refusal's detail (the colliding paths).
+                if row.outcome.as_ref().and_then(Outcome::refusal).is_none()
+                    && row.disposition.refusal().is_some()
+                    && !advance.detail.is_empty()
+                {
+                    let _ = write!(out, ",\"refusal_detail\":{}", json_string(&advance.detail));
+                }
+                let _ = write!(
+                    out,
+                    ",\"advance\":{{\"outcome\":{},\"detail\":{},\"beside\":{},\"reason\":{},\"kept\":{},\"file_besides\":{},\"switched\":{},\"retire_pending\":{}}}",
+                    json_string(&advance.outcome),
+                    json_string(&advance.detail),
+                    json_string(&advance.beside),
+                    json_string(&advance.reason),
+                    advance.kept,
+                    advance.besides,
+                    advance.switched,
+                    advance.retiring,
+                );
             }
             // Gap C12: a refused row names the refs its item's refs-in
             // imported for this capture, and a `GIT_BESIDE_FOREIGN` the
@@ -1283,6 +1399,7 @@ fn transfer_row(
         carried: None,
         refs_in: None,
         detail: None,
+        advance: None,
         beside_reason: None,
     }
 }
@@ -2259,6 +2376,7 @@ mod tests {
             carried: None,
             beside: None,
             refs_in: None,
+            advance: None,
             beside_reason: None,
         }
     }
@@ -3997,6 +4115,7 @@ mod tests {
                     carried: None,
                     beside: None,
                     refs_in: None,
+                    advance: None,
                     beside_reason: None,
                 });
                 let Kind::Typed(code, how) = kind else {

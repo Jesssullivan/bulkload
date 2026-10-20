@@ -1679,7 +1679,15 @@ fn p131_estate_diff_runs_one_index_pack_per_repository() {
         let elsewhere: Vec<_> = processes
             .iter()
             .filter(|process| {
-                process.worktree.contains("/adopt-") && process.argv.contains(bundle.as_str())
+                // An item's scratch is `<stage>/adopt-<n>/repo`: its own
+                // directory's name, never a `/adopt-` higher up the path
+                // (a TMPDIR may hold one).
+                process
+                    .worktree
+                    .rsplit('/')
+                    .nth(1)
+                    .is_some_and(|dir| dir.starts_with("adopt-"))
+                    && process.argv.contains(bundle.as_str())
             })
             .map(|process| (&process.worktree, &process.argv))
             .collect();

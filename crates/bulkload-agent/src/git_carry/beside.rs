@@ -737,12 +737,16 @@ pub fn land(
         workspace: Some(beside),
         ..*target
     };
+    // A beside checkout is never advanced (`--advance-ancestor` acts on the
+    // live checkout only).
     let keep = Policy {
         adopt: false,
+        advance: None,
         ..*policy
     };
     let adopt = Policy {
         adopt: true,
+        advance: None,
         ..*policy
     };
     let meta = match std::fs::symlink_metadata(beside) {
@@ -813,6 +817,10 @@ pub fn land(
         standalone,
     })
 }
+
+// `--advance-ancestor` (operator ruling 2026-10-19): a beside landing an
+// advance made redundant, retired once proved equal to the live tree.
+pub mod retire;
 
 #[cfg(test)]
 mod tests {
