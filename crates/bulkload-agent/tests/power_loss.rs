@@ -80,7 +80,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
-use bulkload_agent::crash_check::{check_view, Entry, Image, Options, Report, StateInfo, View};
+use bulkload_agent::crash_check::{
+    check_view, incarnations, Entry, Image, Options, Report, StateInfo, View,
+};
 use bulkload_agent::durable::{set_durability, Durability};
 use bulkload_agent::trace::recorder::Recorder;
 use bulkload_agent::trace::{CommitRecord, Event, NodeId, SyncKind};
@@ -237,7 +239,9 @@ fn traced_copy(scratch: &Scratch) -> (Image, Vec<Event>) {
         .unwrap()
     };
     assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
-    (image, recorder.take())
+    // Inode reuse told apart (xfs reuses freed inode numbers within a trace).
+    let events = incarnations(&image, &recorder.take()).unwrap();
+    (image, events)
 }
 
 fn options() -> Options {
@@ -804,6 +808,8 @@ fn store_kept(
 /// events are `Store::open`'s. Every event here lowers to one checker
 /// operation (none is a write), so `opened` is also an operation count.
 fn check_store(image: &Image, events: &[Event], opened: usize) -> Report {
+    // Inode reuse told apart; indices are kept, so `opened` still counts.
+    let events = &incarnations(image, events).unwrap();
     assert!(
         !events
             .iter()
@@ -1024,7 +1030,8 @@ fn traced_rerun(scratch: &Scratch) -> (Image, Vec<Event>, bulkload_agent::transf
         let _process = recorder.attach_process();
         run_copy(scratch)
     };
-    (image, recorder.take(), stats)
+    let events = incarnations(&image, &recorder.take()).unwrap();
+    (image, events, stats)
 }
 
 /// The store's view of the superseded paths in one crash state, replayed
@@ -1952,7 +1959,7 @@ fn every_power_loss_state_of_a_worker_written_copy_is_consistent() {
             &scratch.base.join("destination-state"),
         )
     };
-    let events = recorder.take();
+    let events = incarnations(&image, &recorder.take()).unwrap();
     let timing = bulkload_agent::transfer::TransferTiming::snapshot().since(before);
     bulkload_agent::transfer::set_recv_worker_delay(0);
     bulkload_agent::transfer::set_writeback_kick_bytes(0);

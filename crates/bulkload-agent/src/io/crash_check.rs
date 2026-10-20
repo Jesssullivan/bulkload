@@ -121,7 +121,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::Path;
 
-use super::trace::{Event, SyncKind};
+use super::trace::{CommitRecord, Event, SyncKind};
 use super::NodeId;
 
 /// Which mutations a `Barrier` orders (model rule 3).
@@ -697,6 +697,300 @@ struct Lowered {
 
 /// Whether every node an event mutates is known: in the image or created
 /// earlier in the trace. Syncs and commits touch nothing.
+/// The node a create-class event (`Create`, `Mkdir`, `Symlink`) brings
+/// into being.
+const fn created(event: &Event) -> Option<NodeId> {
+    match event {
+        Event::Create { node, .. } | Event::Mkdir { node, .. } | Event::Symlink { node, .. } => {
+            Some(*node)
+        }
+        _ => None,
+    }
+}
+
+/// `event` with every node identity it names, its commit records' included,
+/// passed through `id`.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per trace event kind, each rebuilt field by field"
+)]
+fn renamed(event: &Event, id: impl Fn(NodeId) -> NodeId) -> Event {
+    let record = |record: &CommitRecord| match record {
+        CommitRecord::DirectoryCreated { key, node, mode } => CommitRecord::DirectoryCreated {
+            key: key.clone(),
+            node: node.map(&id),
+            mode: *mode,
+        },
+        CommitRecord::SupersedeBegun {
+            rel_path,
+            temp_path,
+            staged,
+            owned,
+        } => CommitRecord::SupersedeBegun {
+            rel_path: rel_path.clone(),
+            temp_path: temp_path.clone(),
+            staged: id(*staged),
+            owned: id(*owned),
+        },
+        other => other.clone(),
+    };
+    match event {
+        Event::Create {
+            dir,
+            name,
+            node,
+            mode,
+        } => Event::Create {
+            dir: dir.map(&id),
+            name: name.clone(),
+            node: id(*node),
+            mode: *mode,
+        },
+        Event::Mkdir {
+            dir,
+            name,
+            node,
+            mode,
+        } => Event::Mkdir {
+            dir: id(*dir),
+            name: name.clone(),
+            node: id(*node),
+            mode: *mode,
+        },
+        Event::Write {
+            node,
+            offset,
+            data,
+            digest,
+        } => Event::Write {
+            node: id(*node),
+            offset: *offset,
+            data: data.clone(),
+            digest: *digest,
+        },
+        Event::SetMode { node, mode } => Event::SetMode {
+            node: id(*node),
+            mode: *mode,
+        },
+        Event::SetCaptureRecord { node, record } => Event::SetCaptureRecord {
+            node: id(*node),
+            record: record.clone(),
+        },
+        Event::Sync { node, kind } => Event::Sync {
+            node: id(*node),
+            kind: *kind,
+        },
+        Event::Symlink {
+            dir,
+            name,
+            node,
+            target,
+        } => Event::Symlink {
+            dir: id(*dir),
+            name: name.clone(),
+            node: id(*node),
+            target: target.clone(),
+        },
+        Event::Commit { store, records } => Event::Commit {
+            store: id(*store),
+            records: records.iter().map(record).collect(),
+        },
+        Event::Link { node, dir, name } => Event::Link {
+            node: id(*node),
+            dir: id(*dir),
+            name: name.clone(),
+        },
+        Event::Rename {
+            node,
+            from_dir,
+            from,
+            to_dir,
+            to,
+        } => Event::Rename {
+            node: id(*node),
+            from_dir: id(*from_dir),
+            from: from.clone(),
+            to_dir: id(*to_dir),
+            to: to.clone(),
+        },
+        Event::Exchange {
+            dir,
+            a,
+            a_node,
+            b,
+            b_node,
+        } => Event::Exchange {
+            dir: id(*dir),
+            a: a.clone(),
+            a_node: id(*a_node),
+            b: b.clone(),
+            b_node: id(*b_node),
+        },
+        Event::Unlink { dir, name } => Event::Unlink {
+            dir: id(*dir),
+            name: name.clone(),
+        },
+        Event::Untraced { call, error } => Event::Untraced {
+            call: *call,
+            error: error.clone(),
+        },
+    }
+}
+
+/// Every name each node holds, in the trace's own order (not a crash
+/// state's): which directory entries name it.
+#[derive(Default)]
+struct Names {
+    entries: HashMap<NodeId, BTreeMap<Vec<u8>, NodeId>>,
+    count: HashMap<NodeId, usize>,
+}
+
+impl Names {
+    fn of(initial: &Image) -> Self {
+        let mut names = Self::default();
+        for (dir, node) in &initial.nodes {
+            if let Node::Dir { entries, .. } = node {
+                for (name, child) in entries {
+                    names.set(*dir, name, *child);
+                }
+            }
+        }
+        names
+    }
+
+    fn set(&mut self, dir: NodeId, name: &[u8], node: NodeId) {
+        if let Some(old) = self.entries.entry(dir).or_default().insert(name.to_vec(), node) {
+            self.drop_one(old);
+        }
+        *self.count.entry(node).or_default() += 1;
+    }
+
+    fn remove(&mut self, dir: NodeId, name: &[u8]) {
+        if let Some(old) = self.entries.get_mut(&dir).and_then(|entries| entries.remove(name)) {
+            self.drop_one(old);
+        }
+    }
+
+    fn drop_one(&mut self, node: NodeId) {
+        if let Some(count) = self.count.get_mut(&node) {
+            *count = count.saturating_sub(1);
+        }
+    }
+
+    fn named(&self, node: NodeId) -> bool {
+        self.count.get(&node).is_some_and(|count| *count > 0)
+    }
+
+    fn apply(&mut self, event: &Event) {
+        match event {
+            Event::Create {
+                dir: Some(dir),
+                name: Some(name),
+                node,
+                ..
+            }
+            | Event::Mkdir {
+                dir, name, node, ..
+            }
+            | Event::Symlink {
+                dir, name, node, ..
+            }
+            | Event::Link { dir, name, node } => self.set(*dir, name, *node),
+            Event::Rename {
+                node,
+                from_dir,
+                from,
+                to_dir,
+                to,
+            } => {
+                self.remove(*from_dir, from);
+                self.set(*to_dir, to, *node);
+            }
+            Event::Exchange {
+                dir,
+                a,
+                a_node,
+                b,
+                b_node,
+            } => {
+                self.remove(*dir, a);
+                self.remove(*dir, b);
+                self.set(*dir, a, *a_node);
+                self.set(*dir, b, *b_node);
+            }
+            Event::Unlink { dir, name } => self.remove(*dir, name),
+            _ => {}
+        }
+    }
+}
+
+/// The trace with every reused inode number told apart (inode reuse, the
+/// gate of #295, 2026-10-20: xfs gave a swept temporary's number to a
+/// directory the resume made).
+///
+/// A file system frees an inode once it has no name and no open
+/// descriptor, and may give its number to the next file it creates. So a
+/// create (`Create`, `Mkdir`, `Symlink`) of a number the image or an
+/// earlier event already names is a new inode exactly when, by then, the
+/// trace's own namespace has dropped every name of the old one (an unlink,
+/// or a rename or exchange over it). From that create on, every event, and
+/// every commit record, naming that number names the new inode, which gets
+/// an identity no image node and no event uses: its `dev`, and an unused
+/// `ino` counted down from `u64::MAX`. Everything before the create keeps
+/// naming the old inode. An invariant that reads node identities from the
+/// trace's commit records must read them from this result, the one
+/// [`check_view`] and [`check`] are given.
+///
+/// A create of a number whose inode still has a name is two inodes the
+/// trace cannot tell apart, and is refused; so is any reuse left in a trace
+/// handed to [`check_view`] or [`check`] unresolved.
+///
+/// # Errors
+/// A create of a node that still has a name in the trace.
+pub fn incarnations(initial: &Image, events: &[Event]) -> io::Result<Vec<Event>> {
+    let used = std::cell::RefCell::new(initial.nodes.keys().copied().collect::<HashSet<_>>());
+    for event in events {
+        let _ = renamed(event, |node| {
+            used.borrow_mut().insert(node);
+            node
+        });
+    }
+    let mut used = used.into_inner();
+    let mut seen: HashSet<NodeId> = initial.nodes.keys().copied().collect();
+    let mut names = Names::of(initial);
+    let mut current: HashMap<NodeId, NodeId> = HashMap::new();
+    let mut next = u64::MAX;
+    let mut out = Vec::with_capacity(events.len());
+    for (index, event) in events.iter().enumerate() {
+        if let Some(node) = created(event) {
+            if !seen.insert(node) {
+                let old = current.get(&node).copied().unwrap_or(node);
+                if names.named(old) {
+                    return Err(other(format!(
+                        "trace event {index} creates node {node:?}, whose inode still has a \
+                         name in the trace; refusing to conflate two inodes"
+                    )));
+                }
+                let fresh = loop {
+                    let fresh = NodeId {
+                        dev: node.dev,
+                        ino: next,
+                    };
+                    next = next.saturating_sub(1);
+                    if used.insert(fresh) {
+                        break fresh;
+                    }
+                };
+                current.insert(node, fresh);
+            }
+        }
+        let event = renamed(event, |node| current.get(&node).copied().unwrap_or(node));
+        names.apply(&event);
+        out.push(event);
+    }
+    Ok(out)
+}
+
 fn touches_only(event: &Event, known: &HashSet<NodeId>) -> bool {
     let known = |node: &NodeId| known.contains(node);
     match event {
@@ -725,8 +1019,9 @@ fn build_ops(initial: &Image, events: &[Event], options: &Options) -> io::Result
     let mut fresh = Vec::new();
     let mut foreign = 0_usize;
     // A node identity names one inode for the whole trace. A file system may
-    // reuse an inode number after an unlink; the model cannot tell the two
-    // apart, so such a trace is refused rather than conflated.
+    // reuse an inode number after an unlink: [`incarnations`] tells the two
+    // apart, and a trace handed here unresolved is refused rather than
+    // conflated.
     let mut known: HashSet<NodeId> = initial.nodes.keys().copied().collect();
     for (index, event) in events.iter().enumerate() {
         if !touches_only(event, &known) {
@@ -746,7 +1041,8 @@ fn build_ops(initial: &Image, events: &[Event], options: &Options) -> io::Result
             if !known.insert(*node) {
                 return Err(other(format!(
                     "trace event {index} creates node {node:?}, which the image or an \
-                     earlier event already names (inode reuse); refusing to conflate them"
+                     earlier event already names (inode reuse); refusing to conflate them: \
+                     resolve it with crash_check::incarnations first"
                 )));
             }
         }

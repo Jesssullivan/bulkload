@@ -41,7 +41,7 @@
 )]
 
 use super::*;
-use crate::io::crash_check::{check, check_view, Entry, Image, Options};
+use crate::io::crash_check::{check, check_view, incarnations, Entry, Image, Options};
 use crate::io::durable::GroupSink as _;
 use crate::io::trace::recorder::Recorder;
 #[cfg(target_os = "linux")]
@@ -156,7 +156,8 @@ fn resume_after(tag: &str, crash: impl FnOnce(&Crash<'_>)) {
         target.finish_directories(&store).unwrap();
         target.flush_session().unwrap();
     }
-    let events = recorder.take();
+    // Inode reuse told apart (xfs reuses freed inode numbers within a trace).
+    let events = incarnations(&image, &recorder.take()).unwrap();
     let options = Options {
         ignore_foreign: true,
         accept_bounded: true,
@@ -285,7 +286,8 @@ fn an_unrowed_output_is_adopted_without_source_reads() {
         crate::io::durable::seal_dir(&parent).unwrap();
         // The crash: the group's row commit never runs.
     }
-    let events = recorder.take();
+    // Inode reuse told apart (xfs reuses freed inode numbers within a trace).
+    let events = incarnations(&image, &recorder.take()).unwrap();
     assert!(
         events
             .iter()
@@ -518,7 +520,8 @@ fn a_batched_group_names_no_output_before_its_data_is_durable() {
             "{report:?}"
         );
     }
-    let events = recorder.take();
+    // Inode reuse told apart (xfs reuses freed inode numbers within a trace).
+    let events = incarnations(&image, &recorder.take()).unwrap();
     assert_eq!(
         events
             .iter()
@@ -888,7 +891,8 @@ fn check_siblings(
         crash(&tree, &store);
         resume_siblings(&tree, &store);
     }
-    let events = recorder.take();
+    // Inode reuse told apart (xfs reuses freed inode numbers within a trace).
+    let events = incarnations(&image, &recorder.take()).unwrap();
     let modes = tree
         .directories
         .iter()
@@ -1091,7 +1095,8 @@ fn a_batch_waits_for_a_held_adoptable_directory_before_making_inside_it() {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|root| *root != canonical_destination);
         assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
-        let events = recorder.take();
+        // Inode reuse told apart (xfs reuses freed inode numbers within a trace).
+        let events = incarnations(&image, &recorder.take()).unwrap();
         let modes = [b"q/x".as_slice(), b"y", b"y/z"]
             .into_iter()
             .map(|rel| (rel.to_vec(), 0o755))

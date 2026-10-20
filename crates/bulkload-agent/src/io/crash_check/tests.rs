@@ -20,7 +20,8 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use super::{
-    check, check_view, BarrierScope, Entry, Image, Options, Report, StateInfo, View, MAX_EXHAUSTIVE,
+    check, check_view, incarnations, BarrierScope, Entry, Image, Options, Report, StateInfo, View,
+    MAX_EXHAUSTIVE,
 };
 use crate::io::trace::{Event, SyncKind};
 use crate::io::NodeId;
@@ -839,6 +840,190 @@ fn inode_reuse_in_a_trace_is_refused() {
     assert!(check(&initial(), &twice, &Options::default(), |_, _| Ok(())).is_err());
 }
 
+/// The trace of review probe P1: `keep` unlinked, and its inode number
+/// given to a new file `fresh`, written and synced.
+fn reused_keep() -> Vec<Event> {
+    vec![
+        Event::Unlink {
+            dir: ROOT,
+            name: b"keep".to_vec(),
+        },
+        Event::Create {
+            dir: Some(ROOT),
+            name: Some(b"fresh".to_vec()),
+            node: KEEP_NODE,
+            mode: 0o644,
+        },
+        write(KEEP_NODE, NEW),
+        Event::Sync {
+            node: KEEP_NODE,
+            kind: SyncKind::Fsync,
+        },
+        Event::Sync {
+            node: ROOT,
+            kind: SyncKind::Fsync,
+        },
+    ]
+}
+
+/// Inode reuse (the gate of #295, 2026-10-20: xfs gave a freed number to
+/// the next file). Once `keep`'s last name is unlinked its number names a
+/// new inode: `incarnations` gives `fresh` an identity of its own from its
+/// create on, the unlink keeps the old one, and every crash state holds
+/// each file's own bytes. A state that kept the create and lost the unlink
+/// holds both files, `keep` with its old bytes, which one inode under two
+/// names could not.
+#[test]
+fn a_number_reused_after_its_last_name_is_unlinked_names_a_new_inode() {
+    let events = reused_keep();
+    let resolved = incarnations(&initial(), &events).unwrap();
+    assert_eq!(resolved[0], events[0]);
+    let Event::Create { node: fresh, .. } = resolved[1] else {
+        panic!("{:?}", resolved[1]);
+    };
+    assert_ne!(fresh, KEEP_NODE);
+    assert_eq!(fresh.dev, KEEP_NODE.dev);
+    assert_eq!(resolved[2], write(fresh, NEW));
+    assert_eq!(
+        resolved[3],
+        Event::Sync {
+            node: fresh,
+            kind: SyncKind::Fsync,
+        }
+    );
+    assert_eq!(resolved[4], events[4]);
+    // Resolved twice, nothing more moves.
+    assert_eq!(incarnations(&initial(), &resolved).unwrap(), resolved);
+    let mut both = false;
+    let report = check_view(&initial(), &resolved, &Options::default(), |view, info| {
+        let keep = view.get(b"keep");
+        let made = view.get(b"fresh");
+        match keep {
+            None => {}
+            Some(Entry::File { data, .. }) if data == KEEP => {}
+            other => return Err(format!("keep is {other:?}")),
+        }
+        match made {
+            None if !info.complete => {}
+            Some(Entry::File { data, .. }) if data == NEW || (data.is_empty() && !info.complete) => {}
+            other => return Err(format!("fresh is {other:?}")),
+        }
+        both |= keep.is_some() && made.is_some();
+        Ok(())
+    })
+    .unwrap();
+    assert!(report.passed(), "{}", report.summary(&resolved));
+    assert!(both, "no state kept the create and lost the unlink");
+}
+
+/// The same when a rename over `keep` drops its last name: the number the
+/// next create reuses names a new inode.
+#[test]
+fn a_number_reused_after_a_rename_over_its_last_name_names_a_new_inode() {
+    let events = vec![
+        Event::Rename {
+            node: OTHER,
+            from_dir: ROOT,
+            from: b"other".to_vec(),
+            to_dir: ROOT,
+            to: b"keep".to_vec(),
+        },
+        Event::Create {
+            dir: Some(ROOT),
+            name: Some(b"fresh".to_vec()),
+            node: KEEP_NODE,
+            mode: 0o644,
+        },
+    ];
+    let resolved = incarnations(&with_other(), &events).unwrap();
+    assert_eq!(resolved[0], events[0]);
+    assert!(
+        matches!(resolved[1], Event::Create { node, .. } if node != KEEP_NODE),
+        "{:?}",
+        resolved[1]
+    );
+    check_view(&with_other(), &resolved, &Options::default(), |_, _| Ok(())).unwrap();
+}
+
+/// A create of a number whose inode still has a name is two inodes the
+/// trace cannot tell apart: `incarnations` refuses it, as `check_view`
+/// refuses any reuse it is handed unresolved (review probe P1).
+#[test]
+fn a_number_created_while_its_inode_still_has_a_name_is_refused() {
+    let still_named = vec![Event::Create {
+        dir: Some(ROOT),
+        name: Some(b"fresh".to_vec()),
+        node: KEEP_NODE,
+        mode: 0o644,
+    }];
+    let error = incarnations(&initial(), &still_named).unwrap_err();
+    assert!(error.to_string().contains("still has a name"), "{error}");
+    let twice = vec![
+        Event::Mkdir {
+            dir: ROOT,
+            name: b"a".to_vec(),
+            node: n(20),
+            mode: 0o755,
+        },
+        Event::Mkdir {
+            dir: ROOT,
+            name: b"b".to_vec(),
+            node: n(20),
+            mode: 0o755,
+        },
+    ];
+    assert!(incarnations(&initial(), &twice).is_err());
+    // Unresolved, the reuse is refused by the checker itself.
+    let error = check_view(&initial(), &reused_keep(), &Options::default(), |_, _| Ok(()))
+        .unwrap_err();
+    assert!(error.to_string().contains("incarnations"), "{error}");
+}
+
+/// A commit record names the inode its number named when the store
+/// committed: the swept temporary's record keeps the old identity, the
+/// record of the directory made again under the same number names the new
+/// one, so an invariant reading records from the resolved trace binds each
+/// to its own directory.
+#[test]
+fn a_commit_record_names_the_inode_of_its_own_time() {
+    use crate::io::trace::CommitRecord;
+    let created = |key: &[u8], node| Event::Commit {
+        store: LEDGER,
+        records: vec![CommitRecord::DirectoryCreated {
+            key: key.to_vec(),
+            node: Some(node),
+            mode: 0o755,
+        }],
+    };
+    let events = vec![
+        Event::Mkdir {
+            dir: ROOT,
+            name: b".tmp-a".to_vec(),
+            node: n(20),
+            mode: 0o700,
+        },
+        created(b"a", n(20)),
+        Event::Unlink {
+            dir: ROOT,
+            name: b".tmp-a".to_vec(),
+        },
+        Event::Mkdir {
+            dir: ROOT,
+            name: b".tmp-b".to_vec(),
+            node: n(20),
+            mode: 0o700,
+        },
+        created(b"b", n(20)),
+    ];
+    let resolved = incarnations(&initial(), &events).unwrap();
+    assert_eq!(resolved[..3], events[..3]);
+    let Event::Mkdir { node: again, .. } = resolved[3] else {
+        panic!("{:?}", resolved[3]);
+    };
+    assert_ne!(again, n(20));
+    assert_eq!(resolved[4], created(b"b", again));
+}
+
 const OTHER: NodeId = n(5);
 
 fn with_other() -> Image {
@@ -1634,4 +1819,87 @@ fn a_view_finds_an_inode_by_path_and_its_paths() {
     })
     .unwrap();
     assert!(report.passed(), "{report:?}");
+}
+
+/// Inode reuse forced on the real file system under the recorder (the gate
+/// of #295, 2026-10-20).
+#[cfg(feature = "io-trace")]
+mod reused {
+    use std::ffi::CString;
+    use std::fs;
+    use std::os::fd::AsFd as _;
+
+    use super::*;
+    use crate::io::sys;
+    use crate::io::trace::recorder::Recorder;
+
+    fn bytes(index: usize) -> Vec<u8> {
+        format!("bytes of f{index}").into_bytes()
+    }
+
+    /// Files are created, written and synced, their directory synced, and
+    /// each unlinked, in a loop, until the file system gives a freed number
+    /// to a new file (bounded at 64; a file system that never reuses one,
+    /// such as tmpfs, has nothing to prove here). The next create's
+    /// directory sync comes after its write, so a crash can keep that
+    /// create and lose the unlink before it. Handed in as recorded, the
+    /// trace is refused; resolved by `incarnations`, every crash state
+    /// holds each name's own bytes or none, never another inode's, and the
+    /// finished protocol holds only the last file.
+    #[test]
+    fn a_number_the_file_system_reuses_is_told_apart_in_every_state() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        let root = fs::File::from(sys::open_root(scratch.path()).unwrap());
+        let image = Image::scan(scratch.path()).unwrap();
+        let recorder = Recorder::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut last = None;
+        {
+            let _attached = recorder.attach();
+            for index in 0..64 {
+                let name = CString::new(format!("f{index}")).unwrap();
+                let fd = sys::create_excl_at(root.as_fd(), &name, 0o600).unwrap();
+                sys::pwrite_all(&fd, &bytes(index), 0).unwrap();
+                sys::full_flush(&fd).unwrap();
+                sys::full_flush(&root).unwrap();
+                let node = sys::fstat(&fd).unwrap().node;
+                drop(fd);
+                if !seen.insert(node) {
+                    last = Some(index);
+                    break;
+                }
+                sys::unlinkat(&root, &name, false).unwrap();
+            }
+            sys::full_flush(&root).unwrap();
+        }
+        let events = recorder.take();
+        let Some(last) = last else {
+            eprintln!("no inode number was reused in 64 files here; nothing to tell apart");
+            return;
+        };
+        let error = check_view(&image, &events, &Options::default(), |_, _| Ok(())).unwrap_err();
+        assert!(error.to_string().contains("inode reuse"), "{error}");
+        let resolved = incarnations(&image, &events).unwrap();
+        let report = check_view(&image, &resolved, &Options::default(), |view, info| {
+            let mut names = Vec::new();
+            for (rel, entry) in view.walk() {
+                let index: usize = std::str::from_utf8(&rel)
+                    .ok()
+                    .and_then(|rel| rel.strip_prefix('f'))
+                    .and_then(|index| index.parse().ok())
+                    .ok_or_else(|| format!("unexpected entry {rel:?}"))?;
+                match entry {
+                    Entry::File { data, .. } if data.is_empty() || data == bytes(index) => {}
+                    other => return Err(format!("f{index} holds {other:?}")),
+                }
+                names.push(index);
+            }
+            if info.complete && names != [last] {
+                return Err(format!("the finished protocol holds {names:?}"));
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(report.passed(), "{}", report.summary(&resolved));
+    }
 }
