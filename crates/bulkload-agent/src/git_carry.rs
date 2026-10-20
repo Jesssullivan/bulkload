@@ -7525,7 +7525,7 @@ pub(crate) fn restore_linked_staged_landed(
             "git_carry::restore_linked_staged",
         )),
     };
-    let plan = converge::plan_linked(&checked, (staged.path(), base), source, landing)?;
+    let plan = converge::plan_linked(&checked, (staged.path(), base), source, landing, &|| Ok(()))?;
     let instance = plan.instance.clone();
     let expected_exclude = plan.exclude.clone();
     let exclude_path = checked.exclude_path;
@@ -7674,7 +7674,7 @@ pub(crate) fn restore_linked_staged_landed(
 pub(crate) fn adopt_nonrepo_linked(
     staged: &StagedBundle,
     (repository, base): (&Path, Option<&StagedBundle>),
-    destination: &Path,
+    (destination, beside): (&Path, Option<&Path>),
     source: &str,
     landing: &converge::Landing<'_>,
 ) -> Result<converge::Applied> {
@@ -7683,26 +7683,59 @@ pub(crate) fn adopt_nonrepo_linked(
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     destination_git_ready()?;
-    let proof = converge::check_nonrepo(
+    let proof = match converge::check_nonrepo(
         staged,
         (repository, base),
         destination,
-        (source, landing.item),
+        (source, landing.item, beside),
         (landing.observed_ns, landing.exclude_union.is_some()),
-    )?;
+    ) {
+        Ok(proof) => proof,
+        // Review of #286, finding 6: this item's registration a crash cut
+        // short before its gitfile is removed when the directory is not
+        // adopted after all, under the lock; anything else stays.
+        Err(
+            refusal @ (BulkloadRefusal::GitDestinationNonrepoDiffers
+            | BulkloadRefusal::GitDestinationNonrepoDuplicate),
+        ) => {
+            let common = common_repository(repository)?;
+            let intent_path =
+                landed::landing_intent_path(&landed::ledger_dir(&common, source), destination);
+            if landed::read::<landed::LandingIntent>(&intent_path)?
+                .is_some_and(|intent| intent.item == landing.item)
+            {
+                let _lock = landed::lock(&common, source)?;
+                converge::abandon_registration(&common, destination, &intent_path)?;
+            }
+            return Err(refusal);
+        }
+        Err(other) => return Err(other),
+    };
     let checked = proof.checked;
     let heads = checked.heads.clone();
     let head = capture_revision(&heads, "head")?;
-    let plan = converge::plan_linked(&checked, (staged.path(), base), source, landing)?;
-    // Under the lock: still no `.git`, every seat still as proved.
-    if !converge::nonrepo(destination) {
-        return Err(BulkloadRefusal::GitDestinationOccupied);
-    }
-    if !converge::seats_still(destination, &proof.prints)? {
-        return Err(BulkloadRefusal::GitDestinationNonrepoDiffers);
-    }
+    // Under the lock, before the import, the native ref step and any
+    // exclude append (review of #286, finding 5), and again after them:
+    // still no `.git`, every seat still as proved.
+    let still = || -> Result<()> {
+        if !converge::nonrepo(destination) {
+            return Err(BulkloadRefusal::GitDestinationOccupied);
+        }
+        if !converge::seats_still(destination, &proof.prints)? {
+            return Err(BulkloadRefusal::GitDestinationNonrepoDiffers);
+        }
+        Ok(())
+    };
+    let plan = converge::plan_linked(&checked, (staged.path(), base), source, landing, &still)?;
+    still()?;
     let landing_intent =
         landed::landing_intent_path(&landed::ledger_dir(&plan.common, source), destination);
+    // The marker first (review of #286, finding 2): a recovery of this
+    // landing proves every seat and writes none.
+    landed::write_bytes(
+        &converge::nonrepo_marker(&landing_intent),
+        b"bulkload non-repo adoption\n",
+    )?;
     landed::write(
         &landing_intent,
         &landed::LandingIntent {
@@ -7741,6 +7774,7 @@ pub(crate) fn adopt_nonrepo_linked(
         file.sync_all().refuse_at(SITE)?;
         landed::sync_dir(destination)?;
     }
+    converge::unlock_registration(&admin)?;
     fault_point!(EstateConvergeLinkedAdded);
     if text(git(destination).args(["rev-parse", "--verify", "HEAD"]))? != head {
         return Err(BulkloadRefusal::GitAuthorityChanged);
@@ -7784,11 +7818,95 @@ pub(crate) fn adopt_nonrepo_linked(
     if let Some(record) = landing.exclude_union {
         exclude_union::reported(record, &checked.exclude_path)?;
     }
+    landed::remove(&converge::nonrepo_marker(&landing_intent))?;
     landed::remove(&landing_intent)?;
     drop(plan.lock);
     custody.count("adopted-nonrepo");
     custody.add("adopted-seats", seats);
     Ok(converge::Applied::adopted(&custody))
+}
+
+/// Finish a non-repo adoption ([`adopt_nonrepo_linked`]) a crash cut short
+/// after its `.git` gitfile (review of #286, finding 2), under the
+/// destination lock: `intent` names the directory at `destination`, and its
+/// marker says it was adopted, not landed. Its HEAD must still be the
+/// planned one, and every seat the intent's capture carries must still be
+/// there with its kind, mode and bytes ([`converge::prove_seats`], read
+/// from the capture imported into the repository): a seat missing or
+/// changed since (content or mode) refuses `GIT_DESTINATION_MODIFIED` with
+/// nothing written, never a seat restored. The index must be empty (the
+/// registration has none yet) or the capture's, and is then the capture's;
+/// the `locked` "initializing" marker goes; the ledger is written from this
+/// proof's prints, taken before it, once they still hold. Returns `false`
+/// over the ledger cap.
+///
+/// # Errors
+/// `GIT_DESTINATION_MODIFIED` as above; `GIT_CONVERGE_INTERRUPTED` for an
+/// `index.lock` that is not the landing's own; whatever reading or writing
+/// the index refuses.
+pub(crate) fn finish_nonrepo_adoption(
+    destination: &Path,
+    common: &Path,
+    source: &str,
+    intent: &landed::LandingIntent,
+) -> Result<bool> {
+    const SITE: &str = "git_carry::finish_nonrepo_adoption";
+    let modified = BulkloadRefusal::GitDestinationModified;
+    let recorded_ns = pass_start_ns();
+    if converge::head_of(destination)? != intent.head {
+        return Err(modified);
+    }
+    let meta = converge::Meta::read(destination, source, &intent.instance)?;
+    let heads = meta.heads();
+    let git_dir =
+        landed::worktree_git_dir(destination)?.ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+    let Ok(prints) = converge::prove_seats(destination, destination, &meta, false)? else {
+        return Err(modified);
+    };
+    let target = converge::installed_index(destination, &git_dir, &meta)?;
+    let lock = git_dir.join("index.lock");
+    if fs::symlink_metadata(&lock).is_ok() {
+        if converge::index_digest(destination, Some(&lock)).ok() != Some(target) {
+            return Err(BulkloadRefusal::GitConvergeInterrupted);
+        }
+        fs::remove_file(&lock).refuse_at(SITE)?;
+        landed::sync_dir(&git_dir)?;
+    }
+    let index = converge::index_digest(destination, None)?;
+    if index != target {
+        if index != converge::empty_index_digest() {
+            return Err(modified);
+        }
+        read_tree(
+            &mut git(destination),
+            &[&format!("{}^{{tree}}", meta.get("staged")?)],
+        )?;
+        restore_intent_to_add(destination, None, &heads)?;
+    }
+    converge::unlock_registration(&git_dir)?;
+    if !converge::seats_still(destination, &prints)? {
+        return Err(modified);
+    }
+    converge::record_adopted(
+        destination,
+        (&git_dir, common),
+        source,
+        &converge::Landing {
+            item: &intent.item,
+            observed_ns: intent.observed_ns,
+            capture: intent.capture,
+            parents: None,
+            exclude_union: None,
+            beside: false,
+        },
+        (
+            &intent.instance,
+            &intent.head,
+            intent.intended_branch.as_ref(),
+        ),
+        target,
+        (recorded_ns, prints),
+    )
 }
 
 /// Finish a first linked landing a crash cut short between `worktree add`

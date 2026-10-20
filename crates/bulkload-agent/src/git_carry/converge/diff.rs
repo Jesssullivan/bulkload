@@ -70,7 +70,10 @@ pub struct ItemRow {
     /// `ledgered-other-item` (re-keyed by A11b with `--adopt`),
     /// `not-a-repository`, `not-at-path`; for a directory with no `.git` at
     /// all (2026-10-19), `nonrepo-adoptable` (a linked item's that proves
-    /// equal: `--adopt` registers it, writing no file in it) or
+    /// equal: `--adopt` registers it, writing no file in it),
+    /// `nonrepo-duplicate` (equal, but another worktree holds the captured
+    /// branch or the item's beside landing exists:
+    /// `GIT_DESTINATION_NONREPO_DUPLICATE`, nothing written) or
     /// `nonrepo-differs` (`GIT_DESTINATION_NONREPO_DIFFERS`: `--beside`
     /// lands the capture beside it).
     pub adopt: &'static str,
@@ -256,6 +259,7 @@ fn beside_component(
                     adopt: true,
                     origins: &[],
                     items,
+                    beside: None,
                 };
                 if super::rekey_check(staged, &at, landing, &policy, ledger)?.is_some() {
                     "foreign"
@@ -425,17 +429,24 @@ fn nonrepo_row(
         row.adopt = "nonrepo-differs";
         row.components.push("nonrepo-standalone".to_owned());
     } else {
+        let beside_path = beside.map(|suffix| super::super::beside::path(workspace, suffix));
         match super::check_nonrepo(
             staged,
             (target.repository, target.base),
             workspace,
-            (target.source, landing.item),
+            (target.source, landing.item, beside_path.as_deref()),
             (landing.observed_ns, false),
         ) {
             Ok(_) => {
                 row.class = "identical";
                 row.hint = None;
                 row.adopt = "nonrepo-adoptable";
+                return Ok(());
+            }
+            Err(BulkloadRefusal::GitDestinationNonrepoDuplicate) => {
+                row.class = "identical";
+                row.hint = None;
+                row.adopt = "nonrepo-duplicate";
                 return Ok(());
             }
             Err(BulkloadRefusal::GitDestinationNonrepoDiffers) => {
@@ -447,7 +458,9 @@ fn nonrepo_row(
                     target.source,
                 )?;
                 let meta = scratch.meta(target.source)?;
-                if let Err(seats) = super::adopt::prove_seats(workspace, &scratch, &meta, false)? {
+                if let Err(seats) =
+                    super::adopt::prove_seats(workspace, &scratch.repo, &meta, false)?
+                {
                     row.components.extend(seats);
                 }
             }

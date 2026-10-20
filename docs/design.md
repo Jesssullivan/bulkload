@@ -1283,8 +1283,27 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   the code that sent it there (`beside-reason=<CODE>` in the receipt,
   `{item}-{blake3(SOURCE)}.beside-reason` in STATE, `beside_reason` on
   closure's `applied-beside` row; `GIT_DESTINATION_DIVERGED` for a diverged
-  checkout). `estate-diff` reports `nonrepo-adoptable` or `nonrepo-differs`
-  with the differing seats and the beside component.
+  checkout). `estate-diff` reports `nonrepo-adoptable`, `nonrepo-duplicate`
+  or `nonrepo-differs` with the differing seats and the beside component,
+  and `estate-move`'s plan previews a linked item's non-repo directory as
+  `adopt` (`nonrepo-adopt-or-beside`).
+  Review of #286 (2026-10-19): an equal directory is never registered as a
+  second copy of the same worktree: when the captured branch is checked
+  out by another worktree of the repository (the td01 shape: the item's
+  beside landing from an earlier pass holds it) or the item's beside
+  landing exists at `<path>SUFFIX`, it refuses
+  `GIT_DESTINATION_NONREPO_DUPLICATE`, nothing written, pending review
+  (retiring a beside proven equal, as #289 retires one, is the follow-up).
+  The adoption's landing intent carries a marker: a crash past the gitfile
+  is finished by proving every seat again (content and mode, read from the
+  capture imported into the repository) and writing none, a missing or
+  changed seat refusing `GIT_DESTINATION_MODIFIED`, and the ledger is that
+  proof's. The administration directory is held `locked` "initializing"
+  until the gitfile is written, as `git worktree add` holds it; a relative
+  `gitdir` names the directory as an absolute one does; the re-check runs
+  under the lock before the import, the native ref step and any exclude
+  append; and a later pass that does not adopt it removes the registration
+  a crash left before the gitfile.
 - **Beside landings converge, and a beside path is adopted by proof (gap
   C12, plan of record rev 2; operator ruling A-115, 2026-10-18,
   "Landings placed beside refuse every later pass once neo changes" →

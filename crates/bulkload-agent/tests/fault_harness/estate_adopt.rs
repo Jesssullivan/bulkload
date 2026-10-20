@@ -136,6 +136,22 @@ pub enum EstateAdopt {
     /// A linked worktree whose `.git` was stripped (the td01 batch,
     /// 2026-10-19), adopted by registering it again, crashed.
     NonrepoAdopt,
+    /// `NonrepoAdopt` crashed after its gitfile, then a seat removed and a
+    /// mode changed before the rerun (review of #286, finding 2).
+    NonrepoTampered,
+    /// `NonrepoAdopt` crashed before its gitfile, then a captured seat
+    /// edited, so the rerun does not adopt it (review of #286, finding 6).
+    NonrepoAbandon,
+}
+
+impl EstateAdopt {
+    /// The rows of a non-repo directory's adoption (the td01 shape).
+    const fn nonrepo(self) -> bool {
+        matches!(
+            self,
+            Self::NonrepoAdopt | Self::NonrepoTampered | Self::NonrepoAbandon
+        )
+    }
 }
 
 impl Scenario for EstateAdopt {
@@ -222,7 +238,7 @@ impl World {
         git(&src, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
         let (item, dest) = if kind == EstateAdopt::ExcludeUnion {
             (world.exclude_union_item(&src), None)
-        } else if kind == EstateAdopt::NonrepoAdopt {
+        } else if kind.nonrepo() {
             (world.nonrepo_item(&src), None)
         } else if kind == EstateAdopt::Parents {
             (
@@ -563,20 +579,16 @@ fn scenario(point: Point, nth: u64, kind: EstateAdopt) {
     let world = World::new(&point.name().replace('.', "-"), kind);
     std::thread::sleep(std::time::Duration::from_millis(2_100));
     world.capture();
-    if kind == EstateAdopt::Parents {
-        parents(&world, &label, point, nth);
-        return;
-    }
-    if kind == EstateAdopt::ExcludeUnion {
-        exclude_union(&world, &label, point, nth);
-        return;
-    }
     let besides: Option<fn(&World, &str, Point, u64)> = match kind {
+        EstateAdopt::Parents => Some(parents),
+        EstateAdopt::ExcludeUnion => Some(exclude_union),
         EstateAdopt::Beside => Some(beside),
         EstateAdopt::BesideStale => Some(beside_stale),
         EstateAdopt::BesideConverge => Some(beside_converge),
         EstateAdopt::BesideRekey => Some(beside_rekey),
         EstateAdopt::NonrepoAdopt => Some(nonrepo_adopt),
+        EstateAdopt::NonrepoTampered => Some(nonrepo_tampered),
+        EstateAdopt::NonrepoAbandon => Some(nonrepo_abandon),
         _ => None,
     };
     if let Some(row) = besides {
@@ -1223,6 +1235,14 @@ fn nonrepo_adopt(world: &World, label: &str, point: Point, nth: u64) {
         gitfile,
         "{label}: the gitfile at the crash"
     );
+    // Review of #286, finding 4: locked "initializing" until the gitfile.
+    let admins = registrations_of(world, &wt);
+    assert_eq!(admins.len(), 1, "{label}: {admins:?}");
+    assert_eq!(
+        fs::read(admins[0].join("locked")).ok(),
+        (!gitfile).then(|| b"initializing\n".to_vec()),
+        "{label}: the locked marker at the crash"
+    );
     assert_eq!(world.unaccounted(), 1, "{label}: journal-missing");
     let rows = world.apply(true);
     assert_eq!(rows.len(), 1, "{label}");
@@ -1245,15 +1265,9 @@ fn nonrepo_adopt(world: &World, label: &str, point: Point, nth: u64) {
         "feature",
         "{label}"
     );
-    let named: Vec<PathBuf> = fs::read_dir(world.dst().join(".git/worktrees"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|admin| {
-            fs::read_to_string(admin.join("gitdir"))
-                .is_ok_and(|text| Path::new(text.trim_end()) == wt.join(".git"))
-        })
-        .collect();
+    let named = registrations_of(world, &wt);
     assert_eq!(named.len(), 1, "{label}: one registration, {named:?}");
+    assert!(!named[0].join("locked").exists(), "{label}: still locked");
     let status = git(&wt, &["status", "--porcelain", "--untracked-files=all"]);
     for line in [" M a.txt", "?? only-dest.log", "?? wt.txt"] {
         assert!(
@@ -1267,4 +1281,103 @@ fn nonrepo_adopt(world: &World, label: &str, point: Point, nth: u64) {
         rows[0].0, "previous-workspace-restoration-not-revalidated",
         "{label}"
     );
+}
+
+/// The administration directories of the `NonrepoAdopt` destination
+/// repository whose `gitdir` names `wt`'s `.git`.
+fn registrations_of(world: &World, wt: &Path) -> Vec<PathBuf> {
+    fs::read_dir(world.dst().join(".git/worktrees")).map_or_else(
+        |_| Vec::new(),
+        |entries| {
+            entries
+                .map(|entry| entry.unwrap().path())
+                .filter(|admin| {
+                    fs::read_to_string(admin.join("gitdir"))
+                        .is_ok_and(|text| Path::new(text.trim_end()) == wt.join(".git"))
+                })
+                .collect()
+        },
+    )
+}
+
+/// The `NonrepoTampered` row (review of #286, finding 2): the adoption
+/// crashed after its gitfile; then `wt.txt` is removed and `a.txt`'s mode
+/// changed. The rerun proves every seat and writes none: it refuses
+/// `GIT_DESTINATION_MODIFIED`, `wt.txt` stays absent, `a.txt` keeps the new
+/// mode, nothing else moves, and the item is a typed refusal.
+fn nonrepo_tampered(world: &World, label: &str, point: Point, nth: u64) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let wt = world.base.join("dst-wt");
+    crash(world, &format!("{}:{nth}", point.name()));
+    assert!(wt.join(".git").is_file(), "{label}: the gitfile");
+    fs::remove_file(wt.join("wt.txt")).unwrap();
+    fs::set_permissions(wt.join("a.txt"), fs::Permissions::from_mode(0o600)).unwrap();
+    let before = entries_of(&wt);
+    let rows = world.apply(true);
+    assert_eq!(rows.len(), 1, "{label}");
+    assert_eq!(rows[0].0, "refused", "{label}: {rows:?}");
+    assert!(
+        rows[0]
+            .1
+            .as_deref()
+            .is_some_and(|reason| reason.contains("GIT_DESTINATION_MODIFIED")),
+        "{label}: {rows:?}"
+    );
+    assert!(!wt.join("wt.txt").exists(), "{label}: a seat was restored");
+    assert_eq!(
+        fs::metadata(wt.join("a.txt")).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "{label}: a mode was reset"
+    );
+    assert_eq!(entries_of(&wt), before, "{label}: the rerun wrote");
+    assert_eq!(
+        world.unaccounted(),
+        0,
+        "{label}: a typed refusal is accounted"
+    );
+}
+
+/// The `NonrepoAbandon` row (review of #286, finding 6): the adoption
+/// crashed before its gitfile; then a captured seat is edited, so the
+/// directory no longer proves equal. The rerun refuses
+/// `GIT_DESTINATION_NONREPO_DIFFERS` and removes the registration the crash
+/// left (its administration directory, landing intent and marker),
+/// nothing in the directory written.
+fn nonrepo_abandon(world: &World, label: &str, point: Point, nth: u64) {
+    let wt = world.base.join("dst-wt");
+    crash(world, &format!("{}:{nth}", point.name()));
+    assert_eq!(
+        registrations_of(world, &wt).len(),
+        1,
+        "{label}: left by the crash"
+    );
+    fs::write(wt.join("wt.txt"), b"wt, edited on sting\n").unwrap();
+    let before = entries_of(&wt);
+    let rows = world.apply(true);
+    assert_eq!(rows.len(), 1, "{label}");
+    assert_eq!(rows[0].0, "refused", "{label}: {rows:?}");
+    assert!(
+        rows[0]
+            .1
+            .as_deref()
+            .is_some_and(|reason| reason.contains("GIT_DESTINATION_NONREPO_DIFFERS")),
+        "{label}: {rows:?}"
+    );
+    assert!(
+        registrations_of(world, &wt).is_empty(),
+        "{label}: the leftover stays"
+    );
+    let ledger = world.dst().join(".git/bulkload/v1/neo");
+    let left: Vec<String> = fs::read_dir(&ledger).map_or_else(
+        |_| Vec::new(),
+        |entries| {
+            entries
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("landing-"))
+                .collect()
+        },
+    );
+    assert!(left.is_empty(), "{label}: {left:?}");
+    assert!(!wt.join(".git").exists(), "{label}");
+    assert_eq!(entries_of(&wt), before, "{label}: the rerun wrote");
 }

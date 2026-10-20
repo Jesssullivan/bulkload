@@ -2440,6 +2440,7 @@ fn apply_item(
         adopt: options.adopt,
         origins: &options.activate_origin,
         items,
+        beside: options.beside.as_deref(),
     };
     let (outcome, mut applied) = if item.workspace.is_some() {
         let landed_before = landed_before(state, &identity, source, &journal)?;

@@ -154,6 +154,10 @@ pub struct Policy<'a> {
     /// Every item id of the run's plan: A11b never re-keys a ledger that
     /// names one of them (review of 2026-10-16, finding 2).
     pub items: &'a [String],
+    /// `--beside SUFFIX`, when given: a non-repo directory whose item has a
+    /// beside landing at `<path>SUFFIX` is never registered as a second
+    /// copy (review of #286, finding 1).
+    pub beside: Option<&'a str>,
 }
 
 /// Where an item lands.
@@ -2198,10 +2202,13 @@ pub fn apply_workspace(
         if standalone {
             return Err(BulkloadRefusal::GitDestinationNonrepoDiffers);
         }
+        let beside = policy
+            .beside
+            .map(|suffix| super::beside::path(workspace, suffix));
         return super::adopt_nonrepo_linked(
             staged,
             (target.repository, target.base),
-            workspace,
+            (workspace, beside.as_deref()),
             target.source,
             landing,
         );
@@ -2245,7 +2252,19 @@ pub fn apply_workspace(
         if intent.item != landing.item || intent.destination != destination.as_os_str().as_bytes() {
             return Err(BulkloadRefusal::GitDestinationOccupied);
         }
-        super::recover_linked_landing(&destination, &place.common, target.source, &intent)?;
+        // A non-repo adoption's registration (review of #286, finding 2):
+        // every seat proved again, none written.
+        let marker = nonrepo_marker(&landing_intent);
+        if landed::exists(&marker)? {
+            if !super::finish_nonrepo_adoption(&destination, &place.common, target.source, &intent)?
+            {
+                custody.count("not-convergeable");
+            }
+            custody.count("adopted-nonrepo");
+            landed::remove(&marker)?;
+        } else {
+            super::recover_linked_landing(&destination, &place.common, target.source, &intent)?;
+        }
         landed::remove(&landing_intent)?;
         custody.count("landing-recovered");
         // A beside landing (M2 round 2 item c) is finished forward; one of
@@ -3100,7 +3119,7 @@ pub(super) fn check_nonrepo(
     staged: &super::StagedBundle,
     (repository, base): (&Path, Option<&super::StagedBundle>),
     destination: &Path,
-    (source, item): (&str, &str),
+    (source, item, beside): (&str, &str, Option<&Path>),
     (observed_ns, union): (i128, bool),
 ) -> Result<NonrepoProof> {
     const SITE: &str = "git_carry::converge::check_nonrepo";
@@ -3127,13 +3146,28 @@ pub(super) fn check_nonrepo(
         (observed_ns, union),
     )?;
     let meta = scratch.meta(source)?;
-    adopt::prove_seats(destination, &scratch, &meta, false)?
-        .map(|prints| NonrepoProof {
-            checked,
-            prints,
-            recorded_ns,
-        })
-        .map_err(|_| BulkloadRefusal::GitDestinationNonrepoDiffers)
+    let prints = adopt::prove_seats(destination, &scratch.repo, &meta, false)?
+        .map_err(|_| BulkloadRefusal::GitDestinationNonrepoDiffers)?;
+    // Review of #286, finding 1: registering it must not make a second
+    // registered copy of this worktree: the captured branch checked out by
+    // another worktree (the td01 shape: the item's beside landing holding
+    // it), or the item's beside landing there at all.
+    if let Some(branch) = meta.symbolic(&scratch.repo)? {
+        let held = checked_out_by(repository)?
+            .into_iter()
+            .any(|(path, held)| held == branch && !same_path(&path, destination));
+        if held {
+            return Err(BulkloadRefusal::GitDestinationNonrepoDuplicate);
+        }
+    }
+    if beside.is_some_and(|beside| fs::symlink_metadata(beside).is_ok()) {
+        return Err(BulkloadRefusal::GitDestinationNonrepoDuplicate);
+    }
+    Ok(NonrepoProof {
+        checked,
+        prints,
+        recorded_ns,
+    })
 }
 
 /// The worktree administration directory of the repository whose common
@@ -3150,13 +3184,26 @@ pub(super) fn registration_of(common: &Path, destination: &Path) -> Result<Optio
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(crate::refuse::io(&error, SITE)),
     };
-    let dotgit = destination.join(".git");
     for entry in entries {
         let admin = entry.refuse_at(SITE)?.path();
         let Ok(text) = fs::read_to_string(admin.join("gitdir")) else {
             continue;
         };
-        if Path::new(text.trim_end_matches(['\n', '\r'])) == dotgit {
+        // Absolute, or relative to the administration directory
+        // (`worktree.useRelativePaths`), as `adopt::foreign_shape` reads it
+        // (review of #286, finding 3); the `.git` it names may not exist.
+        let named = Path::new(text.trim_end_matches(['\n', '\r']));
+        let named = if named.is_absolute() {
+            named.to_path_buf()
+        } else {
+            admin.join(named)
+        };
+        let points_here = named.file_name() == Some(OsStr::new(".git"))
+            && named
+                .parent()
+                .and_then(|parent| fs::canonicalize(parent).ok())
+                .is_some_and(|parent| same_path(&parent, destination));
+        if points_here {
             return Ok(Some(admin));
         }
     }
@@ -3184,6 +3231,10 @@ pub(super) fn register(common: &Path, destination: &Path, head: &Head) -> Result
         || format!("{}\n", head.oid),
         |branch| format!("ref: {branch}\n"),
     );
+    // Review of #286, finding 4: locked "initializing" until the `.git`
+    // gitfile is written, as `git worktree add` holds it, so a concurrent
+    // `git worktree prune` (or `gc --auto`) never removes it meanwhile.
+    landed::write_bytes_mode(&admin.join("locked"), INITIALIZING, 0o644)?;
     landed::write_bytes_mode(&admin.join("commondir"), b"../..\n", 0o644)?;
     landed::write_bytes_mode(&admin.join("HEAD"), head_line.as_bytes(), 0o644)?;
     let mut gitdir = destination.join(".git").into_os_string().into_vec();
@@ -3192,6 +3243,86 @@ pub(super) fn register(common: &Path, destination: &Path, head: &Head) -> Result
     landed::sync_dir(&admin)?;
     landed::sync_dir(&worktrees)?;
     Ok(admin)
+}
+
+/// What [`register`] writes in the administration directory's `locked`
+/// until the gitfile is written.
+pub(super) const INITIALIZING: &[u8] = b"initializing\n";
+
+/// Remove the `locked` "initializing" marker [`register`] left in `admin`,
+/// if it is still exactly that (an operator's lock stays). Durable.
+///
+/// # Errors
+/// IO.
+pub(super) fn unlock_registration(admin: &Path) -> Result<()> {
+    const SITE: &str = "git_carry::converge::unlock_registration";
+    let locked = admin.join("locked");
+    match fs::read(&locked) {
+        Ok(bytes) if bytes == INITIALIZING => {
+            fs::remove_file(&locked).refuse_at(SITE)?;
+            landed::sync_dir(admin)
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(crate::refuse::io(&error, SITE)),
+    }
+}
+
+/// Remove this item's registration of `destination` a crash cut short
+/// before its gitfile (review of #286, finding 6), when a later pass does
+/// not adopt it: the administration directory [`register`] wrote (still
+/// locked "initializing", holding only what it writes, and `destination`
+/// still without `.git`), then the landing intent and its marker. Anything
+/// else stays. Run under the destination lock.
+///
+/// # Errors
+/// IO.
+pub(super) fn abandon_registration(
+    common: &Path,
+    destination: &Path,
+    landing_intent: &Path,
+) -> Result<()> {
+    const SITE: &str = "git_carry::converge::abandon_registration";
+    if !nonrepo(destination) {
+        return Ok(());
+    }
+    if let Some(admin) = registration_of(common, destination)? {
+        let ours = fs::read(admin.join("locked")).is_ok_and(|bytes| bytes == INITIALIZING);
+        let only_ours = fs::read_dir(&admin).refuse_at(SITE)?.all(|entry| {
+            entry.is_ok_and(|entry| {
+                matches!(
+                    entry.file_name().to_str(),
+                    Some("locked" | "commondir" | "HEAD" | "gitdir")
+                )
+            })
+        });
+        if !(ours && only_ours) {
+            return Ok(());
+        }
+        for name in ["gitdir", "HEAD", "commondir", "locked"] {
+            match fs::remove_file(admin.join(name)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(crate::refuse::io(&error, SITE)),
+            }
+        }
+        fs::remove_dir(&admin).refuse_at(SITE)?;
+        if let Some(parent) = admin.parent() {
+            landed::sync_dir(parent)?;
+        }
+    }
+    landed::remove(&nonrepo_marker(landing_intent))?;
+    landed::remove(landing_intent)
+}
+
+/// The marker beside a landing intent that says the landing adopts an
+/// existing non-repo directory (2026-10-19): its recovery proves every
+/// seat and writes none ([`super::finish_nonrepo_adoption`]).
+#[must_use]
+pub(super) fn nonrepo_marker(landing_intent: &Path) -> PathBuf {
+    let mut name = landing_intent.as_os_str().to_owned();
+    name.push(".nonrepo");
+    PathBuf::from(name)
 }
 
 // A new administration directory under `worktrees` for `destination`: its
@@ -3391,6 +3522,7 @@ pub(super) fn plan_linked(
     (bundle, base): (&Path, Option<&super::StagedBundle>),
     source: &str,
     landing: &Landing<'_>,
+    recheck: &dyn Fn() -> Result<()>,
 ) -> Result<LinkedPlan> {
     let t = landing.observed_ns;
     let repository = checked.repository.as_path();
@@ -3398,6 +3530,10 @@ pub(super) fn plan_linked(
     let lock = landed::lock(&common, source)?;
     let directory = landed::ledger_dir(&common, source);
     let mut custody = settle_repository(repository, &common, source)?;
+    // The caller's own check under the lock, before the import, the native
+    // ref step and an `--exclude-union` append (review of #286, finding 5:
+    // a non-repo adoption's directory checked again first).
+    recheck()?;
     // `--exclude-union`: under the repository-wide exclude lock, an append
     // a crash cut short is settled first.
     let exclude_path = checked.exclude_path.as_path();
@@ -3601,7 +3737,7 @@ pub(super) fn finish_landing(
 }
 
 mod adopt;
-pub(super) use adopt::seats_still;
+pub(super) use adopt::{prove_seats, seats_still};
 pub mod diff;
 pub mod handoff;
 

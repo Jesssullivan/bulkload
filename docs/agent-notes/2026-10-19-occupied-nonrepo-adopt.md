@@ -108,14 +108,25 @@ with no `.git` entry:
   uses the existing `read_tree` helper, adding no site.
 - Results: in the PR body with host, head and TMPDIR.
 
+## Review of #286 (coordinator comment, 2026-10-19T23:38Z, at `f70dd0c`)
+
+| # | Finding | Disposition |
+| --- | --- | --- |
+| 1 (blocker) | five of the six td01 items already have a bulkload `<path>.neo-20261016` linked landing holding their branch: adopting the August directory landed it detached beside it, two registered copies under a passing closure | fixed (refusal half): an equal directory whose captured branch another worktree holds, or whose item's beside landing exists (`--beside`), refuses `GIT_DESTINATION_NONREPO_DUPLICATE` before any write, pending review; P129. Open: when that beside is this seat's and proven equal, moving the branch to the adopted path and retiring the beside through #289's `git_carry::beside::retire` (unmerged); until #289 lands the item waits for review with both copies as they are |
+| 2 (high) | crash recovery past the gitfile rewrote missing seats and reset modes; its ledger was a later census | fixed: a marker beside the landing intent sends the recovery to `finish_nonrepo_adoption`, which proves every seat (content and mode) and writes none (`GIT_DESTINATION_MODIFIED` otherwise) and records that proof's prints; fault row `estate_apply_nonrepo_tampered` |
+| 3 (med) | `registration_of` compared `gitdir` literally, so a relative stale one let the path be registered twice | fixed: a relative `gitdir` is resolved against its administration directory; P134 |
+| 4 (low) | no `locked` marker while the registration is made | fixed: `locked` "initializing" until the gitfile, then removed (only that exact content); asserted in `estate_apply_nonrepo_registered` |
+| 5 (low) | the under-lock re-check ran after the import and an exclude append | fixed: `plan_linked` takes a re-check run under the lock before them (and the check runs after too) |
+| 6 (low) | a crash before the gitfile, then a pass that does not adopt, left the administration directory and intent | fixed: `abandon_registration` removes them under the lock when they are exactly this item's; fault row `estate_apply_nonrepo_abandon` |
+| preview | `estate-move` printed `action=refuse reason=not-git` | fixed: `moving::nonrepo_preview` says `adopt` (`nonrepo-adopt-or-beside`) for a linked item's non-repo directory with a held capture; a standalone one's and a file stay `refuse`; unit test |
+| Darwin | P126-P128 refuse `DESTINATION_SPACE_INSUFFICIENT` on pzm's free-space floor (the 38 baseline failures' cause) | no Darwin defect (coordinator's A/B at `f70dd0c`) |
+
 ## Open
 
-- `estate-move`'s plan table still prints `action=refuse reason=not-git`
-  for these items (`estate/moving.rs` `action`; `Presence::NotGit` does not
-  tell a directory from a file, and its property test pins "never adopt a
-  non-Git tree" for the plan). The apply runs on every planned item anyway,
-  so the outcome is the apply's; the preview line is stale. Changing the
-  plan table is a separate change (it touches a persisted `Presence` enum).
+- (superseded by the review fix above: the preview now says `adopt` for a
+  linked item's non-repo directory.)
+- Finding 1's equal-beside path waits for #289: this lane refuses the
+  duplicate; it does not yet move the branch or retire the beside.
 - A stale registration of the repository that names the path (an admin
   directory left by a pruned worktree whose `gitdir` still names
   `<path>/.git`) makes the directory `GIT_DESTINATION_NONREPO_DIFFERS`

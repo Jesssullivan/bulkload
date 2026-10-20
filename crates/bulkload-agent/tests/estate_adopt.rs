@@ -3499,3 +3499,85 @@ fn p128_a_standalone_nonrepo_directory_refuses_typed_and_stays() {
         closure.stdout
     );
 }
+
+/// P129 NONREPO-DUPLICATE (review of #286, finding 1, the td01 shape): the
+/// item's beside landing `<path>.neo-20261016` exists from an earlier pass
+/// (a hand plan's linked landing, on the captured branch). The non-repo
+/// directory proves equal, but registering it would make a second
+/// registered copy of the same worktree: with or without `--beside` it
+/// refuses `GIT_DESTINATION_NONREPO_DUPLICATE`, nothing written to either
+/// copy, `git worktree list` unchanged, closure pending review (never a
+/// passing gate on two copies); `estate-diff` says `nonrepo-duplicate`.
+#[test]
+fn p129_a_nonrepo_dir_beside_an_existing_copy_refuses_typed() {
+    let world = Gftb::new();
+    let (run, wt, dmain, dwt) = nonrepo_world(&world);
+    let beside = beside_of(&dwt);
+    let hand = named_run(&world, "hand", &[(&wt, &dmain, Some(&beside))]);
+    hand.capture();
+    private_dir(&hand.applied);
+    let ran = hand.apply(&[]);
+    assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    assert_eq!(
+        git(&beside, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        "wt",
+        "the earlier copy holds the branch"
+    );
+    let before = (entries_of(&dwt), freeze_all(&beside));
+    let listed = git(&dmain, &["worktree", "list", "--porcelain"]);
+    let diff = run.diff(&["--beside", SUFFIX]);
+    assert!(
+        diff_line(&diff.stdout, &wt).contains("\"adopt\":\"nonrepo-duplicate\""),
+        "{}",
+        diff.stdout
+    );
+    for flags in [
+        &["--adopt"][..],
+        &["--adopt", "--beside", SUFFIX, "--refs-in"][..],
+    ] {
+        let ran = run.apply(flags);
+        let row = receipt(&receipts(&ran.stdout), &wt).clone();
+        assert_eq!(row.1, "refused", "{flags:?}: {row:?}");
+        assert!(
+            row.2.contains("GIT_DESTINATION_NONREPO_DUPLICATE"),
+            "{flags:?}: {row:?}"
+        );
+        assert!(!dwt.join(".git").exists(), "{flags:?}");
+        assert_eq!((entries_of(&dwt), freeze_all(&beside)), before, "{flags:?}");
+        assert_eq!(git(&dmain, &["worktree", "list", "--porcelain"]), listed);
+        let closure = run.closure();
+        assert!(
+            closure.stdout.contains("\"unaccounted\":0")
+                && closure
+                    .stdout
+                    .contains("\"GIT_DESTINATION_NONREPO_DUPLICATE\":1")
+                && !closure.stdout.contains("\"gate\":\"pass\""),
+            "{flags:?}: {}",
+            closure.stdout
+        );
+    }
+}
+
+/// P134 NONREPO-STALE-RELATIVE (review of #286, finding 3): a stale
+/// registration of the repository that names the directory by a relative
+/// `gitdir` (`worktree.useRelativePaths`) is found as an absolute one is:
+/// the directory refuses `GIT_DESTINATION_NONREPO_DIFFERS` and no second
+/// registration (`worktrees/wt1`) is made.
+#[test]
+fn p134_a_relative_stale_registration_is_never_registered_twice() {
+    let world = Gftb::new();
+    let (run, wt, dmain, dwt) = nonrepo_world(&world);
+    let admin = dmain.join(".git/worktrees/wt");
+    fs::create_dir_all(&admin).unwrap();
+    fs::write(admin.join("gitdir"), b"../../../../app.worktrees/wt/.git\n").unwrap();
+    fs::write(admin.join("commondir"), b"../..\n").unwrap();
+    fs::write(admin.join("HEAD"), b"ref: refs/heads/wt\n").unwrap();
+    let before = entries_of(&dwt);
+    let ran = run.apply(&["--adopt"]);
+    let row = receipt(&receipts(&ran.stdout), &wt).clone();
+    assert_eq!(row.1, "refused", "{row:?}");
+    assert!(row.2.contains("GIT_DESTINATION_NONREPO_DIFFERS"), "{row:?}");
+    assert!(!dmain.join(".git/worktrees/wt1").exists());
+    assert!(!dwt.join(".git").exists());
+    assert_eq!(entries_of(&dwt), before);
+}

@@ -446,7 +446,7 @@ pub(in crate::git_carry) fn prove_adoptable(
     if standalone && exclude != exclude_digest(&meta.exclude(&scratch.repo)?) {
         differs.push("exclude".to_owned());
     }
-    let prints = match prove_seats(worktree, scratch, meta, landing.beside)? {
+    let prints = match prove_seats(worktree, &scratch.repo, meta, landing.beside)? {
         Ok(prints) => prints,
         Err(seats) => {
             differs.extend(seats);
@@ -471,8 +471,9 @@ pub(in crate::git_carry) fn prove_adoptable(
     })))
 }
 
-/// The seat half of the adopt proof: every seat the capture `meta` (in
-/// `scratch`) carries, tracked, untracked and ignored, held at `worktree`
+/// The seat half of the adopt proof: every seat the capture `meta` (read
+/// from the repository `objects_in`: a scratch one, or the destination's
+/// own once the capture is imported there) carries, tracked, untracked and ignored, held at `worktree`
 /// with its kind, mode and content, each under a print that held still
 /// while it was read. Their prints, sorted by path; or the components that
 /// differ (`seats=<n>` and the first `seat=<path>`s). Seats at `worktree`
@@ -484,18 +485,18 @@ pub(in crate::git_carry) fn prove_adoptable(
 /// Whatever reading the destination or the scratch repository refuses.
 pub(in crate::git_carry) fn prove_seats(
     worktree: &Path,
-    scratch: &Scratch,
+    objects_in: &Path,
     meta: &Meta,
     beside: bool,
 ) -> Result<std::result::Result<Vec<SeatPrint>, Vec<String>>> {
-    let mut sides = sides(&scratch.repo, meta)?;
+    let mut sides = sides(objects_in, meta)?;
     // Gap C12 (A-115): a beside checkout bulkload did not land may differ
     // from the capture by a bulkload hand-off block at byte 0 of a target,
     // and by nothing else.
     if beside {
         super::handoff::declared_blocks(worktree, &mut sides)?;
     }
-    let mut objects = BatchObjects::new(&scratch.repo)?;
+    let mut objects = BatchObjects::new(objects_in)?;
     let mut prints = Vec::with_capacity(sides.len());
     let mut seats = Vec::new();
     for (path, side) in &sides {

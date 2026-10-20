@@ -1531,6 +1531,11 @@ scenarios! {
     // and after its gitfile; finished by the rerun, no file written.
     estate_apply_nonrepo_registered => EstateApplyNonrepoRegistered: 1, EstateAdopt::NonrepoAdopt;
     estate_apply_nonrepo_linked_added => EstateConvergeLinkedAdded: 1, EstateAdopt::NonrepoAdopt;
+    // Review of #286: a crash past the gitfile, then a seat removed and a
+    // mode changed (finding 2); a crash before it, then a seat edited
+    // (finding 6).
+    estate_apply_nonrepo_tampered => EstateConvergeLinkedAdded: 1, EstateAdopt::NonrepoTampered;
+    estate_apply_nonrepo_abandon => EstateApplyNonrepoRegistered: 1, EstateAdopt::NonrepoAbandon;
     // M2r2 b: a capture-refused item carried as files, crashed after its
     // carry record and before its outcome.
     estate_carry_recorded => EstateCarryRecorded: 1, EstateCarried::Workspace;

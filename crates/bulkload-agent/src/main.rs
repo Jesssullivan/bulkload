@@ -92,8 +92,11 @@ SUBCOMMANDS:
                 (2026-10-19) is adopted when every captured path there holds
                 its kind, mode and bytes: registered again (a .git gitfile,
                 its worktrees/ administration, the index from the capture), no
-                file in it written, extra files kept (adopted-nonrepo=1); one
-                that differs, or a standalone item's, refuses
+                file in it written, extra files kept (adopted-nonrepo=1),
+                unless another worktree holds the captured branch or the
+                item's beside landing exists (GIT_DESTINATION_NONREPO_DUPLICATE,
+                nothing written, pending review); one that differs, or a
+                standalone item's, refuses
                 GIT_DESTINATION_NONREPO_DIFFERS, nothing written, and under
                 --beside a linked item's capture lands beside it with its
                 refs (beside-reason=GIT_DESTINATION_NONREPO_DIFFERS). A bare capture into an absent path
