@@ -362,6 +362,37 @@ condition maps to `GIT_SWITCH_NOT_CLEAN`, `_IN_PROGRESS`, `_IN_USE`,
 | 5 LOW | Standalone retirement skipped config, `info/exclude`, `modules`, in-progress state; `refs/carry*` skipped both checks. | Kept typed (`configuration`, `exclude`, `modules`, `in-progress`), never carried into the live config (the advance never touches config). `refs/carry*` held by name and value, else must be reachable commits. softconnect's four branch upstreams will keep its beside, pending review. |
 | 6 LOW | A replaced seat's print came from a later `lstat`. | Printed from the written descriptor (`fstat`); a size/mtime moved since the rename records the pre-rename print (never matches). |
 
+## Coordinator decisions on the readings (2026-10-20, at 9116e01)
+
+1. Accepted: a detached side stays `GIT_ADVANCE_BRANCH_MISMATCH`
+   (switching off a detached HEAD could orphan a commit).
+2. Accepted: a switch does not need the live HEAD to be an ancestor
+   (sting's branch stays put).
+3. Changed: the no-process check applies to the plain advance too (C19: a
+   live agent must not have files change under it; the operator: work is
+   "topped up as agents exit organically"). `GIT_ADVANCE_IN_USE`,
+   retryable (never in the decided list a journal rerun keeps), pending
+   review, and no beside written for that pass when one exists (the item
+   refuses typed instead of landing beside).
+4. Changed: a standalone beside's configuration entries whose key the live
+   configuration lacks (softconnect's branch upstreams) are added to the
+   live configuration create-only (`git config --local --add` only while
+   the key is absent; never an existing value changed; only values
+   `safe_configuration_value` allows), counted in the receipt
+   (`advance-config-added=N`), and the beside is then retirable; a key the
+   live configuration holds with another value keeps it
+   (`configuration:<key>`). `info/exclude` patterns the live exclude lacks
+   are appended by the exclude union's rule (its lock, STATE record and
+   settle; `advance-exclude-appended=N`); a negation on either side, or an
+   exclude another converge proves, keeps the beside (`exclude`). The
+   source command registry's `config (writing form)` pin goes 3 to 4,
+   argued in its entry and recorded on bulkload#188.
+
+Tests: lib `an_advance_refuses_while_a_process_is_inside`; `estate_advance`
+A13 (in use: refused, no beside written, advanced once free) and R2 (two
+absent upstreams and an exclude pattern carried, then retired; a key held
+with another value kept, live config untouched).
+
 ## Open
 
 - **A beside kept after an advance stays** until the operator disposes it
@@ -375,9 +406,13 @@ condition maps to `GIT_SWITCH_NOT_CLEAN`, `_IN_PROGRESS`, `_IN_USE`,
   scan and the rename or deletion is not seen. On Darwin nothing is
   proved: a switch refuses `GIT_SWITCH_IN_USE` and a retirement keeps the
   beside (`in-use`).
-- **The advance itself has no process check** (the ruling put condition c
-  on the switch only); an advance's rollback guard covers a writer that
-  edits a seat it lays down.
+- **Darwin**: with the process check on every advance, nothing advances or
+  switches on Darwin (unprovable, refused `GIT_ADVANCE_IN_USE` /
+  `GIT_SWITCH_IN_USE`); sting (Linux) is the target.
+- **A beside's configuration values are carried only for the keys
+  `safe_configuration_value` allows** (user identity, push/pull modes,
+  branch upstreams to `origin` or `.`, origin's default fetch refspec); any
+  other absent key keeps the beside (`configuration:<key>`).
 - **Gate codes on a journal rerun**: the metadata-only gate cannot see the
   capture, so a rerun whose live checkout became dirty records
   `GIT_ADVANCE_NOT_CLEAN` even where the item would be a switch.

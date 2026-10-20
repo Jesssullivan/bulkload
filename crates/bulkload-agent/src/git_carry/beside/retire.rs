@@ -33,18 +33,25 @@
 //!   checkout); a standalone one's every ref held by the live repository
 //!   by name and value (its own, under the beside namespace, or in the
 //!   capture's provenance; a provenance `refs/carry*` ref held by name and
-//!   value or a reachable commit), no hook of its own, no remote URL, no
-//!   configuration entry (the per-machine `core.*` keys `git init` writes
-//!   aside) and no `info/exclude` pattern the live repository lacks, and
-//!   no `modules` directory (review of #289, finding 5: kept, typed,
-//!   never carried into the live configuration, which an advance never
-//!   touches).
+//!   value or a reachable commit), no hook of its own, no remote URL the
+//!   live repository lacks, no `modules` directory (review of #289,
+//!   finding 5). Its configuration entries (the per-machine `core.*` keys
+//!   `git init` writes aside) whose key the live configuration lacks, and
+//!   its `info/exclude` patterns the live exclude lacks, go into the live
+//!   repository first, create-only (the coordinator's decision of
+//!   2026-10-20: `git config --add` only for an absent key and a value
+//!   `safe_configuration_value` allows; patterns by the exclude union's
+//!   rule, recorded in STATE), counted in the receipt; a key the live
+//!   configuration holds with another value, or one not safe to carry,
+//!   keeps the beside (`configuration:<key>`), as does a pattern no pure
+//!   union carries or another converge proves (`exclude`).
 //!
 //! Any difference keeps the beside checkout and returns why
 //! ([`Retired::Kept`]: `differs:head`, `differs:index`,
 //! `differs:seat=<path>`, `missing:<path>`, `extra:<path>`,
-//! `unreachable`, `refs:<name>`, `hooks`, `remotes`, `configuration`,
-//! `exclude`, `modules`, `in-progress`, `nested:<path>`, `locked`,
+//! `unreachable`, `refs:<name>`, `hooks`, `remotes`,
+//! `configuration:<key>`, `exclude`, `modules`, `in-progress`,
+//! `nested:<path>`, `locked`,
 //! `worktrees`, `worktree-refs`, `admin-foreign`, `in-use`, `raced`).
 //! The prints of the tree and of a linked landing's administration
 //! directory (its HEAD, index, refs and reflogs) are taken before the

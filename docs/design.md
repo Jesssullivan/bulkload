@@ -1383,7 +1383,14 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   (`advance-switched=1`, `advance-switched-from=<branch>@<oid>`, closure
   `switched`); races and rollbacks are `GIT_SWITCH_RACED` and
   `GIT_SWITCH_ROLLED_BACK`, each refusal landing beside, pending review.
-  `estate-diff` previews it as `adopt:"advance-switch"`. An ignored entry of the live checkout
+  `estate-diff` previews it as `adopt:"advance-switch"`. Neither an
+  advance nor a switch runs while a process has its working directory or
+  an open file inside the live checkout (`/proc`, Linux; unprovable
+  elsewhere, refused): `GIT_ADVANCE_IN_USE` (`GIT_SWITCH_IN_USE`), the
+  coordinator's decision on #289 (C19: a live agent never has files change
+  under it; work is topped up as agents exit). It is retryable, never
+  remembered as a decision, and no beside is written for that pass when
+  one exists already (the item refuses typed, pending review). An ignored entry of the live checkout
   is never touched: where the capture holds a seat it does not track, the
   live entry and its subtree are left (`advance-kept=N`, recorded); a
   captured file or link among them lands as a file-level beside,
@@ -1442,12 +1449,19 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   repository's refs; for a standalone one, every ref held by the live
   repository by name and value (its own, under the beside namespace, or
   in the capture's provenance), no hook of its own and no remote URL the
-  live repository lacks, no configuration entry (the per-machine `core.*`
-  keys aside) or `info/exclude` pattern it lacks, no `modules` directory
-  and no operation in progress (`configuration`, `exclude`, `modules`,
-  `in-progress`: kept, never carried into the live configuration; review
-  of #289, finding 5), its `refs/carry*` held by name and value or
-  reachable commits; a linked one's administration directory under the
+  live repository lacks, no `modules` directory and no operation in
+  progress (`modules`, `in-progress`; review of #289, finding 5), its
+  `refs/carry*` held by name and value or reachable commits; its
+  configuration entries (per-machine `core.*` keys aside) whose key the
+  live configuration lacks, and its `info/exclude` patterns the live
+  exclude lacks, are added to the live repository first, create-only (the
+  coordinator's decision of 2026-10-20: `git config --add` only for an
+  absent key with a value `safe_configuration_value` allows; patterns by
+  the exclude union's rule, recorded in STATE; receipt
+  `advance-config-added=N`, `advance-exclude-appended=N`), while a key the
+  live configuration holds with another value, or one not safe to carry,
+  keeps the beside (`configuration:<key>`), as does a pattern no pure
+  union carries (`exclude`); a linked one's administration directory under the
   live repository's `worktrees/`, its `gitdir` naming the beside
   (`admin-foreign`; finding 4). Its prints, a linked landing's
   administration directory included, are taken before the proof and
