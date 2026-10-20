@@ -713,10 +713,14 @@ fn a_seat_over_a_destination_symlink_lands_beside_or_refuses_typed() {
         .collect();
     codes.sort();
     assert!(
-        codes.iter().all(|(_, code)| code == "DESTINATION_OCCUPIED"),
+        codes
+            .iter()
+            .all(|(_, code)| code == "DESTINATION_OCCUPIED" || code == "DESTINATION_KIND_MISMATCH"),
         "typed, never IO: {codes:?}"
     );
-    assert!(codes.contains(&("AGENTS.md".to_owned(), "DESTINATION_OCCUPIED".to_owned())));
+    // A symlink where a regular output lands is the wrong kind of node
+    // (#283's code); a directory over one is occupied.
+    assert!(codes.contains(&("AGENTS.md".to_owned(), "DESTINATION_KIND_MISMATCH".to_owned())));
     assert!(codes.contains(&("d".to_owned(), "DESTINATION_OCCUPIED".to_owned())));
 
     settle(&beside.corpus);
@@ -813,8 +817,9 @@ fn a_racy_beside_output_is_still_this_seats_own() {
 
 /// Independent review of #280, N1: a destination root swapped for a link
 /// after the caller resolved it (sting's `~/.claude` relinked between the
-/// pull's resolve and its open) is refused `PATH_ESCAPES_ROOT`, typed,
-/// never a bare `IO`; nothing is written through the link.
+/// pull's resolve and its open) is refused `DESTINATION_KIND_MISMATCH`
+/// (as #283 types a link at DEST), never a bare `IO`; nothing is written
+/// through the link.
 #[test]
 fn a_destination_root_swapped_for_a_link_is_a_typed_refusal() {
     let corpus = Corpus::new();
@@ -827,6 +832,6 @@ fn a_destination_root_swapped_for_a_link_is_a_typed_refusal() {
     let refused = Destination::open(&corpus.base.join("destination"), &store)
         .map(|_| ())
         .unwrap_err();
-    assert_eq!(refused, BulkloadRefusal::PathEscapesRoot);
+    assert_eq!(refused, BulkloadRefusal::DestinationKindMismatch);
     assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
 }

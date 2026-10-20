@@ -296,12 +296,12 @@ impl Destination {
     /// Refuses a missing root or symlink root, or a store without authority.
     pub fn open(path: &Path, store: &Store) -> Result<Self> {
         // A root swapped for a link or a non-directory after the caller
-        // resolved it is `PATH_ESCAPES_ROOT`, typed, never a bare `IO`
-        // (independent review of #280, N1).
+        // resolved it is `DESTINATION_KIND_MISMATCH`, typed as #283 types a
+        // link at DEST, never a bare `IO` (independent review of #280, N1).
         let root = File::from(
             crate::io::sys::open_dir_path_nofollow(path).map_err(|error| {
                 if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) {
-                    BulkloadRefusal::PathEscapesRoot
+                    BulkloadRefusal::DestinationKindMismatch
                 } else {
                     crate::refuse::io(&error, "materialize::open")
                 }
@@ -3001,10 +3001,17 @@ fn other_kind(error: &std::io::Error, site: &'static str) -> BulkloadRefusal {
 }
 
 fn open_regular(parent: &File, name: &CStr) -> Result<File> {
-    let file = File::from(
-        crate::io::sys::open_read_at(parent, name)
-            .map_err(|error| other_kind(&error, "materialize::open_regular"))?,
-    );
+    // The open follows no link, so `ELOOP` is this name being a symlink (to
+    // a file, a directory or nothing): the wrong kind of node where a
+    // regular output lands, typed (#283 review 3; it was IO errno 40). Any
+    // other kind on the way is [`other_kind`]'s.
+    let file = File::from(crate::io::sys::open_read_at(parent, name).map_err(|error| {
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            BulkloadRefusal::DestinationKindMismatch
+        } else {
+            other_kind(&error, "materialize::open_regular")
+        }
+    })?);
     if !file
         .metadata()
         .refuse_at("materialize::open_regular")?
