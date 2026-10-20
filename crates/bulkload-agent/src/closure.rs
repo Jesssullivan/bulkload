@@ -27,6 +27,16 @@
 //!   ref created under `refs/<ns>/` (a ref kept at another value refuses
 //!   the item instead). Closed: every captured byte and ref is at the
 //!   destination, beside the live tree.
+//! - `applied` also (operator ruling 2026-10-16 21:24Z, "refs in always; a
+//!   tree beside ONLY where neo has uncommitted work"): the outcome is
+//!   `WorkspaceRefsIn` (or a re-apply's
+//!   `PreviousWorkspaceRefsInNotRevalidated`), the exact journal says
+//!   `workspace-refs-in`, the item's `.files` record names its current
+//!   capture, finished with no entry occupied, and its `.refs-in` record
+//!   names that capture with no ref pending: the capture held no tracked
+//!   change and its HEAD came in by ref, so no tree landed beside; its
+//!   untracked and ignored files were placed, adopted or landed beside one
+//!   by one, every one counted (the row's `files` block, with `refs_in`).
 //! - `referenced-only`: the item plans no workspace, its outcome is
 //!   `RefsImported` (or `PreviousRefCustodyNotWorkspaceParity`, or
 //!   `IndexRepaired` from `git-repair-missing-index` with a state directory,
@@ -287,6 +297,22 @@ pub fn classify(entry: &LedgerEntry) -> Disposition {
                 ),
             }
         }
+        // Operator ruling 2026-10-16 21:24Z: no tree beside, the refs in
+        // and every untracked and ignored entry counted. The `.files`
+        // record must name the item and its current capture, finished with
+        // nothing occupied, and the `.refs-in` record that capture with no
+        // ref pending.
+        Outcome::WorkspaceRefsIn | Outcome::PreviousWorkspaceRefsInNotRevalidated => {
+            match (&entry.files, entry.has_workspace) {
+                (_, false) => Disposition::Unaccounted("outcome-workspace-mismatch"),
+                (None, true) => Disposition::Unaccounted("files-record-missing"),
+                (Some(Err(why)), true) => Disposition::Unaccounted(why),
+                (Some(Ok(_)), true) if entry.refs_in.is_none() => {
+                    Disposition::Unaccounted("refs-in-record-missing")
+                }
+                (Some(Ok(_)), true) => journal("workspace-refs-in", Disposition::Applied),
+            }
+        }
         Outcome::WorkspaceRestored | Outcome::PreviousWorkspaceRestorationNotRevalidated => {
             if entry.has_workspace {
                 journal("workspace-restored", Disposition::Applied)
@@ -496,6 +522,9 @@ pub struct Row {
     /// `--advance-ancestor` (operator ruling 2026-10-19): what the item's
     /// advance record says of its current capture, printed as `advance`.
     pub advance: Option<crate::estate::AdvanceSummary>,
+    /// Operator ruling 2026-10-16 21:24Z: a `workspace-refs-in` row's file
+    /// count (no tree beside), printed as `files`.
+    pub files: Option<crate::estate::FilesSummary>,
 }
 
 /// The per-item closure ledger and its totals.
@@ -649,6 +678,21 @@ impl Report {
                 refs_in: entry.refs_in.clone(),
                 detail: beside_foreign_detail(entry),
                 advance: entry.advance.clone(),
+                files: entry
+                    .files
+                    .as_ref()
+                    .and_then(|files| files.as_ref().ok())
+                    .filter(|_| {
+                        matches!(
+                            entry.record,
+                            Some(Ok(crate::outcome::OutcomeRecord {
+                                outcome: Outcome::WorkspaceRefsIn
+                                    | Outcome::PreviousWorkspaceRefsInNotRevalidated,
+                                ..
+                            }))
+                        )
+                    })
+                    .cloned(),
             });
         }
         report.recount();
@@ -1111,6 +1155,33 @@ impl Report {
                     advance.kept,
                 );
             }
+            // Operator ruling 2026-10-16 21:24Z: a row landed with no tree
+            // beside counts every file and names the refs that went in.
+            if let Some(files) = &row.files {
+                let tally = &files.tally;
+                let _ = write!(
+                    out,
+                    ",\"files\":{{\"tracked\":{},\"placed\":{},\"adopted\":{},\"beside\":{},\"beside_present\":{},\"dirs_placed\":{},\"dirs_adopted\":{},\"dirs_beside\":{},\"bytes_placed\":{}}}",
+                    files.tracked,
+                    tally.placed,
+                    tally.adopted,
+                    tally.beside,
+                    tally.beside_present,
+                    tally.dirs_placed,
+                    tally.dirs_adopted,
+                    tally.dirs_beside,
+                    tally.bytes,
+                );
+                if let Some(refs) = &row.refs_in {
+                    let _ = write!(
+                        out,
+                        ",\"refs_in\":{{\"ns\":{},\"created\":{},\"kept\":{}}}",
+                        json_string(&refs.ns),
+                        refs.created,
+                        refs.kept,
+                    );
+                }
+            }
             // Gap C12: a refused row names the refs its item's refs-in
             // imported for this capture, and a `GIT_BESIDE_FOREIGN` the
             // beside path.
@@ -1355,6 +1426,7 @@ fn transfer_row(
         refs_in: None,
         detail: None,
         advance: None,
+        files: None,
     }
 }
 
@@ -2303,6 +2375,71 @@ mod tests {
         );
     }
 
+    /// Operator ruling 2026-10-16 21:24Z: a `workspace-refs-in` outcome
+    /// (no tree beside) closes `applied` only with its exact journal, a
+    /// finished `.files` record of the current capture and its refs-in
+    /// record; otherwise it is unaccounted, by reason.
+    #[test]
+    fn a_refs_in_outcome_needs_its_journal_its_files_and_its_refs() {
+        let summary = crate::estate::FilesSummary {
+            tracked: 3,
+            tally: crate::git_carry::converge::files::Tally::default(),
+        };
+        let refs = crate::estate::RefsInSummary {
+            ns: "neo-20261016".to_owned(),
+            created: 1,
+            kept: 0,
+        };
+        let with =
+            |files: Option<std::result::Result<crate::estate::FilesSummary, &'static str>>,
+             refs_in: Option<crate::estate::RefsInSummary>,
+             journal| LedgerEntry {
+                refs_in,
+                files,
+                ..entry('f', true, Some(("workspace-refs-in", None)), journal)
+            };
+        assert_eq!(
+            classify(&with(
+                Some(Ok(summary.clone())),
+                Some(refs.clone()),
+                present("workspace-refs-in")
+            )),
+            Disposition::Applied
+        );
+        assert_eq!(
+            classify(&with(
+                None,
+                Some(refs.clone()),
+                present("workspace-refs-in")
+            )),
+            Disposition::Unaccounted("files-record-missing")
+        );
+        assert_eq!(
+            classify(&with(
+                Some(Err("files-record-mismatch")),
+                Some(refs.clone()),
+                present("workspace-refs-in")
+            )),
+            Disposition::Unaccounted("files-record-mismatch")
+        );
+        assert_eq!(
+            classify(&with(
+                Some(Ok(summary.clone())),
+                None,
+                present("workspace-refs-in")
+            )),
+            Disposition::Unaccounted("refs-in-record-missing")
+        );
+        assert_eq!(
+            classify(&with(
+                Some(Ok(summary)),
+                Some(refs),
+                present("workspace-beside")
+            )),
+            Disposition::Unaccounted("journal-outcome-mismatch")
+        );
+    }
+
     fn entry(
         item: char,
         has_workspace: bool,
@@ -2331,6 +2468,7 @@ mod tests {
             beside: None,
             refs_in: None,
             advance: None,
+            files: None,
         }
     }
 
@@ -4069,6 +4207,7 @@ mod tests {
                     beside: None,
                     refs_in: None,
                     advance: None,
+                    files: None,
                 });
                 let Kind::Typed(code, how) = kind else {
                     continue;

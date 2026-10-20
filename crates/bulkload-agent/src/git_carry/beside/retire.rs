@@ -133,7 +133,7 @@ fn path_of(bytes: &[u8]) -> PathBuf {
     PathBuf::from(OsStr::from_bytes(bytes))
 }
 
-fn lstat(path: &Path) -> Result<Option<fs::Metadata>> {
+pub(super) fn lstat(path: &Path) -> Result<Option<fs::Metadata>> {
     match fs::symlink_metadata(path) {
         Ok(meta) => Ok(Some(meta)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -145,14 +145,14 @@ fn lstat(path: &Path) -> Result<Option<fs::Metadata>> {
 }
 
 /// One entry under a tree, as a walk found it.
-struct Entry {
-    relative: Vec<u8>,
-    meta: fs::Metadata,
+pub(super) struct Entry {
+    pub(super) relative: Vec<u8>,
+    pub(super) meta: fs::Metadata,
 }
 
 // Every entry under `root` (never following a link), sorted by path; with
 // `with_git`, the top-level `.git` and what is under it too.
-fn walk(root: &Path, with_git: bool) -> Result<Vec<Entry>> {
+pub(super) fn walk(root: &Path, with_git: bool) -> Result<Vec<Entry>> {
     const SITE: &str = "git_carry::beside::retire::walk";
     let mut found = Vec::new();
     let mut pending = vec![Vec::<u8>::new()];
@@ -189,7 +189,7 @@ fn walk(root: &Path, with_git: bool) -> Result<Vec<Entry>> {
 
 // The digest of every entry's print under `root`, its `.git` included: a
 // write anywhere under it since changes it.
-fn prints(root: &Path) -> Result<[u8; 32]> {
+pub(super) fn prints(root: &Path) -> Result<[u8; 32]> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"bulkload-retire-prints-v1\0");
     for entry in walk(root, true)? {
@@ -213,7 +213,7 @@ fn read_counted(path: &Path) -> Result<Vec<u8>> {
 }
 
 // `bytes` without a sealed bulkload hand-off block at byte 0.
-fn unblocked(bytes: &[u8]) -> &[u8] {
+pub(super) fn unblocked(bytes: &[u8]) -> &[u8] {
     match render::marker(bytes) {
         render::Marker::Block(len) => match bytes.get(..len) {
             Some(block) if render::sealed(block) => bytes.get(len..).unwrap_or_default(),
@@ -335,7 +335,7 @@ fn reflog_commits(path: &Path) -> Result<Vec<String>> {
 
 // Whether every one of `commits` is in `live`'s object store and reachable
 // from one of its refs (a Git child that fails says no).
-fn reachable(live: &Path, commits: &[String]) -> bool {
+pub(super) fn reachable(live: &Path, commits: &[String]) -> bool {
     commits.chunks(1024).all(|chunk| {
         let mut command = git(live);
         command.args(["rev-list", "--max-count=1"]);
@@ -346,7 +346,7 @@ fn reachable(live: &Path, commits: &[String]) -> bool {
 }
 
 // The commits every reflog file under `logs` names.
-fn reflogs(logs: &Path) -> Result<Vec<String>> {
+pub(super) fn reflogs(logs: &Path) -> Result<Vec<String>> {
     let mut commits = Vec::new();
     if lstat(logs)?.is_some_and(|meta| meta.is_dir()) {
         for entry in walk(logs, true)? {
@@ -413,6 +413,13 @@ fn live_names(live: &Path, source: &str) -> Result<BTreeMap<String, Vec<String>>
     Ok(names)
 }
 
+// Whether a linked checkout's administration directory `admin` holds a
+// per-worktree ref of its own (`refs/bisect`, `refs/worktree`, ...).
+pub(super) fn worktree_refs(admin: &Path) -> Result<bool> {
+    let own = admin.join("refs");
+    Ok(lstat(&own)?.is_some_and(|meta| meta.is_dir()) && !walk(&own, true)?.is_empty())
+}
+
 // Why removing the beside checkout's Git would lose something; `None`
 // when it would not. `admin` is a linked landing's administration
 // directory (its refs and reflogs are the live repository's but its own
@@ -432,8 +439,7 @@ fn git_differs(
         if lstat(&admin.join("locked"))?.is_some() {
             return Ok(Some("locked".to_owned()));
         }
-        let own = admin.join("refs");
-        if lstat(&own)?.is_some_and(|meta| meta.is_dir()) && !walk(&own, true)?.is_empty() {
+        if worktree_refs(admin)? {
             return Ok(Some("worktree-refs".to_owned()));
         }
         commits.extend(reflogs(&admin.join("logs"))?);
@@ -550,7 +556,7 @@ pub fn differs(
 
 // A linked checkout's administration directory (what its `.git` file
 // names); `None` for a standalone checkout.
-fn linked_admin(beside: &Path) -> Result<Option<PathBuf>> {
+pub(super) fn linked_admin(beside: &Path) -> Result<Option<PathBuf>> {
     if lstat(&beside.join(".git"))?.is_some_and(|meta| meta.is_dir()) {
         return Ok(None);
     }
@@ -617,6 +623,24 @@ pub fn retire(
     if prints(beside)? != before {
         return Ok(Retired::Kept("raced".to_owned()));
     }
+    remove_proved(record, beside, (item, capture), before)
+}
+
+/// Remove the beside checkout at `beside` once its caller proved it may
+/// go, its prints `before` taken before that proof: the crash-safe
+/// removal of the module docs (the record at `record`, the rename to a
+/// private name, the re-proof by prints, a linked landing's
+/// administration, the tree, the record). `capture` names the private
+/// name; `item` is recorded.
+///
+/// # Errors
+/// Whatever the rename, the removal or a record write refuses.
+pub(super) fn remove_proved(
+    record: &Path,
+    beside: &Path,
+    (item, capture): (&str, [u8; 32]),
+    before: [u8; 32],
+) -> Result<Retired> {
     let meta = fs::symlink_metadata(beside).refuse_at("git_carry::beside::retire")?;
     let admin = linked_admin(beside)?;
     let admin_gitdir = match &admin {

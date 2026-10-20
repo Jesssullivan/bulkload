@@ -144,6 +144,22 @@ SUBCOMMANDS:
                 included as refs/NS-stash/N, and closure prints refs_in on the
                 refused row. A ref named refs/NS itself refuses the item
                 GIT_DESTINATION_OCCUPIED before it writes anything.
+                With --refs-in, a capture with no tracked change (index and
+                tracked files its HEAD's) whose HEAD a live ref or a captured
+                branch or tag brings in lands NO tree beside (operator ruling
+                2026-10-16 21:24Z, 'refs in always; a tree beside ONLY where
+                neo has uncommitted work'): its refs go in (stash entries as
+                refs/NS-stash/N) and its untracked and ignored files are
+                reconciled into the live checkout one by one, create-only:
+                absent placed, equal adopted, different landed as
+                FILE+SUFFIX (a directory under a live file, under
+                DIR+SUFFIX/); a FILE+SUFFIX holding something else refuses
+                GIT_BESIDE_FOREIGN path=... after the rest. Recorded in STATE
+                ITEM-SOURCE.files; receipt beside-tree=none files-tracked=N
+                files-placed=N files-adopted=N files-beside=N ...; outcome
+                and journal workspace-refs-in, closure applied (with files
+                and refs_in). The live checkout's HEAD, index, tracked files,
+                refs and info/exclude are never touched.
                 --advance-ancestor (operator ruling 2026-10-19, 'Yes, advance
                 those'; needs --adopt and --beside): a live checkout bulkload
                 did not land that differs from the capture is advanced in
@@ -370,6 +386,33 @@ SUBCOMMANDS:
                 CAPTURE_ABSENT back (and for refs-only items riding on it).
                 --dry-run reads only and prints what each item would do.
                 One line per item
+    estate-beside-retire [--delete] [--scan ROOT]... [--depth N] SUFFIX SOURCE PRIVATE_STATE [BESIDE ...]
+                Operator ruling 2026-10-16 21:24Z: prove each beside tree
+                (each BESIDE, and every directory named *SUFFIX whose live
+                path exists under a --scan ROOT, to --depth levels, default
+                6, never into a checkout) a subset of its live checkout (the
+                name without SUFFIX): empty; or a linked worktree of the
+                live repository or a standalone repository, tracked-clean,
+                its HEAD reachable from a live ref (provenance aside),
+                nothing its Git holds lost (no lock, per-worktree ref, own
+                worktree or hook; every commit its refs, stash and reflogs
+                name reachable in the live repository; a standalone tree's
+                branches and tags held there by name, natively or under
+                refs/NS/, else created there create-only), and every
+                untracked or ignored entry present and equal in the live
+                checkout or landable there as a file-level beside
+                (FILE+SUFFIX; rebuildable roots counted, not reconciled).
+                One line per tree: verdict=retirable with the counts and
+                bytes, or verdict=refused reason=... (typed; nothing
+                written), then a summary. Report only: nothing is written.
+                --delete: each retirable tree's entries are reconciled into
+                the live checkout and its refs created, it is proved again,
+                ledgered in PRIVATE_STATE (beside-retire-TAG.retired: path,
+                live path, HEAD, counts, refs, bytes, a standalone tree's
+                config and info/exclude) and removed crash-safely (renamed
+                aside, re-proved by prints, its administration and tree
+                deleted); outcome=retired, or outcome=kept reason=... A
+                rerun finishes a removal a crash cut short.
     closure-report [--attest LEDGER.json] [--dispositions LEDGER] [--transfer DEST_STATE ...] [--transfer-manifest MANIFEST] [--omissions-from-destination] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
                 Read-only: join PLAN with CORPUS's capture records and each
                 PRIVATE_STATE's typed outcome records (legacy string records
@@ -804,6 +847,7 @@ impl Priority {
     }
 }
 
+#[allow(clippy::too_many_lines)] // One dispatch table.
 fn main() -> ExitCode {
     let started = std::time::Instant::now();
     // OI-1001-Q2: the binary keeps a 25% free-space floor unless told otherwise.
@@ -870,6 +914,7 @@ fn main() -> ExitCode {
             | "estate-unseat"),
         ) => estate_command(name, &args.collect::<Vec<_>>()),
         Some("estate-carry-files") => carry_files_command(&args.collect::<Vec<_>>()),
+        Some("estate-beside-retire") => beside_retire_command(&args.collect::<Vec<_>>()),
         Some(name @ ("estate-move-source" | "estate-move")) => estate_move::command(name, args),
         Some("apply-state-candidate") => apply_state_command(&args.collect::<Vec<_>>()),
         Some("closure-report") => closure_command(&args.collect::<Vec<_>>()),
@@ -2369,6 +2414,69 @@ fn pull_recorded(args: &[std::ffi::OsString]) -> Result<()> {
 
 // M2r2 b: `estate-carry-files`. A `pull` carries through `pull_command`,
 // the remote source state per item under --source-state-root.
+// `estate-beside-retire [--delete] [--scan ROOT]... [--depth N] SUFFIX
+// SOURCE PRIVATE_STATE [BESIDE ...]` (operator ruling 2026-10-16 21:24Z).
+fn beside_retire_command(args: &[std::ffi::OsString]) -> Result<()> {
+    use bulkload_agent::estate::beside_retire::{self, RetireOptions};
+    let mut options = RetireOptions {
+        depth: beside_retire::SCAN_DEPTH,
+        ..RetireOptions::default()
+    };
+    let mut at = 0;
+    let value = |at: usize| args.get(at).ok_or(BulkloadRefusal::RequiredFieldMissing);
+    while let Some(arg) = args.get(at).and_then(|arg| arg.to_str()) {
+        match arg {
+            "--delete" if !options.delete => {
+                options.delete = true;
+                at += 1;
+            }
+            "--scan" => {
+                options.scan.push(PathBuf::from(value(at + 1)?));
+                at += 2;
+            }
+            "--depth" => {
+                options.depth = value(at + 1)?
+                    .to_str()
+                    .and_then(|depth| depth.parse::<usize>().ok())
+                    .filter(|depth| *depth > 0)
+                    .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+                at += 2;
+            }
+            other if other.starts_with("--") => return Err(BulkloadRefusal::FieldDomainViolation),
+            _ => break,
+        }
+    }
+    let rest = args.get(at..).unwrap_or_default();
+    let text = |i: usize| -> Result<String> {
+        rest.get(i)
+            .ok_or(BulkloadRefusal::RequiredFieldMissing)?
+            .to_str()
+            .map(str::to_owned)
+            .ok_or(BulkloadRefusal::FieldDomainViolation)
+    };
+    options.suffix = text(0)?;
+    options.source = text(1)?;
+    options.state = PathBuf::from(rest.get(2).ok_or(BulkloadRefusal::RequiredFieldMissing)?);
+    if !options.state.is_absolute() {
+        return Err(BulkloadRefusal::PathNotAbsolute);
+    }
+    options.paths = rest
+        .get(3..)
+        .unwrap_or_default()
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    if options.paths.is_empty() && options.scan.is_empty() {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
+    }
+    beside_retire::run(&options, &mut |line| {
+        let mut output = std::io::stdout().lock();
+        writeln!(output, "{line}").refuse_at("main::beside_retire")?;
+        output.flush().refuse_at("main::beside_retire")
+    })
+    .map(drop)
+}
+
 #[allow(clippy::too_many_lines)] // Argument parsing, then one call.
 fn carry_files_command(args: &[std::ffi::OsString]) -> Result<()> {
     use bulkload_agent::estate::carried::{self, CarryJob, CarryOptions, Transport};

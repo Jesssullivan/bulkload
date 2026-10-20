@@ -2349,6 +2349,7 @@ fn apply_item(
             let outcome = match done.as_str() {
                 "workspace-restored" => "previous-workspace-restoration-not-revalidated",
                 "workspace-beside" => "previous-workspace-beside-not-revalidated",
+                "workspace-refs-in" => "previous-workspace-refs-in-not-revalidated",
                 "refs-imported" => "previous-ref-custody-not-workspace-parity",
                 _ => return Err(BulkloadRefusal::ReceiptBindingInvalid),
             };
@@ -2488,8 +2489,27 @@ fn apply_item(
                         refused,
                     )?;
                 }
-                match beside_item(&staged, &target, &landing, (state, &policy, suffix)) {
-                    Ok(mut applied) => {
+                // Operator ruling 2026-10-16 21:24Z ("refs in always; a tree
+                // beside ONLY where neo has uncommitted work"): a capture
+                // with no tracked change whose HEAD the refs bring in lands
+                // no tree beside; its untracked and ignored files are
+                // reconciled into the live checkout, file by file
+                // (`git_carry::converge::clean`). Only under `--refs-in`:
+                // without it the refs would not go in.
+                let clean = if options.refs_in {
+                    git_carry::converge::clean::assess(&staged, &target)?
+                } else {
+                    None
+                };
+                let landed = clean.as_ref().map_or_else(
+                    || {
+                        beside_item(&staged, &target, &landing, (state, &policy, suffix))
+                            .map(|applied| ("workspace-beside", applied))
+                    },
+                    |clean| clean_item(clean, item, &target, &landing, (state, suffix)),
+                );
+                match landed {
+                    Ok((outcome, mut applied)) => {
                         if let Some(refused) = &refused {
                             let words = format!("advance-refused={}", refused.code());
                             applied.custody = Some(match applied.custody.take() {
@@ -2497,7 +2517,7 @@ fn apply_item(
                                 None => words,
                             });
                         }
-                        ("workspace-beside", applied)
+                        (outcome, applied)
                     }
                     // Gap C12 (A-115): the tree waits for review beside the
                     // live checkout, but the item's refs go in now, branches,
@@ -2546,8 +2566,10 @@ fn apply_item(
             .as_deref()
             .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
         // An advanced checkout (now or by an earlier pass) keeps its own
-        // stash: the capture's entries go in under the namespace.
-        let stash = applied.advanced
+        // stash: the capture's entries go in under the namespace, as a
+        // clean source's do (no tree beside holds them).
+        let stash = outcome == "workspace-refs-in"
+            || applied.advanced
             || match item.workspace.as_deref() {
                 Some(workspace) => {
                     git_carry::converge::advance::advanced_at(workspace, source)?.is_some()
@@ -2597,6 +2619,86 @@ fn apply_item(
         })
         .or_else(|| applied.converged.then(|| "converged".to_owned()));
     Ok(done)
+}
+
+// Operator ruling 2026-10-16 21:24Z: the clean capture `clean` lands no
+// tree beside the live checkout; its untracked and ignored files are
+// reconciled into it ([`git_carry::converge::clean::land`]), recorded at
+// `{item}-{blake3(SOURCE)}.files` in STATE. The refs go in after, as for
+// any adopted or landed item (`--refs-in`, stash entries included). A
+// beside landing an earlier pass made is left as it was and named, for
+// `estate-beside-retire`.
+fn clean_item(
+    clean: &git_carry::converge::clean::Clean,
+    item: &Item,
+    target: &git_carry::converge::Target<'_>,
+    landing: &git_carry::converge::Landing<'_>,
+    (state, suffix): (&Path, &str),
+) -> Result<(&'static str, git_carry::converge::Applied)> {
+    let record = files_record_path(state, landing.item, target.source);
+    let mut applied = git_carry::converge::clean::land(clean, target, landing, (&record, suffix))?;
+    if let Some(workspace) = item.workspace.as_deref() {
+        let beside = git_carry::beside::path(workspace, suffix);
+        if fs::symlink_metadata(&beside).is_ok() {
+            applied.custody = applied
+                .custody
+                .map(|words| format!("{words} beside-existing={}", beside.display()));
+        }
+    }
+    Ok(("workspace-refs-in", applied))
+}
+
+/// Where an item's clean-source file reconcile is recorded (operator
+/// ruling 2026-10-16 21:24Z): `{item}-{blake3(source)}.files` in STATE, a
+/// [`git_carry::converge::files::FilesRecord`].
+#[must_use]
+pub fn files_record_path(state: &Path, identity: &str, source: &str) -> PathBuf {
+    state.join(format!(
+        "{identity}-{}.files",
+        blake3::hash(source.as_bytes()).to_hex()
+    ))
+}
+
+/// What an item's `.files` record says of its current capture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilesSummary {
+    /// The tracked files and links the source's HEAD holds (in by ref).
+    pub tracked: u64,
+    /// How the untracked and ignored entries ended.
+    pub tally: git_carry::converge::files::Tally,
+}
+
+// The `.files` summary of `identity`'s current capture (`capture`,
+// lowercase hex) from the last state directory holding its record: `Err`
+// when it names another item or capture, is unfinished or left an entry
+// occupied; `None` with no record.
+fn files_summary(
+    states: &[PathBuf],
+    identity: &str,
+    source: &str,
+    capture: Option<&str>,
+) -> Option<std::result::Result<FilesSummary, &'static str>> {
+    let path = states
+        .iter()
+        .rev()
+        .map(|state| files_record_path(state, identity, source))
+        .find(|path| path.is_file())?;
+    let Ok(Some(record)) = git_carry::converge::files::read_record(&path) else {
+        return Some(Err("files-record-unreadable"));
+    };
+    let current = capture.is_some_and(|capture| {
+        blake3::Hash::from_bytes(record.capture).to_hex().as_str() == capture
+    });
+    Some(
+        if record.item == identity && current && record.done && record.occupied.is_empty() {
+            Ok(FilesSummary {
+                tracked: record.tracked,
+                tally: record.tally,
+            })
+        } else {
+            Err("files-record-mismatch")
+        },
+    )
 }
 
 /// Whether the last `.beside` record of `identity` in `states` proves its
@@ -3336,6 +3438,12 @@ pub struct LedgerEntry {
     /// or refused with a `GIT_ADVANCE_*` code, which closure holds pending
     /// review on a beside row. `None` otherwise.
     pub advance: Option<AdvanceSummary>,
+    /// Operator ruling 2026-10-16 21:24Z: what the item's
+    /// `{item}-{blake3(SOURCE)}.files` record (the last state directory
+    /// holding one) says of its current capture, landed with no tree beside:
+    /// every untracked and ignored entry counted, none left occupied. `None`
+    /// when no state directory holds one.
+    pub files: Option<std::result::Result<FilesSummary, &'static str>>,
     /// Why `omitted` is unknown: `no-capture`, `capture-unreadable`,
     /// `sidecar-unreadable`, or the in-band reader's reason
     /// (`header-unreadable`, `value-not-read`, `value-not-held`,
@@ -3563,6 +3671,7 @@ pub fn ledger_with(
         let beside = beside_proof(states, &identity, source, capture.as_deref());
         let refs_in = refs_in_summary(states, &identity, source, capture.as_deref());
         let advance = advance_summary(states, &identity, source, capture.as_deref());
+        let files = files_summary(states, &identity, source, capture.as_deref());
         ledger.entries.push(LedgerEntry {
             source: item.source.clone(),
             has_workspace: item.workspace.is_some(),
@@ -3574,6 +3683,7 @@ pub fn ledger_with(
             beside,
             refs_in,
             advance,
+            files,
             unknown_because,
             item: identity,
         });
@@ -4309,6 +4419,9 @@ pub use retarget::{mapped as retarget_mapped, retarget, Moved as Retargeted};
 
 // `estate-move` and `estate-move-source` (M2 item 7).
 pub mod moving;
+
+// `estate-beside-retire` (operator ruling 2026-10-16 21:24Z).
+pub mod beside_retire;
 
 // S4 refusal sweep (2026-10-08): #219, #220, #162, #183.
 #[cfg(test)]

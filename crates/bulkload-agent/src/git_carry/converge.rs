@@ -876,7 +876,7 @@ pub(super) fn settle_repository(repo: &Path, common: &Path, source: &str) -> Res
 /// may carry above its landed bytes (TIN-6569, OI-1003-Q183); it is not
 /// part of the side's identity, so the delta never plans a write for it.
 #[derive(Debug, Clone)]
-struct Side {
+pub(in crate::git_carry) struct Side {
     kind: Kind,
     mode: u32,
     blob: Option<String>,
@@ -3479,7 +3479,9 @@ pub(super) fn finish_landing(
 
 mod adopt;
 pub mod advance;
+pub mod clean;
 pub mod diff;
+pub mod files;
 pub mod handoff;
 
 #[cfg(test)]

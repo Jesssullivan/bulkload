@@ -120,7 +120,7 @@ pub const ADVANCED: &str = "advanced";
 
 /// Git's in-progress markers in a worktree's git directory: a merge,
 /// cherry-pick, revert, rebase, bisect or sequencer run.
-const IN_PROGRESS: &[&str] = &[
+pub(in crate::git_carry) const IN_PROGRESS: &[&str] = &[
     "MERGE_HEAD",
     "CHERRY_PICK_HEAD",
     "REVERT_HEAD",
@@ -450,7 +450,10 @@ pub fn advanced_at(workspace: &Path, source: &str) -> Result<Option<Advanced>> {
 // repository included. Git runs with no fsmonitor (`git_env`), so it walks
 // the worktree itself (an untracked cache it keeps is checked against the
 // directories' times).
-fn status(worktree: &Path, git_dir: &Path) -> Result<Option<Vec<Vec<u8>>>> {
+pub(in crate::git_carry) fn status(
+    worktree: &Path,
+    git_dir: &Path,
+) -> Result<Option<Vec<Vec<u8>>>> {
     for name in IN_PROGRESS {
         if lstat(&git_dir.join(name))?.is_some() {
             return Ok(None);

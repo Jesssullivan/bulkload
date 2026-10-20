@@ -362,6 +362,33 @@ fn beside_lands_next_to_an_occupied_workspace() {
     assert!(report.contains("\"disposition\":\"carried\""), "{report}");
 }
 
+/// Operator ruling 2026-10-16 21:24Z (no empty beside directory; the two
+/// empty `*.neo-20261016` directories on sting, 2026-10-19): a carry whose
+/// session refuses before anything lands removes the destination it made,
+/// so nothing is left on disk, and the item stays `CAPTURE_ABSENT`. A
+/// destination that was there before is never removed.
+#[test]
+fn a_refused_carry_leaves_no_empty_directory() {
+    for existed in [false, true] {
+        let world = World::new("refused-empty", |_, _| {});
+        let beside = world.path("dst/repo.neo-20261016");
+        if existed {
+            fs::create_dir(&beside).unwrap();
+        }
+        fs::remove_dir_all(&world.source).unwrap();
+        let ran = world.carry(&["--beside", ".neo-20261016"]);
+        assert!(
+            !ran.stdout.contains("outcome=carried-as-files"),
+            "{existed}: {}{}",
+            ran.stdout,
+            ran.stderr
+        );
+        assert_eq!(beside.exists(), existed, "{existed}: {}", ran.stdout);
+        let report = world.closure();
+        assert!(report.contains("CAPTURE_ABSENT"), "{existed}: {report}");
+    }
+}
+
 #[test]
 fn an_equal_destination_is_adopted_and_a_differing_file_is_never_overwritten() {
     // Equal: a copy the lane made by hand is adopted with nothing written.

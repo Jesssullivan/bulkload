@@ -821,6 +821,9 @@ pub fn land(
 // `--advance-ancestor` (operator ruling 2026-10-19): a beside landing an
 // advance made redundant, retired once proved equal to the live tree.
 pub mod retire;
+// The clean-source rule (operator ruling 2026-10-16 21:24Z): a beside tree
+// whose content the live repository holds, retired by proof.
+pub mod subset;
 
 #[cfg(test)]
 mod tests {
