@@ -92,3 +92,13 @@ The schemas were read from Codex `79a19cbb`'s migrations
   into an absent store; the union holds `SQLITE_UNION_TARGET_ABSENT` until
   then), and `HOMES_CONSOLIDATE_RACED` for a racing writer or a replaced
   store (`SQLITE_STATE_CHANGED` today).
+
+## 2026-10-20: requirement re-quoted from the ratified SPEC (#298, main c2da575)
+
+SPEC, "How each kind of data is consolidated", the Codex SQLite row,
+verbatim: "Codex SQLite | adopt | rows come in | rows merged into sting's
+live database by primary key, streamed from neo's held read snapshot; no
+database copy is written; a key with two versions takes the later one, and
+the other is kept in the ledger". Goals 6 ("never holds a lock a live
+writer waits on") and 8 ("reads only what changed") apply too. The earlier
+R2.2 quote is superseded by this text.
