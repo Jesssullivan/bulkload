@@ -2417,25 +2417,27 @@ impl Judged {
         match self {
             Self::Extended { .. } | Self::Covered { .. } => None,
             Self::Diverged => Some(BulkloadRefusal::ReseatDestDiverged),
-            Self::Held("live-unsettled" | "live-raced") => Some(BulkloadRefusal::ReseatExtendRaced),
+            Self::Held("live-unsettled" | "live-raced" | "live-in-use" | "copy-mid-line") => {
+                Some(BulkloadRefusal::ReseatExtendRaced)
+            }
             Self::Held(_) => Some(BulkloadRefusal::DestinationOccupied),
         }
     }
 }
 
-/// BLAKE3 of `file`'s first `length` bytes, `None` when it holds fewer.
-fn head_digest(file: &File, length: u64) -> Result<Option<[u8; 32]>> {
+/// BLAKE3 of `file`'s bytes `[from, to)`, `None` when it holds fewer.
+fn range_digest(file: &File, (from, to): (u64, u64)) -> Result<Option<[u8; 32]>> {
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0_u8; 1 << 20];
-    let mut at = 0_u64;
-    while at < length {
-        let want = usize::try_from((length - at).min(1 << 20)).unwrap_or(1 << 20);
+    let mut at = from;
+    while at < to {
+        let want = usize::try_from((to - at).min(1 << 20)).unwrap_or(1 << 20);
         let slot = buffer
             .get_mut(..want)
             .ok_or(BulkloadRefusal::BudgetExceeded)?;
         let read = file
             .read_at(slot, at)
-            .refuse_at("reseat::place::head_digest")?;
+            .refuse_at("reseat::place::range_digest")?;
         if read == 0 {
             return Ok(None);
         }
@@ -2446,6 +2448,73 @@ fn head_digest(file: &File, length: u64) -> Result<Option<[u8; 32]>> {
     Ok(Some(*hasher.finalize().as_bytes()))
 }
 
+/// The end of the last whole line of `file` in `[from, to)`: one past its
+/// last line end there, or `None` when that range holds none.
+fn last_line_end(file: &File, (from, to): (u64, u64)) -> Result<Option<u64>> {
+    const WINDOW: u64 = 1 << 20;
+    let mut buffer = vec![0_u8; 1 << 20];
+    let mut end = to;
+    while end > from {
+        let start = end.saturating_sub(WINDOW).max(from);
+        let slot = buffer
+            .get_mut(..usize::try_from(end - start).unwrap_or(0))
+            .ok_or(BulkloadRefusal::BudgetExceeded)?;
+        if crate::io::sys::pread_full(file, slot, start)
+            .refuse_at("reseat::place::last_line_end")?
+            != slot.len()
+        {
+            return Ok(None);
+        }
+        counters::add_len(Counter::ReseatLandingRead, slot.len());
+        if let Some(at) = slot.iter().rposition(|byte| *byte == b'\n') {
+            return Ok(Some(start + at as u64 + 1));
+        }
+        end = start;
+    }
+    Ok(None)
+}
+
+/// The next piece of `file` to append from `at`, before `target` (a line
+/// end): at most a mebibyte ending at its last line end, or, when its
+/// first mebibyte holds none, read on to the next line end (one record,
+/// however long), as the pull's `record_piece` reads. `None` when `file`
+/// holds fewer bytes than asked (it changed).
+fn line_piece<'b>(
+    file: &File,
+    (at, target): (u64, u64),
+    buffer: &'b mut Vec<u8>,
+) -> Result<Option<&'b [u8]>> {
+    const PIECE: u64 = 1 << 20;
+    let mut read = 0_u64;
+    loop {
+        let want = (target - at - read).min(PIECE);
+        let start = usize::try_from(read).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
+        let end = usize::try_from(read + want).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
+        if buffer.len() < end {
+            buffer.resize(end, 0);
+        }
+        let slot = buffer
+            .get_mut(start..end)
+            .ok_or(BulkloadRefusal::BudgetExceeded)?;
+        if crate::io::sys::pread_full(file, slot, at + read)
+            .refuse_at("reseat::place::line_piece")?
+            != slot.len()
+        {
+            return Ok(None);
+        }
+        counters::add_len(Counter::ReseatLandingRead, slot.len());
+        let last = slot.iter().rposition(|byte| *byte == b'\n');
+        read += want;
+        if let Some(last) = last {
+            return Ok(buffer.get(..start + last + 1));
+        }
+        if at + read >= target {
+            // `target` is a line end, so this is not reached.
+            return Ok(buffer.get(..end));
+        }
+    }
+}
+
 /// Judge the source's copy `landed` the pull put beside the destination's
 /// own regular transcript `live` by their bytes (#294 review 1).
 ///
@@ -2453,22 +2522,36 @@ fn head_digest(file: &File, length: u64) -> Result<Option<[u8; 32]>> {
 /// file, one with other links, another owner or mode, the prefix extension
 /// off.
 ///
-/// The live file a strict prefix of the copy is extended in place by the
-/// copy's whole lines past it, `O_APPEND`, each piece one write after its
-/// size is checked, when that is safe: a regular file with one link, this
-/// user's, the copy's mode, quiet past the racy window by `now_ns`, ending
-/// at a line's end (or empty), and the prefix extension on
-/// ([`crate::transfer::PREFIX_EXTEND_ENV`] not `0`); else it is
-/// [`Judged::Held`]. A copy whose bytes are the live file's first bytes is
+/// The live file a strict prefix of the copy is extended in place by every
+/// whole line of the copy past it, up to the copy's last line end,
+/// `O_APPEND`, each piece one write after the file's size is checked; then
+/// the appended range is read back and hashed against what was written.
+/// That only when it is safe:
+/// - a regular file with one link, this user's, the copy's mode, quiet past
+///   the racy window by `now_ns`, ending at a line's end (or empty), and the
+///   prefix extension on ([`crate::transfer::PREFIX_EXTEND_ENV`] not `0`);
+/// - no process holds the live file open or works in `lane`, the lane's
+///   destination directory (#294 verification: a quiet but open session
+///   would fork inside one file), as [`crate::procs::inside`] sees on
+///   Linux; where it cannot say, nothing is written.
+///
+/// Anything else is [`Judged::Held`], typed with its reason, nothing written
+/// (a copy with no line end past the live file's bytes is `copy-mid-line`).
+/// A copy whose bytes are the live file's first bytes is
 /// [`Judged::Covered`]; neither a prefix of the other is
 /// [`Judged::Diverged`]. A copy wholly in the live file afterwards, which a
 /// later pull will not land again, is removed (the very file read), so one
 /// copy of the bytes stays.
 ///
 /// # Errors
-/// I/O refusals of reading and appending.
+/// I/O refusals of reading and appending; `/proc` unreadable.
 #[allow(clippy::too_many_lines)] // Compare, then the guarded append.
-pub fn judge_beside(live: &Path, landed: &Path, now_ns: i64) -> Result<Judged> {
+pub fn judge_beside(
+    live: &Path,
+    landed: &Path,
+    now_ns: i64,
+    lane: Option<&Path>,
+) -> Result<Judged> {
     let (Some(live_meta), Some(landed_meta)) = (lstat(live)?, lstat(landed)?) else {
         return Ok(Judged::Held("live-not-regular"));
     };
@@ -2479,7 +2562,8 @@ pub fn judge_beside(live: &Path, landed: &Path, now_ns: i64) -> Result<Judged> {
     let landed_file = crate::hash::open_nofollow(landed)?;
     let (held, size) = (live_meta.len(), landed_meta.len());
     let shared = held.min(size);
-    let same_head = head_digest(&live_file, shared)? == head_digest(&landed_file, shared)?;
+    let same_head =
+        range_digest(&live_file, (0, shared))? == range_digest(&landed_file, (0, shared))?;
     let unmoved = |path: &Path, meta: &std::fs::Metadata| -> Result<bool> {
         Ok(lstat(path)?.is_some_and(|now| Identity::of(&now) == Identity::of(meta)))
     };
@@ -2515,7 +2599,11 @@ pub fn judge_beside(live: &Path, landed: &Path, now_ns: i64) -> Result<Judged> {
         let consumed = if held > size { remove_copy()? } else { false };
         return Ok(Judged::Covered { consumed });
     }
-    // The live file is a strict prefix of the copy: extend it, when safe.
+    // The live file is a strict prefix of the copy: extend it by the copy's
+    // whole lines, when safe.
+    let Some(target) = last_line_end(&landed_file, (held, size))? else {
+        return Ok(Judged::Held("copy-mid-line"));
+    };
     let quiet = now_ns.saturating_sub(2_000_000_000);
     let stamp =
         |seconds: i64, nanos: i64| seconds.saturating_mul(1_000_000_000).saturating_add(nanos);
@@ -2534,7 +2622,13 @@ pub fn judge_beside(live: &Path, landed: &Path, now_ns: i64) -> Result<Judged> {
     } else if held > 0 && last_byte(&live_file, held)? != Some(b'\n') {
         Some("live-mid-line")
     } else {
-        None
+        let mut roots = vec![live];
+        roots.extend(lane);
+        match crate::procs::inside(&roots)? {
+            Some(pids) if pids.is_empty() => None,
+            Some(_) => Some("live-in-use"),
+            None => Some("live-in-use-unknown"),
+        }
     };
     if let Some(reason) = unsafe_reason {
         return Ok(Judged::Held(reason));
@@ -2548,58 +2642,50 @@ pub fn judge_beside(live: &Path, landed: &Path, now_ns: i64) -> Result<Judged> {
     if Identity::of(&opened) != Identity::of(&live_meta) {
         return Ok(Judged::Held("live-raced"));
     }
-    // Whole lines only: the copy's bytes up to its last line end.
-    let mut buffer = vec![0_u8; 1 << 20];
+    let mut buffer = Vec::new();
+    let mut written = blake3::Hasher::new();
     let mut at = held;
-    let mut end = held;
-    while at < size {
-        let want = usize::try_from((size - at).min(1 << 20)).unwrap_or(1 << 20);
-        let slot = buffer
-            .get_mut(..want)
-            .ok_or(BulkloadRefusal::BudgetExceeded)?;
-        let read = landed_file
-            .read_at(slot, at)
-            .refuse_at("reseat::place::judge_beside")?;
-        if read == 0 {
-            break;
-        }
-        let piece = slot.get(..read).unwrap_or_default();
-        let Some(last) = piece.iter().rposition(|byte| *byte == b'\n') else {
-            // No line end in this piece: read on would need a larger piece;
-            // stop at the whole lines placed so far.
-            break;
+    while at < target {
+        let Some(piece) = line_piece(&landed_file, (at, target), &mut buffer)? else {
+            return Ok(Judged::Held("live-raced"));
         };
-        let whole = piece.get(..=last).unwrap_or_default();
-        let now = writer
+        if writer
             .metadata()
             .refuse_at("reseat::place::judge_beside")?
-            .len();
-        if now != end {
+            .len()
+            != at
+        {
             // A writer appended under us: stop, the live file is its own.
             return Ok(Judged::Held("live-raced"));
         }
         (&writer)
-            .write_all(whole)
+            .write_all(piece)
             .refuse_at("reseat::place::judge_beside")?;
-        counters::add_len(Counter::ReseatDestWrite, whole.len());
-        end += whole.len() as u64;
-        at += whole.len() as u64;
+        counters::add_len(Counter::ReseatDestWrite, piece.len());
+        written.update(piece);
+        at += piece.len() as u64;
     }
     writer.sync_all().refuse_at("reseat::place::judge_beside")?;
     let after = writer
         .metadata()
         .refuse_at("reseat::place::judge_beside")?
         .len();
-    if after != end || !unmoved(landed, &landed_meta)? {
+    // The appended range, read back from the live file, is what was
+    // written, and the copy has not moved: else nothing more is done.
+    if after != target
+        || !unmoved(landed, &landed_meta)?
+        || range_digest(&live_file, (held, target))? != Some(*written.finalize().as_bytes())
+    {
         return Ok(Judged::Held("live-raced"));
     }
-    if end == held {
-        return Ok(Judged::Held("live-mid-line"));
-    }
-    let consumed = if end == size { remove_copy()? } else { false };
+    let consumed = if target == size {
+        remove_copy()?
+    } else {
+        false
+    };
     Ok(Judged::Extended {
         prior: held,
-        size: end,
+        size: target,
         consumed,
     })
 }
@@ -2610,6 +2696,14 @@ mod judge_tests {
 
     use super::{judge_beside, Judged};
     use std::path::Path;
+
+    /// The re-seat rows that measure the process-wide landed-read counter
+    /// run one at a time; these read landed bytes, so they wait for them.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        super::super::tests::SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     /// An hour from now: every fixture written by the test is quiet.
     fn later() -> i64 {
@@ -2626,6 +2720,7 @@ mod judge_tests {
     /// #294 review 1: the copy is judged by bytes, never taken as diverged.
     #[test]
     fn a_beside_copy_is_judged_by_its_bytes() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let dir = std::fs::canonicalize(dir.path()).unwrap();
         let grown: &[u8] = b"{\"a\":1}\n{\"b\":2}\n";
@@ -2634,7 +2729,7 @@ mod judge_tests {
         for live in [&b""[..], &b"{\"a\":1}\n"[..]] {
             let (at, beside) = pair(&dir, live, grown);
             let inode = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&at).unwrap());
-            let judged = judge_beside(&at, &beside, later()).unwrap();
+            let judged = judge_beside(&at, &beside, later(), None).unwrap();
             assert_eq!(
                 judged,
                 Judged::Extended {
@@ -2653,21 +2748,21 @@ mod judge_tests {
         // The live file holds the copy and more: covered, the copy removed.
         let (at, beside) = pair(&dir, b"{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n", grown);
         assert_eq!(
-            judge_beside(&at, &beside, later()).unwrap(),
+            judge_beside(&at, &beside, later(), None).unwrap(),
             Judged::Covered { consumed: true }
         );
         assert!(!beside.exists());
         // The same bytes: covered, kept (a later pull would land it again).
         let (at, beside) = pair(&dir, grown, grown);
         assert_eq!(
-            judge_beside(&at, &beside, later()).unwrap(),
+            judge_beside(&at, &beside, later(), None).unwrap(),
             Judged::Covered { consumed: false }
         );
         assert!(beside.exists());
         // Neither a prefix of the other: diverged, both kept.
         let (at, beside) = pair(&dir, b"{\"a\":1}\n{\"x\":9}\n", grown);
         assert_eq!(
-            judge_beside(&at, &beside, later()).unwrap(),
+            judge_beside(&at, &beside, later(), None).unwrap(),
             Judged::Diverged
         );
         assert_eq!(std::fs::read(&at).unwrap(), b"{\"a\":1}\n{\"x\":9}\n");
@@ -2679,37 +2774,129 @@ mod judge_tests {
         ));
     }
 
+    /// #294 verification 1 and 2: a line longer than a mebibyte is read on
+    /// and appended whole; a copy ending mid-line is extended by its whole
+    /// lines, the partial one left in the copy, and the next judgment of it
+    /// is held `copy-mid-line`, never a false `extended`.
+    #[test]
+    fn whole_lines_are_appended_however_long_and_a_partial_one_is_held() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(dir.path()).unwrap();
+        let live: &[u8] = b"{\"a\":1}\n";
+        let mut long = live.to_vec();
+        long.extend_from_slice(b"{\"big\":\"");
+        long.extend(std::iter::repeat_n(b'x', 2 << 20));
+        long.extend_from_slice(b"\"}\n");
+        let (at, beside) = pair(&dir, live, &long);
+        assert_eq!(
+            judge_beside(&at, &beside, later(), None).unwrap(),
+            Judged::Extended {
+                prior: live.len() as u64,
+                size: long.len() as u64,
+                consumed: true
+            }
+        );
+        assert_eq!(std::fs::read(&at).unwrap(), long);
+        assert!(!beside.exists());
+
+        let partial: &[u8] = b"{\"a\":1}\n{\"b\":2}\n{\"c\"";
+        let (at, beside) = pair(&dir, live, partial);
+        assert_eq!(
+            judge_beside(&at, &beside, later(), None).unwrap(),
+            Judged::Extended {
+                prior: live.len() as u64,
+                size: 16,
+                consumed: false
+            }
+        );
+        assert_eq!(std::fs::read(&at).unwrap(), b"{\"a\":1}\n{\"b\":2}\n");
+        assert!(beside.exists(), "the partial line stays in the copy");
+        let again = judge_beside(&at, &beside, later(), None).unwrap();
+        assert_eq!(again, Judged::Held("copy-mid-line"));
+        assert!(!super::super::word_accounted(again.word()));
+        assert_eq!(
+            again.refusal(),
+            Some(crate::BulkloadRefusal::ReseatExtendRaced)
+        );
+    }
+
+    /// #294 verification 3: a quiet but open session (a process working in
+    /// the lane, or holding the transcript) is never written into: held,
+    /// typed and retryable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_session_working_in_the_lane_is_never_written_into() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(dir.path()).unwrap();
+        let lane = dir.join("lane");
+        std::fs::create_dir(&lane).unwrap();
+        let (at, beside) = pair(&dir, b"{\"a\":1}\n", b"{\"a\":1}\n{\"b\":2}\n");
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .current_dir(&lane)
+            .spawn()
+            .unwrap();
+        let mut judged = None;
+        for _ in 0..200 {
+            let found = crate::procs::inside(&[lane.as_path()]).unwrap();
+            if found.is_some_and(|pids| !pids.is_empty()) {
+                judged = Some(judge_beside(&at, &beside, later(), Some(&lane)).unwrap());
+                break;
+            }
+            std::thread::yield_now();
+        }
+        child.wait().unwrap();
+        assert_eq!(judged, Some(Judged::Held("live-in-use")));
+        assert_eq!(
+            std::fs::read(&at).unwrap(),
+            b"{\"a\":1}\n",
+            "nothing written"
+        );
+        assert_eq!(
+            Judged::Held("live-in-use").refusal(),
+            Some(crate::BulkloadRefusal::ReseatExtendRaced)
+        );
+        // Once it is gone, the next pass extends.
+        assert!(matches!(
+            judge_beside(&at, &beside, later(), Some(&lane)).unwrap(),
+            Judged::Extended { .. }
+        ));
+    }
+
     /// A strict prefix the re-seat may not extend now is held, typed: a
     /// file written within the racy window, ending mid-line, of another
     /// mode, or with another link.
     #[test]
     fn an_unsafe_extension_is_held_typed() {
         use std::os::unix::fs::PermissionsExt as _;
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let dir = std::fs::canonicalize(dir.path()).unwrap();
         let grown: &[u8] = b"{\"a\":1}\n{\"b\":2}\n";
         let (at, beside) = pair(&dir, b"{\"a\":1}\n", grown);
         let now = super::super::now_ns();
         assert_eq!(
-            judge_beside(&at, &beside, now).unwrap(),
+            judge_beside(&at, &beside, now, None).unwrap(),
             Judged::Held("live-unsettled")
         );
         let (at, beside) = pair(&dir, b"{\"a\":1", grown);
         assert_eq!(
-            judge_beside(&at, &beside, later()).unwrap(),
+            judge_beside(&at, &beside, later(), None).unwrap(),
             Judged::Held("live-mid-line")
         );
         let (at, beside) = pair(&dir, b"{\"a\":1}\n", grown);
         std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::set_permissions(&beside, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(
-            judge_beside(&at, &beside, later()).unwrap(),
+            judge_beside(&at, &beside, later(), None).unwrap(),
             Judged::Held("live-mode-differs")
         );
         let (at, beside) = pair(&dir, b"{\"a\":1}\n", grown);
         std::fs::hard_link(&at, dir.join("other-name")).unwrap();
         assert_eq!(
-            judge_beside(&at, &beside, later()).unwrap(),
+            judge_beside(&at, &beside, later(), None).unwrap(),
             Judged::Held("live-linked")
         );
         assert_eq!(

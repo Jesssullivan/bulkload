@@ -230,6 +230,42 @@ They are fixed on this branch in new commits, after a signed merge of
    - Gap: a source path reached through a symlink keys by its target,
      whose lane is another one, so it is not found.
 
+## Verification of #294 (2026-10-20, at `6e3ae3a`) and the fixes
+
+The coordinator's verification held items 2 to 4 and the merge, and found
+one defect and two hardenings in `place::judge_beside`:
+
+1. **(must) A partial extension counted as `extended`.** The append loop
+   read the copy in 1 MiB pieces and stopped at a piece with no line end.
+   It reported `extended` (accounted) with part of the copy appended, and
+   the next pass was held under the wrong reason (`live-mid-line`). Probes:
+   a 2 MiB single line got 16 of 2,097,187 bytes; a copy ending mid-line
+   got 16 of 21.
+   - Now the extension aims at the copy's last line end
+     (`last_line_end`). Each piece is a mebibyte ending at its last line
+     end, or is read on to the next line end, one record however long
+     (`line_piece`, as the pull's `record_piece` does).
+   - `extended` only when everything up to that line end was appended;
+     anything less is held `live-raced`.
+   - A copy with no line end past the live file's bytes is held
+     `copy-mid-line` (`RESEAT_EXTEND_RACED`, retryable).
+2. **(should) The appended range is read back and hashed** against the
+   bytes written before the copy may be removed, not checked by size only.
+3. **(should) A quiet but open session is never written into.** Before
+   extending, any process holding the live transcript open, or working in
+   the lane's destination directory, holds the session `live-in-use`
+   (`RESEAT_EXTEND_RACED`, not remembered, nothing written). The scan is
+   `procs::inside`, added byte-identical to #289's `procs.rs` so the two
+   merge cleanly. Where it cannot say (not Linux), `live-in-use-unknown`.
+   A shell sitting in the lane's checkout counts too.
+- `DESTINATION_UNSETTLED` is rerun-only (`closure::rerun_only`, like
+  `TRANSPORT_LOST`): unaccounted, `destination-unsettled`, and neither a
+  review row nor a standing policy closes it. Only a later pass that
+  decides the path does.
+- Tests: `judge_tests::whole_lines_are_appended_however_long_and_a_partial_one_is_held`,
+  `judge_tests::a_session_working_in_the_lane_is_never_written_into`,
+  `closure::transfer_tests::an_unsettled_destination_is_rerun_only`.
+
 ## Receipt after the review (2026-10-20, at `60d769d`)
 
 - Host `honey`. Worktree `~/git-build/pull-map-prefix-20261019` is `fdc8589`

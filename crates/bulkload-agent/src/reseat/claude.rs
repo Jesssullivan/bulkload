@@ -898,7 +898,12 @@ pub fn reseat(
             && candidate.key == dest_key
             && std::fs::symlink_metadata(root.join(&rel)).is_ok_and(|meta| meta.is_file())
         {
-            let judged = place::judge_beside(&root.join(&rel), &candidate.path, options.now_ns)?;
+            let judged = place::judge_beside(
+                &root.join(&rel),
+                &candidate.path,
+                options.now_ns,
+                lane.as_ref().map(|lane| lane.dest_cwd.as_path()),
+            )?;
             kept_beside(
                 ledger,
                 candidate,

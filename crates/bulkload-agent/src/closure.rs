@@ -316,11 +316,16 @@ pub fn classify(entry: &LedgerEntry) -> Disposition {
 ///   peer's own refusal, when it had one, never crossed the wire.
 /// - `ITEMS_REFUSED` (S4, #231): the run-level exit, never an item's or a
 ///   path's outcome; a record naming it proves nothing about the item.
+/// - `DESTINATION_UNSETTLED` (#294 verification): a live append-only file a
+///   writer may have been at when the pass looked. Nothing was decided for
+///   it, so a review has nothing to accept: only a later pass that finds
+///   it quiet and records another outcome closes it.
 #[must_use]
 pub fn rerun_only(code: &str) -> Option<&'static str> {
     match code {
         "GIT_CONVERGE_INTERRUPTED" => Some("converge-interrupted"),
         "TRANSPORT_LOST" => Some("transport-lost"),
+        "DESTINATION_UNSETTLED" => Some("destination-unsettled"),
         // #279: another run held the move state; nothing ran.
         "MOVE_STATE_BUSY" => Some("state-busy"),
         "ITEMS_REFUSED" => Some("run-level-refusal"),
@@ -1589,6 +1594,7 @@ impl AttestationRow {
                 return Err(match refusal.code() {
                     "GIT_CONVERGE_INTERRUPTED" => "native-converge-interrupted",
                     "TRANSPORT_LOST" => "native-transport-lost",
+                    "DESTINATION_UNSETTLED" => "native-destination-unsettled",
                     _ => "native-run-level-refusal",
                 });
             }
