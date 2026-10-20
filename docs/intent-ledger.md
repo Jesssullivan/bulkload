@@ -1,5 +1,7 @@
 # bulkload intent ledger
 
+> **Evidence only, 2026-10-20.** The operator's own words recorded here stay valid evidence. The requirement IDs and agent paraphrases do not. [SPEC.md](SPEC.md) is the requirement and wins on any disagreement.
+
 This file is the evidence behind [SPEC.md](SPEC.md). It records what the
 operator said bulkload is for, word for word. Every requirement in SPEC.md
 cites entries here by ID (for example `RES-12`). If a SPEC requirement cannot

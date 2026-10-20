@@ -13,7 +13,8 @@
 //!   lands beside it at `<path>.<label>`, the live checkout untouched;
 //! - `broken` and `broken2`: captures refused (no index): carried as files,
 //!   at the live path (absent) and beside it (occupied);
-//! - `occupied`: a non-Git tree at the live path: refused typed, untouched;
+//! - `occupied`: a non-Git tree at the live path (a standalone item's):
+//!   refused typed (`GIT_DESTINATION_NONREPO_DIFFERS`), untouched;
 //! - `bare.git`: a bare repository landed refs-only.
 //!
 //! Then: closure accounts for every item; a rerun changes no ref and keeps
@@ -416,7 +417,7 @@ fn one_pass_lands_adopts_besides_carries_and_accounts_for_every_item() {
     let mut got = closure(&converged.stdout);
     assert!(
         got.remove("refusals")
-            .is_some_and(|codes| codes.contains("GIT_DESTINATION_OCCUPIED:1")),
+            .is_some_and(|codes| codes.contains("GIT_DESTINATION_NONREPO_DIFFERS:1")),
         "{}",
         converged.stdout
     );
