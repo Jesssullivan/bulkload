@@ -443,6 +443,24 @@ pub enum BulkloadRefusal {
     /// it finishes, then this one is rerun. No review closes it. Was a bare
     /// `IO` (errno 11).
     MoveStateBusy(Vec<u8>),
+    /// `estate-move-source` or `estate-move`: a pass would leave payload in
+    /// a state directory, or did, named by path (SPEC rule 2, reset
+    /// 2026-10-20: bulkload's private state holds ledgers and resume marks
+    /// only, never payload). Raised before a step that would stage payload
+    /// there (a capture into a corpus, a pull of one, a landing area), and
+    /// at the end of every pass when the state measures any payload bytes
+    /// (`state_payload_bytes=`). Nothing was staged by the refused step. No
+    /// review closes it.
+    StatePayloadLeft(Vec<u8>),
+    /// `estate-move-source` or `estate-move`: the state directory holds a
+    /// retired staging format, named by path: a capture bundle, a private
+    /// repository copy (`repository.git`), a capture attempt directory, a
+    /// corpus or a landing area (SPEC rule 2, reset 2026-10-20). Refused at
+    /// startup, before anything is read, written or reused: the verb never
+    /// grows or silently reuses such a tree. Each one found is printed. The
+    /// operator removes them by literal path, then reruns. No review closes
+    /// it.
+    StateFormatRetired(Vec<u8>),
 
     // ---- agent session re-seat (R0, TIN-6587) -------------------------------
     /// `estate-reseat`: the destination already holds a file at a session's
@@ -641,6 +659,22 @@ impl BulkloadRefusal {
             Self::WorkerLost => "WORKER_LOST",
             Self::TransportLost => "TRANSPORT_LOST",
             Self::MoveStateBusy(_) => "MOVE_STATE_BUSY",
+            Self::StatePayloadLeft(_) => "STATE_PAYLOAD_LEFT",
+            Self::StateFormatRetired(_) => "STATE_FORMAT_RETIRED",
+            Self::ProbeFailed => "PROBE_FAILED",
+            Self::Io(_) => "IO",
+            // The reseat family has a table of its own.
+            _ => self.reseat_code(),
+        }
+    }
+
+    /// [`Self::code`] of a reseat refusal (`RESEAT_*`, the `reseat` verb's
+    /// family): the arms `code` leaves to this table. Any other refusal has
+    /// its arm in `code` and none here, so it reads as the empty string, a
+    /// code the code-table test (`codes_are_unique_and_well_formed`)
+    /// refuses for every refusal it lists.
+    const fn reseat_code(&self) -> &'static str {
+        match *self {
             Self::ReseatDestDiverged => "RESEAT_DEST_DIVERGED",
             Self::ReseatDestContinued => "RESEAT_DEST_CONTINUED",
             Self::ReseatSourceRewritten => "RESEAT_SOURCE_REWRITTEN",
@@ -658,8 +692,7 @@ impl BulkloadRefusal {
             Self::ReseatRegularizeRaced => "RESEAT_REGULARIZE_RACED",
             Self::ReseatUndoTargetChanged => "RESEAT_UNDO_TARGET_CHANGED",
             Self::ReseatR0Failed => "RESEAT_R0_FAILED",
-            Self::ProbeFailed => "PROBE_FAILED",
-            Self::Io(_) => "IO",
+            _ => "",
         }
     }
 }
@@ -748,6 +781,8 @@ impl BulkloadRefusal {
         "WORKER_LOST",
         "TRANSPORT_LOST",
         "MOVE_STATE_BUSY",
+        "STATE_PAYLOAD_LEFT",
+        "STATE_FORMAT_RETIRED",
         "RESEAT_DEST_DIVERGED",
         "RESEAT_DEST_CONTINUED",
         "RESEAT_SOURCE_REWRITTEN",
@@ -799,6 +834,8 @@ impl fmt::Display for BulkloadRefusal {
             | Self::GitNestWorktreeMoved(ref path)
             | Self::GitSourceAlternates(ref path)
             | Self::MoveStateBusy(ref path)
+            | Self::StatePayloadLeft(ref path)
+            | Self::StateFormatRetired(ref path)
             | Self::GitBesideForeign(ref path)
             | Self::SpaceExhausted(Some(ref path)) => {
                 write!(f, "{} path=\"{}\"", self.code(), path.escape_ascii())
@@ -1024,6 +1061,8 @@ mod tests {
             BulkloadRefusal::WorkerLost,
             BulkloadRefusal::TransportLost,
             BulkloadRefusal::MoveStateBusy(Vec::new()),
+            BulkloadRefusal::StatePayloadLeft(Vec::new()),
+            BulkloadRefusal::StateFormatRetired(Vec::new()),
             BulkloadRefusal::ReseatDestDiverged,
             BulkloadRefusal::ReseatDestContinued,
             BulkloadRefusal::ReseatSourceRewritten,
@@ -1059,6 +1098,8 @@ mod tests {
         assert!(!BulkloadRefusal::is_code("IO (errno 2)"));
 
         for code in codes {
+            // A refusal whose arm is in neither table reads as "".
+            assert!(!code.is_empty(), "a listed refusal has no code");
             assert!(
                 code.chars()
                     .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),

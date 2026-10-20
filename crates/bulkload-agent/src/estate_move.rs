@@ -84,6 +84,29 @@ fn out(line: &str) -> Result<()> {
     output.flush().refuse_at("estate_move::out")
 }
 
+// The end of every pass (SPEC rule 2): `states` measured, each payload
+// file named, and one state line. Payload in a state outranks the pass's
+// own result: the verb refuses `STATE_PAYLOAD_LEFT`.
+fn finish(verb: &str, states: &[&Path], passed: Result<()>) -> Result<()> {
+    let measured = match bulkload_agent::state_payload::measure_all(states) {
+        Ok(measured) => measured,
+        Err(refusal) => return passed.and(Err(refusal)),
+    };
+    for path in &measured.payload {
+        out(&format!("{verb} state=payload path={path:?}"))?;
+    }
+    let refusal = measured.refusal();
+    out(&format!(
+        "{verb} phase=state outcome={} {}",
+        refusal.as_ref().map_or_else(
+            || "ok".to_owned(),
+            |refusal| format!("refused:{}", refusal.code())
+        ),
+        measured.words()
+    ))?;
+    refusal.map_or(passed, Err)
+}
+
 // `--map SRC=DST`, both absolute.
 fn map_pair(value: Option<&OsString>) -> Result<(PathBuf, PathBuf)> {
     let (from, to) = value
@@ -119,15 +142,18 @@ fn jobs(value: Option<&OsString>) -> Result<usize> {
 /// `estate-move-source [--map SRC=LIVE]... [--jobs N] [--include-rebuildable]
 /// MOVE_STATE SOURCE_ROOT...`, on the source: inventory every repository
 /// under the roots ([`moving::inventory`]), append the new items to
-/// `MOVE_STATE/carry/plan.postcard` (`estate-add-batch`), and capture the
-/// plan into `MOVE_STATE/carry/corpus` (`estate-capture`, private state in
-/// `MOVE_STATE/private`), and make `MOVE_STATE/serve` and
-/// `MOVE_STATE/serve/carry`, where the destination half's `pull`s and its
-/// carry phase keep their `serve` states (#276). A capture
-/// refusal is an item's (its line says
-/// why; the destination carries it as files); only a refusal of the whole
-/// capture fails the verb.
-#[allow(clippy::too_many_lines)] // Arguments, then the inventory and capture.
+/// `MOVE_STATE/carry/plan.postcard` (`estate-add-batch`), and make
+/// `MOVE_STATE/serve` and `MOVE_STATE/serve/carry`, where the destination
+/// half's `pull`s and its carry phase keep their `serve` states (#276).
+///
+/// SPEC rule 2 (reset 2026-10-20): the state holds ledgers and resume
+/// marks only. A state holding a retired staging format is refused at
+/// startup (`STATE_FORMAT_RETIRED`, each one named); the capture, which
+/// would write bundles and repository copies into the state, is refused
+/// before it writes (`STATE_PAYLOAD_LEFT`) for any non-empty plan until the
+/// streamed capture replaces it; and every pass ends with its state line
+/// (`state_payload_bytes=`), refusing `STATE_PAYLOAD_LEFT` when the state
+/// measures any payload.
 fn source_command(args: &[OsString]) -> Result<()> {
     let mut maps = Vec::new();
     let mut count = 2;
@@ -162,8 +188,26 @@ fn source_command(args: &[OsString]) -> Result<()> {
         .iter()
         .map(|root| absolute(Some(root)))
         .collect::<Result<Vec<_>>>()?;
-    moving::private_dir(&state)?;
-    let _lock = moving::lock(&state)?;
+    // SPEC rule 2 (reset 2026-10-20): a retired staging format in the state
+    // is named and refused before anything is read, written or reused.
+    bulkload_agent::state_payload::refuse_retired(&[&state], &mut |path| {
+        out(&format!("estate-move-source state=retired path={path:?}"))
+    })?;
+    let passed = source_pass(&state, &roots, &maps, count, rebuildable);
+    finish("estate-move-source", &[&state], passed)
+}
+
+/// One source pass over `roots` into `state` (see [`source_command`]).
+#[allow(clippy::too_many_lines)] // The inventory, then the capture.
+fn source_pass(
+    state: &Path,
+    roots: &[PathBuf],
+    maps: &[(PathBuf, PathBuf)],
+    count: usize,
+    rebuildable: bool,
+) -> Result<()> {
+    moving::private_dir(state)?;
+    let _lock = moving::lock(state)?;
     let carry = state.join("carry");
     moving::private_dir(&carry)?;
     // #276: the destination half's `pull`s name their source states under
@@ -181,7 +225,7 @@ fn source_command(args: &[OsString]) -> Result<()> {
     let pass = now_ns().to_string();
     moving::write_report(&carry.join(STARTED), pass.as_bytes())?;
     let plan = carry.join("plan.postcard");
-    let found = moving::inventory(&roots, &maps)?;
+    let found = moving::inventory(roots, maps)?;
     for planned in &found.items {
         out(&format!(
             "estate-move-source item={} kind={} source={:?} repository={:?} workspace={:?}",
@@ -259,37 +303,50 @@ fn source_command(args: &[OsString]) -> Result<()> {
     let refusals = std::sync::Mutex::new(std::collections::BTreeMap::new());
     let nests = std::sync::Mutex::new(Vec::new());
     let receipts = AtomicU64::new(0);
-    let capture = estate::capture_with_policy(
-        &plan,
-        &state.join("private"),
-        &carry.join("corpus"),
-        count,
-        policy,
-        &|row| {
-            receipts.fetch_add(1, Ordering::Relaxed);
-            if row.outcome == "refused" {
-                let code = row.refusal.as_ref().map_or("IO", BulkloadRefusal::code);
-                refusals
-                    .lock()
-                    .map_err(|_| BulkloadRefusal::WorkerLost)?
-                    .insert(row.item.clone(), code.to_owned());
-            }
-            for line in &row.nested {
-                if line.contains("kind=Directory") && !line.contains("seats=own-item") {
-                    nests
-                        .lock()
-                        .map_err(|_| BulkloadRefusal::WorkerLost)?
-                        .push(moving::Note {
-                            path: row.source.clone(),
-                            what: "nested",
-                            count: 1,
-                            code: None,
-                        });
-                }
-            }
-            super::print_receipt(row)
-        },
-    );
+    // SPEC rule 2: a capture writes its bundles and repository copies into
+    // the state (`private/`, `carry/corpus`), so it is refused before it
+    // writes; an empty plan captures nothing. The streamed capture replaces
+    // it.
+    let staged = || {
+        bulkload_agent::state_payload::refuse_staging(state, &carry.join("corpus"))?;
+        bulkload_agent::state_payload::refuse_staging(state, &state.join("private"))
+    };
+    let capture = if planned == 0 {
+        Ok(())
+    } else {
+        staged().and_then(|()| {
+            estate::capture_with_policy(
+                &plan,
+                &state.join("private"),
+                &carry.join("corpus"),
+                count,
+                policy,
+                &|row| {
+                    receipts.fetch_add(1, Ordering::Relaxed);
+                    if row.outcome == "refused" {
+                        let code = row.refusal.as_ref().map_or("IO", BulkloadRefusal::code);
+                        refusals
+                            .lock()
+                            .map_err(|_| BulkloadRefusal::WorkerLost)?
+                            .insert(row.item.clone(), code.to_owned());
+                    }
+                    for line in &row.nested {
+                        if line.contains("kind=Directory") && !line.contains("seats=own-item") {
+                            nests.lock().map_err(|_| BulkloadRefusal::WorkerLost)?.push(
+                                moving::Note {
+                                    path: row.source.clone(),
+                                    what: "nested",
+                                    count: 1,
+                                    code: None,
+                                },
+                            );
+                        }
+                    }
+                    super::print_receipt(row)
+                },
+            )
+        })
+    };
     let refusals = refusals
         .into_inner()
         .map_err(|_| BulkloadRefusal::WorkerLost)?;
@@ -507,6 +564,16 @@ impl Move {
         format!(".{}", self.label)
     }
 
+    // The state directories this run measures and checks: its own, and the
+    // source half's when it is on this host.
+    fn states(&self) -> Vec<&Path> {
+        if self.local() {
+            vec![self.state.as_path(), self.source_state.as_path()]
+        } else {
+            vec![self.state.as_path()]
+        }
+    }
+
     // One recorded transfer of the source's `from` into `to`: `copy` on
     // this host, else `pull` from HOST; `serve` keeps its source state in
     // the source half's `MOVE_STATE/serve/NAME`, this side in
@@ -554,9 +621,26 @@ fn word(result: &Result<()>) -> String {
 /// `estate-reseat` (with `--sessions`), and `closure-report`. Each phase's
 /// end is recorded in `MOVE_STATE/move.ledger`. Exits with the first
 /// phase's refusal, else the closure gate.
-#[allow(clippy::too_many_lines)]
+///
+/// SPEC rule 2 (reset 2026-10-20): a state holding a retired staging
+/// format (this one, or the source half's on this host) is refused at
+/// startup, each one named (`STATE_FORMAT_RETIRED`); a pull of the corpus
+/// or of the session trees into the state is refused before it writes
+/// (`STATE_PAYLOAD_LEFT`), so a pass refuses at its pull until the streamed
+/// capture replaces it; every pass ends with its state line, and the
+/// closure line carries `state_payload_bytes=`.
 fn move_command(args: &[OsString]) -> Result<()> {
     let run = Move::parse(args)?;
+    bulkload_agent::state_payload::refuse_retired(&run.states(), &mut |path| {
+        out(&format!("estate-move state=retired path={path:?}"))
+    })?;
+    let passed = move_pass(&run);
+    finish("estate-move", &run.states(), passed)
+}
+
+/// One destination pass (see [`move_command`]).
+#[allow(clippy::too_many_lines)]
+fn move_pass(run: &Move) -> Result<()> {
     moving::private_dir(&run.state)?;
     let _lock = moving::lock(&run.state)?;
     let ledger_path = moving::ledger_path(&run.state);
@@ -584,9 +668,11 @@ fn move_command(args: &[OsString]) -> Result<()> {
         }
     };
 
-    // 1. The source half's plan and corpus, from a finished pass only.
-    let pulled = run
-        .transfer(&run.source_state.join("carry"), &carry, "corpus")
+    // 1. The source half's plan and corpus, from a finished pass only. A
+    // corpus pulled into the state is staging (SPEC rule 2): refused before
+    // the pull writes.
+    let pulled = bulkload_agent::state_payload::refuse_staging(&run.state, &carry.join("corpus"))
+        .and_then(|()| run.transfer(&run.source_state.join("carry"), &carry, "corpus"))
         .and_then(|()| finished_pass(&carry));
     reached(&mut ledger, &ledger_path, "pull", word(&pulled))?;
     pulled?;
@@ -609,7 +695,7 @@ fn move_command(args: &[OsString]) -> Result<()> {
     let suffix = run.suffix();
     print_plan(&rows, &suffix, &notes)?;
     if run.plan_only {
-        return preview(&run, (&plan, &corpus, &private));
+        return preview(run, (&plan, &corpus, &private));
     }
     ledger.items = decided.items;
     reached(&mut ledger, &ledger_path, "plan", "ok".to_owned())?;
@@ -687,7 +773,7 @@ fn move_command(args: &[OsString]) -> Result<()> {
         }
     }
     ledger.save(&ledger_path)?;
-    let carried = carry_files(&run, &rows, (&plan, &corpus, &private));
+    let carried = carry_files(run, &rows, (&plan, &corpus, &private));
     note(&carried);
     reached(&mut ledger, &ledger_path, "carry", word(&carried))?;
 
@@ -711,11 +797,11 @@ fn move_command(args: &[OsString]) -> Result<()> {
     // 6. Sessions: the agent state trees, then the re-seat (TIN-6587),
     // only over a complete landing.
     if let Some(home) = &run.sessions {
-        let pulled = sessions_pull(&run, home);
+        let pulled = sessions_pull(run, home);
         note(&pulled);
         reached(&mut ledger, &ledger_path, "sessions-pull", word(&pulled))?;
         if pulled.is_ok() {
-            let reseated = reseat(&run, home, (&plan, &corpus, &private));
+            let reseated = reseat(run, home, (&plan, &corpus, &private));
             note(&reseated);
             reached(&mut ledger, &ledger_path, "reseat", word(&reseated))?;
         } else {
@@ -754,8 +840,9 @@ fn move_command(args: &[OsString]) -> Result<()> {
         .collect::<Vec<_>>()
         .join(",");
     let not_moved: u64 = notes.values().sum();
+    let measured = bulkload_agent::state_payload::measure_all(&run.states())?;
     out(&format!(
-        "estate-move closure planned={} applied={} applied_beside={} carried={} referenced_only={} refused={} refused_pending_review={} unaccounted={} not_moved={not_moved} refusals={} report={report_path:?}",
+        "estate-move closure planned={} applied={} applied_beside={} carried={} referenced_only={} refused={} refused_pending_review={} unaccounted={} not_moved={not_moved} refusals={} {} report={report_path:?}",
         rows.len(),
         report.applied,
         report.applied_beside,
@@ -765,6 +852,7 @@ fn move_command(args: &[OsString]) -> Result<()> {
         report.refused_pending_review,
         report.unaccounted,
         if refusals.is_empty() { "none" } else { &refusals },
+        measured.words(),
     ))?;
     let gate = report.gate().and(if not_moved == 0 {
         Ok(())
@@ -941,8 +1029,11 @@ fn carry_files(
 }
 
 // Phase 6a: SOURCE_HOME/.claude and the Codex root into MOVE_STATE/landing.
+// A landing area in the state is staging (SPEC rule 2): refused before it
+// is made.
 fn sessions_pull(run: &Move, home: &Path) -> Result<()> {
     let landing = run.state.join("landing");
+    bulkload_agent::state_payload::refuse_staging(&run.state, &landing)?;
     moving::private_dir(&landing)?;
     let codex_root = run
         .codex_root
