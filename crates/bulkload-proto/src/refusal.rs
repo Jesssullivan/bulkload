@@ -568,10 +568,6 @@ impl BulkloadRefusal {
     /// These strings are the wire/log identity of a refusal and must not change
     /// once a milestone ships.
     #[must_use]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one arm per refusal: the match is the code table"
-    )]
     pub const fn code(&self) -> &'static str {
         match *self {
             Self::SnapshotRootsOverlap => "SNAPSHOT_ROOTS_OVERLAP",
@@ -654,6 +650,20 @@ impl BulkloadRefusal {
             Self::WorkerLost => "WORKER_LOST",
             Self::TransportLost => "TRANSPORT_LOST",
             Self::MoveStateBusy(_) => "MOVE_STATE_BUSY",
+            Self::ProbeFailed => "PROBE_FAILED",
+            Self::Io(_) => "IO",
+            // The reseat family has a table of its own.
+            _ => self.reseat_code(),
+        }
+    }
+
+    /// [`Self::code`] of a reseat refusal (`RESEAT_*`, the `reseat` verb's
+    /// family): the arms `code` leaves to this table. Any other refusal has
+    /// its arm in `code` and none here, so it reads as the empty string, a
+    /// code the code-table test (`codes_are_unique_and_well_formed`)
+    /// refuses for every refusal it lists.
+    const fn reseat_code(&self) -> &'static str {
+        match *self {
             Self::ReseatDestDiverged => "RESEAT_DEST_DIVERGED",
             Self::ReseatDestContinued => "RESEAT_DEST_CONTINUED",
             Self::ReseatSourceRewritten => "RESEAT_SOURCE_REWRITTEN",
@@ -671,8 +681,7 @@ impl BulkloadRefusal {
             Self::ReseatRegularizeRaced => "RESEAT_REGULARIZE_RACED",
             Self::ReseatUndoTargetChanged => "RESEAT_UNDO_TARGET_CHANGED",
             Self::ReseatR0Failed => "RESEAT_R0_FAILED",
-            Self::ProbeFailed => "PROBE_FAILED",
-            Self::Io(_) => "IO",
+            _ => "",
         }
     }
 }
@@ -1075,6 +1084,8 @@ mod tests {
         assert!(!BulkloadRefusal::is_code("IO (errno 2)"));
 
         for code in codes {
+            // A refusal whose arm is in neither table reads as "".
+            assert!(!code.is_empty(), "a listed refusal has no code");
             assert!(
                 code.chars()
                     .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
