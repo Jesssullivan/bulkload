@@ -22,8 +22,8 @@
 //! unmapped. An entry that would reach a destination any other way (the
 //! source holds the destination's name itself, or a shorter map's image
 //! falls inside a longer map's destination) would merge two source paths
-//! into one: it is refused `DESTINATION_OCCUPIED`, typed, with every entry
-//! under it, whatever the walk order, and nothing is merged. Each map
+//! into one: it is refused `DESTINATION_MAP_CONFLICT`, typed, with every
+//! entry under it, whatever the walk order, and nothing is merged. Each map
 //! replaces one prefix, so it never lands two of its own paths at one name;
 //! with the owner rule no two seats of a session ever meet at one name.
 //!
@@ -168,7 +168,7 @@ impl PrefixMap {
     /// destination's owner is not the map that would land it.
     ///
     /// # Errors
-    /// The source path, for the caller's `DESTINATION_OCCUPIED`.
+    /// The source path, for the caller's `DESTINATION_MAP_CONFLICT`.
     pub fn land(&self, path: Vec<u8>) -> std::result::Result<(Option<usize>, Vec<u8>), Vec<u8>> {
         let (by, landed) = match self.apply(&path) {
             Some((at, landed)) => (Some(at), landed),

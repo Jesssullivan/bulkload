@@ -5481,7 +5481,7 @@ enum Walked {
     },
     /// `--map-prefix`: an entry the owner rule refuses (it would reach a
     /// map's destination another way), at its source path: never a batch
-    /// member, answered `DESTINATION_OCCUPIED` in stream order.
+    /// member, answered `DESTINATION_MAP_CONFLICT` in stream order.
     Unowned {
         entry: u64,
         row: RowSchema,
@@ -6116,7 +6116,7 @@ impl<W: Write> Inbound<'_, W> {
                 Ok(())
             }
             Walked::Unowned { entry, row } => {
-                let refusal = BulkloadRefusal::DestinationOccupied;
+                let refusal = BulkloadRefusal::DestinationMapConflict;
                 self.refuse(row.rel_path, &refusal);
                 write_control(
                     self.output,
@@ -7517,7 +7517,16 @@ impl<W: Write> Inbound<'_, W> {
                                 }
                             }
                         }
-                        if supersede.is_none() && self.beside.is_some() {
+                        if supersede.is_none()
+                            && self.beside.is_some()
+                            && settled.is_none()
+                            && prefix_extend_scope(self.target.path()).covers(&row.rel_path)
+                        {
+                            // `--beside`: an append-only live file a writer
+                            // may be at is judged on a later pass, never
+                            // copied beside now (#280 finding 9 review).
+                            Err(BulkloadRefusal::DestinationUnsettled)
+                        } else if supersede.is_none() && self.beside.is_some() {
                             // `--beside`: the streamed copy lands beside.
                             land_beside = self
                                 .beside
@@ -8829,6 +8838,21 @@ fn plan_file(
                                     return Plan::Adopt(file, parent, Some(identity), None)
                                 }
                                 Err(BulkloadRefusal::DestinationOccupied) => {
+                                    // An append-only live file written
+                                    // within the racy window: a writer may
+                                    // be at it, so neither extending it, nor
+                                    // taking it as covering the seat, nor a
+                                    // copy beside it can be judged now. A
+                                    // typed refusal, not remembered: the
+                                    // next pass decides (#280 finding 9
+                                    // review). Never a beside copy, which
+                                    // would stay a duplicate (C12).
+                                    if settled.is_none()
+                                        && prefix_extend_scope(context.target.path())
+                                            .covers(&row.rel_path)
+                                    {
+                                        return Plan::Refuse(BulkloadRefusal::DestinationUnsettled);
+                                    }
                                     // The live file holds these bytes and
                                     // more: nothing to land (#280 finding 9).
                                     if let Some(identity) =

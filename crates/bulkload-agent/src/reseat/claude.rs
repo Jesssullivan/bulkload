@@ -782,7 +782,20 @@ pub fn reseat(
         .with_beside(options.beside_suffix.as_deref().filter(|_| live));
     let mut keys_done: BTreeSet<(String, String)> = BTreeSet::new();
     let mut refused_keys: BTreeMap<String, BulkloadRefusal> = BTreeMap::new();
-    for candidate in &sessions.list {
+    // A live-home landing: the source's copies landed beside first, so a
+    // destination transcript one of them extends (#294 review 1) is read
+    // as it stands after that, not before.
+    let ordered = sessions
+        .list
+        .iter()
+        .filter(|candidate| live && candidate.beside)
+        .chain(
+            sessions
+                .list
+                .iter()
+                .filter(|candidate| !(live && candidate.beside)),
+        );
+    for candidate in ordered {
         // A live-home landing (C9): an earlier pass's placement is this
         // ledger's output, not a landed session; nothing is read for it.
         if live && own_placement(options, Some(ledger), &root, candidate)? {
@@ -873,22 +886,24 @@ pub fn reseat(
             .and_then(|row| row.dest_key.clone())
             .filter(|previous| *previous != dest_key);
         // The pull's key map (#280 finding 9): the source's copy beside the
-        // destination's own transcript, under the lane's key. The pull
-        // judged the two: it lands beside only when the live file is not
-        // these bytes, not a prefix of them, and does not hold them
-        // (`dest-ahead`). Both are kept, as SPEC R2.2 rules (`diverged`),
-        // nothing written; an archive link there is still replaced
-        // (A-106) by the placer below.
+        // destination's own regular transcript, under the lane's key, judged
+        // by their bytes (#294 review 1; the pull also lands beside for
+        // reasons other than content): the live file extended in place when
+        // it is a strict prefix and that is safe, covered when the copy is
+        // its prefix, else kept for review (`beside-diverged`,
+        // `beside-held`), holding the gate. An archive link there is still
+        // replaced (A-106) by the placer below.
         if live
             && candidate.beside
             && candidate.key == dest_key
             && std::fs::symlink_metadata(root.join(&rel)).is_ok_and(|meta| meta.is_file())
         {
+            let judged = place::judge_beside(&root.join(&rel), &candidate.path, options.now_ns)?;
             kept_beside(
                 ledger,
                 candidate,
                 (&cwd, lane.as_ref(), &dest_key),
-                slug_known,
+                (slug_known, judged),
                 summary,
                 emit,
             )?;
@@ -1050,19 +1065,21 @@ fn in_place(
     ))
 }
 
-/// A live-home landing's beside copy kept beside the destination's own
-/// transcript of that session under its lane's key (#280 finding 9):
-/// counted and reported `diverged` (accounted: both kept), its session row
-/// written so a rerun reads nothing for it, nothing placed.
+/// A live-home landing's beside copy beside the destination's own
+/// transcript of that session under its lane's key (#280 finding 9), as
+/// [`place::judge_beside`] judged it: counted and reported by its word
+/// (`extended`, `covered` accounted; `beside-diverged`, `beside-held` held
+/// for review), its session row written.
 fn kept_beside(
     ledger: &Ledger,
     candidate: &Candidate,
     (cwd, lane, dest_key): (&str, Option<&Lane>, &str),
-    slug: Option<String>,
+    (slug, judged): (Option<String>, place::Judged),
     summary: &mut Summary,
     emit: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<()> {
-    summary.session(TOOL, "diverged");
+    let word = judged.word();
+    summary.session(TOOL, word);
     ledger.put_session(&Session {
         tool: TOOL.to_owned(),
         id: candidate.sid.clone(),
@@ -1071,17 +1088,34 @@ fn kept_beside(
         dest_cwd: lane.map(|lane| lane.dest_cwd.clone()),
         dest_key: Some(dest_key.to_owned()),
         slug,
-        outcome: "diverged".to_owned(),
+        outcome: word.to_owned(),
         landed_size: Some(candidate.size),
         landed_mtime: Some(candidate.mtime),
     })?;
+    let mut files = BTreeMap::new();
+    match judged {
+        place::Judged::Extended { consumed, .. } | place::Judged::Covered { consumed } => {
+            files.insert(
+                if consumed {
+                    "beside-removed"
+                } else {
+                    "beside-kept"
+                },
+                1,
+            );
+        }
+        place::Judged::Held(reason) => {
+            files.insert(reason, 1);
+        }
+        place::Judged::Diverged => {}
+    }
     emit(&session_line(
         candidate,
         cwd,
         (lane, Some(dest_key), None),
-        "diverged",
-        Some(&BulkloadRefusal::ReseatDestDiverged),
-        &BTreeMap::new(),
+        word,
+        judged.refusal().as_ref(),
+        &files,
     ))
 }
 

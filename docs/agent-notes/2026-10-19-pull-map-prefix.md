@@ -89,12 +89,12 @@ the first mapped pass on sting worse for sessions sting resumed:
    whole beside, as a false prefix did). Before, the proof needed one whole
    chunk, so every small grown transcript landed beside (pre-existing in
    #280; it would have made the map's first pass copy them beside).
-9. The re-seat keeps a beside copy under its lane's destination key, beside
-   the destination's own regular transcript, as `diverged` (accounted,
-   nothing written; both sides continued), and resolves such a copy's lane
-   by the key Claude Code lists it under. Without it the copy was
-   `RESEAT_LANE_UNRESOLVED`, or a `collision` with the placement row of the
-   neo-key landing, and held the gate.
+9. The re-seat resolves a beside copy under its lane's destination key by
+   the key Claude Code lists it under. It judges the copy against the
+   destination's own regular transcript by bytes (review 1 below; this note
+   first said `diverged`, accounted, which was assumed rather than checked).
+   Without this, the copy was `RESEAT_LANE_UNRESOLVED`, or a `collision`
+   with the placement row of the neo-key landing.
 
 ## Tests
 
@@ -163,6 +163,72 @@ targeted filters only, one at a time.
   --post`), owed once honey is free; `just darwin-check` on pzm, owed
   before merge.
 - Test scratch under `TMPDIR` removed after the runs.
+
+## Review of #294 (2026-10-20, at `fdc8589`) and the fixes
+
+The coordinator's independent review (PR comment) found the items below.
+They are fixed on this branch in new commits, after a signed merge of
+#280's head `182496f` (no force-push).
+
+0. **Merge of #280 (`182496f`).** Five files conflicted. Resolved as the
+   review describes:
+   - `sessions_pull` returns `(Result, Option<Homes>, key maps)`. The key map
+     is derived for #280's resolved, owner-checked `.claude`, and the proof
+     resolves that home read-only (`owned_real`).
+   - `Inbound` keeps both the `maps` and `listing` fields. #280's `--file`
+     `land()` runs before the map at every frame. The source listing is
+     recorded after mapping, so it holds the paths as they land.
+   - One option parser takes `--file`, `--beside` and `--map-prefix` in any
+     order.
+   - Both placer builder fields are kept (`beside`, `kept_suffix`). A copy
+     kept aside on an A-106 swap-back, whose `<name><suffix>` is taken by an
+     unconsumed beside landing, falls to `<name><suffix>.1` (documented on
+     `Placer::kept_suffix`).
+1. **(must) `diverged` was assumed, not checked.** The pull also lands
+   files beside for reasons other than content: an empty live file, other
+   links, another owner or mode, the extension off. The re-seat now judges
+   the beside copy against sting's own regular transcript by their bytes
+   (`place::judge_beside`):
+   - **Live file is a strict prefix of the copy.** It is extended in place
+     by the copy's whole lines (`O_APPEND`, size checked before each piece)
+     when that is safe: one link, this user's, the copy's mode, quiet past
+     the racy window, ending at a line's end, extension on. The copy is
+     removed once the live file holds it whole. Otherwise the session is
+     held, typed (`beside-held`, with its reason).
+   - **The copy is a prefix of the live file.** `covered`, accounted. The
+     copy is removed when the live file is longer, because a later pull
+     finds that file `dest-ahead`.
+   - **Neither is a prefix of the other.** `beside-diverged`
+     (`RESEAT_DEST_DIVERGED`). It is not accounted: it holds the gate,
+     counts in the closure line's new `diverged=`, and the operator decides.
+   - Tests: `reseat::place::judge_tests` (2), and the end-to-end tests: an
+     empty live transcript is extended and never landed beside again;
+     `a_session_both_sides_continued_is_held_diverged_for_review`.
+2. **(must) A live file written within 2 s became a permanent beside
+   duplicate.** Under `--beside`, an append-only live file written within
+   the racy window is now refused `DESTINATION_UNSETTLED` (new code).
+   - Typed and not remembered: nothing lands beside, and the next pass
+     decides.
+   - It applies to the manifest path and the streamed path alike.
+   - Test: `a_live_file_written_now_is_unsettled_and_the_next_pass_decides`.
+3. **Same-key lanes were not counted in the collision check.**
+   - Keys that land as they are now take their name at the destination:
+     same-key lanes, and keys held as ambiguous or unresolved. A map onto
+     one of them is held `dest-key-collision`, and holding repeats until
+     nothing more is held.
+   - The owner rule's refusal has its own code,
+     `DESTINATION_MAP_CONFLICT` (new).
+   - Test: `a_map_onto_a_key_that_lands_as_it_is_is_a_collision`.
+4. **A derived map its sessions did not use was invisible.** After the
+   Claude pull, `keymap::unused` reads the listing and prints a typed
+   `estate-move key-map-unused from= to= seen= cwd=` line for each
+   source-keyed directory that no map moved and that belongs to a mapped
+   lane: by name but for case, or by its transcript's `cwd`. These
+   directories are the second copies. The closure line gains
+   `key_maps_unused=`.
+   - Test: `a_map_its_sessions_did_not_use_is_named`.
+   - Gap: a source path reached through a symlink keys by its target,
+     whose lane is another one, so it is not found.
 
 ## Open
 

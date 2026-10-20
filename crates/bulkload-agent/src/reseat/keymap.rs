@@ -81,6 +81,9 @@ pub struct KeyMaps {
     /// Lane sources whose key is their destination's (one home path on both
     /// hosts): nothing to map.
     pub same: u64,
+    /// After the pull: maps the landed sessions of their lane did not use
+    /// ([`unused`]).
+    pub unused: Vec<Unused>,
 }
 
 impl KeyMaps {
@@ -142,43 +145,154 @@ pub fn derive(options: &Options) -> Result<KeyMaps> {
     }
     let mut out = KeyMaps::default();
     let mut candidates = Vec::new();
+    // Source keys that land as they are (a same-key lane, a held key): their
+    // own name is taken at the destination, as a mapped key's target is.
+    let mut native: Vec<String> = Vec::new();
     for (from, found) in by_key {
         let cwds: Vec<PathBuf> = found.iter().map(|(cwd, _)| cwd.clone()).collect();
         match found.as_slice() {
-            [(_, Some(to))] if *to == from => out.same += 1,
+            [(_, Some(to))] if *to == from => {
+                out.same += 1;
+                native.push(from);
+            }
             [(cwd, Some(to))] => candidates.push(KeyMap {
                 from,
                 to: to.clone(),
                 cwd: cwd.clone(),
             }),
-            [(_, None)] => out.held.push(HeldKey {
-                key: from,
-                reason: Held::LaneUnresolved,
-                cwds,
-                to: None,
-            }),
-            _ => out.held.push(HeldKey {
-                key: from,
-                reason: Held::AmbiguousSourceKey,
-                cwds,
-                to: None,
-            }),
+            [(_, None)] => {
+                native.push(from.clone());
+                out.held.push(HeldKey {
+                    key: from,
+                    reason: Held::LaneUnresolved,
+                    cwds,
+                    to: None,
+                });
+            }
+            _ => {
+                native.push(from.clone());
+                out.held.push(HeldKey {
+                    key: from,
+                    reason: Held::AmbiguousSourceKey,
+                    cwds,
+                    to: None,
+                });
+            }
         }
     }
-    let mut targets: BTreeMap<String, u64> = BTreeMap::new();
-    for map in &candidates {
-        *targets.entry(map.to.clone()).or_default() += 1;
-    }
-    for map in candidates {
-        if targets.get(&map.to).copied().unwrap_or(0) > 1 {
+    // A destination key two keys would land at (two maps, or a map and a
+    // key that lands as it is) holds every map to it; a held key then lands
+    // as it is too, so this runs until nothing more is held (#294 review 3:
+    // same-key lanes were not counted, and the native key was refused on
+    // every pass).
+    loop {
+        let mut targets: BTreeMap<&str, u64> = BTreeMap::new();
+        for key in &native {
+            *targets.entry(key.as_str()).or_default() += 1;
+        }
+        for map in &candidates {
+            *targets.entry(map.to.as_str()).or_default() += 1;
+        }
+        let (kept, held): (Vec<KeyMap>, Vec<KeyMap>) = candidates
+            .clone()
+            .into_iter()
+            .partition(|map| targets.get(map.to.as_str()).copied().unwrap_or(0) <= 1);
+        if held.is_empty() {
+            out.maps = kept;
+            break;
+        }
+        for map in held {
+            native.push(map.from.clone());
             out.held.push(HeldKey {
                 key: map.from,
                 reason: Held::DestKeyCollision,
                 cwds: vec![map.cwd],
                 to: Some(map.to),
             });
-        } else {
-            out.maps.push(map);
+        }
+        candidates = kept;
+    }
+    Ok(out)
+}
+
+/// A derived map no landed session used (#294 review 4).
+///
+/// The source keyed sessions of its lane otherwise (an older Claude Code's
+/// key, which kept `.`; a differently cased path on a case-insensitive
+/// source), and they landed under that other key, to be re-seated as
+/// before: a second copy. Named so the duplicate is visible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unused {
+    /// The derived map's source key, and the key it lands at.
+    pub from: String,
+    pub to: String,
+    /// The key the source's sessions of that lane landed under.
+    pub seen: String,
+    /// The `cwd` one of them records.
+    pub cwd: String,
+}
+
+/// The derived maps (`maps`) that sessions of their lane did not land
+/// through.
+///
+/// Each source-keyed directory in the pull's listing (`listed`,
+/// paths relative to `.claude`) that no map moved, whose name is a map's
+/// source key but for case, or whose first listed transcript's `cwd` lanes
+/// to a map's destination key. Reads the first `cwd` of one transcript per
+/// such directory under `options.dest_claude`. A source path reached
+/// through a symlink keys by its target, whose lane is another one: not
+/// found here.
+///
+/// # Errors
+/// The read refusal of a transcript.
+pub fn unused(options: &Options, maps: &KeyMaps, listed: &[Vec<u8>]) -> Result<Vec<Unused>> {
+    let (Some(source), Some(destination)) = (
+        options.source_home.to_str().map(key::project_key),
+        options.dest_home.to_str().map(key::project_key),
+    ) else {
+        return Ok(Vec::new());
+    };
+    let lanes = Lanes::new(options);
+    let mut first: BTreeMap<&str, &str> = BTreeMap::new();
+    for path in listed {
+        let Some(rest) = std::str::from_utf8(path)
+            .ok()
+            .and_then(|path| path.strip_prefix("projects/"))
+        else {
+            continue;
+        };
+        let Some((dir, name)) = rest.split_once('/') else {
+            continue;
+        };
+        if name.contains('/')
+            || Path::new(name)
+                .extension()
+                .is_none_or(|extension| extension != "jsonl")
+            || !source_keyed(&source, &destination, dir)
+            || maps.maps.iter().any(|map| map.to == dir)
+        {
+            continue;
+        }
+        first.entry(dir).or_insert(name);
+    }
+    let mut out = Vec::new();
+    for (dir, name) in first {
+        let path = options.dest_claude.join("projects").join(dir).join(name);
+        let cwd = claude::first_cwd(&path)?.unwrap_or_default();
+        let key = match lanes.lane(Path::new(&cwd)) {
+            Ok(Some(lane)) if !cwd.is_empty() => Some(lane.key),
+            _ => None,
+        };
+        if let Some(map) = maps.maps.iter().find(|map| {
+            map.from != dir
+                && (map.from.eq_ignore_ascii_case(dir) || key.as_deref() == Some(map.to.as_str()))
+        }) {
+            out.push(Unused {
+                from: map.from.clone(),
+                to: map.to.clone(),
+                seen: dir.to_owned(),
+                cwd,
+            });
         }
     }
     Ok(out)
@@ -472,6 +586,76 @@ mod tests {
         );
         assert_eq!(derived.maps.len(), 1, "{:?}", derived.maps);
         crate::transfer::PrefixMap::new(derived.prefixes()).unwrap();
+    }
+
+    /// #294 review 3: a key that lands as it is (a lane whose key is its
+    /// destination's) takes its name at the destination, so another source
+    /// key mapping there is held, typed, never refused on every pass.
+    #[test]
+    fn a_map_onto_a_key_that_lands_as_it_is_is_a_collision() {
+        let base = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(base.path()).unwrap();
+        std::fs::create_dir_all(base.join("home/jess/git")).unwrap();
+        let options = options(
+            &base,
+            &[
+                ("Users/jess/git/same", "Users/jess/git/same"),
+                ("Users/jess/git/other", "Users/jess/git/same"),
+            ],
+        );
+        let derived = derive(&options).unwrap();
+        let key = |path: &str| key::project_key(base.join(path).to_str().unwrap());
+        assert_eq!(derived.same, 1, "{derived:?}");
+        assert!(
+            derived
+                .held
+                .iter()
+                .any(|held| held.key == key("Users/jess/git/other")
+                    && held.reason == Held::DestKeyCollision),
+            "{derived:?}"
+        );
+        assert!(derived.to(&key("Users/jess/git/other")).is_none());
+    }
+
+    /// #294 review 4: sessions of a mapped lane the source keyed otherwise
+    /// (an older Claude Code kept `.`; a differently cased path) did not
+    /// use the map: named.
+    #[test]
+    fn a_map_its_sessions_did_not_use_is_named() {
+        let base = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(base.path()).unwrap();
+        std::fs::create_dir_all(base.join("home/jess/git/lab")).unwrap();
+        let options = options(&base, &[("Users/jess/git/lab", "home/jess/git/lab")]);
+        let derived = derive(&options).unwrap();
+        let key = |path: &str| key::project_key(base.join(path).to_str().unwrap());
+        let lab = key("Users/jess/git/lab");
+        let cased = key("Users/jess/git/Lab");
+        // An old-style key for a worktree under the lane (`.` kept).
+        let dotted = format!("{lab}-.claude-worktrees-x");
+        let projects = base.join("home/jess/.claude/projects");
+        let cwd = base.join("Users/jess/git/lab");
+        for dir in [&cased, &dotted] {
+            std::fs::create_dir_all(projects.join(dir)).unwrap();
+            std::fs::write(
+                projects.join(dir).join("s.jsonl"),
+                format!("{{\"cwd\":\"{}\"}}\n", cwd.display()),
+            )
+            .unwrap();
+        }
+        let listed: Vec<Vec<u8>> = [&cased, &dotted]
+            .iter()
+            .map(|dir| format!("projects/{dir}/s.jsonl").into_bytes())
+            .collect();
+        let unused = unused(&options, &derived, &listed).unwrap();
+        let seen: Vec<&str> = unused.iter().map(|note| note.seen.as_str()).collect();
+        assert!(seen.contains(&cased.as_str()), "{unused:?}");
+        assert!(seen.contains(&dotted.as_str()), "{unused:?}");
+        assert!(unused.iter().all(|note| note.from == lab));
+        // A mapped landing is no note.
+        let mapped = vec![format!("projects/{}/s.jsonl", key("home/jess/git/lab")).into_bytes()];
+        assert!(super::unused(&options, &derived, &mapped)
+            .unwrap()
+            .is_empty());
     }
 
     /// The report-only proof over source-key directories an earlier pass

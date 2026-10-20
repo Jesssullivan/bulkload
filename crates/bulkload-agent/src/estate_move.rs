@@ -923,7 +923,7 @@ fn move_command(args: &[OsString]) -> Result<()> {
         .collect::<Vec<_>>()
         .join(",");
     out(&format!(
-        "estate-move closure planned={} applied={} applied_beside={} carried={} referenced_only={} refused={} refused_pending_review={} unaccounted={} not_moved={not_moved} refusals={} sessions={} transfer_rows={} reseat_unaccounted={reseat_unaccounted} reseat_held={} key_maps={} key_maps_held={} report={report_path:?}",
+        "estate-move closure planned={} applied={} applied_beside={} carried={} referenced_only={} refused={} refused_pending_review={} unaccounted={} not_moved={not_moved} refusals={} sessions={} transfer_rows={} reseat_unaccounted={reseat_unaccounted} reseat_held={} key_maps={} key_maps_held={} key_maps_unused={} diverged={} report={report_path:?}",
         rows.len(),
         report.applied,
         report.applied_beside,
@@ -938,6 +938,12 @@ fn move_command(args: &[OsString]) -> Result<()> {
         if held.is_empty() { "none" } else { &held },
         key_maps.as_ref().map_or(0, |maps| maps.maps.len()),
         key_maps.as_ref().map_or(0, |maps| maps.held.len()),
+        key_maps.as_ref().map_or(0, |maps| maps.unused.len()),
+        reseat_held
+            .iter()
+            .filter(|(word, _)| word.ends_with("/beside-diverged"))
+            .map(|(_, count)| count)
+            .sum::<u64>(),
     ))?;
     let gate = report
         .gate()
@@ -1190,7 +1196,27 @@ fn sessions_pull(
                 .and_then(|real| run.transfer_into(&home.join(".claude"), real, "claude"))
         });
     let unmapped = bulkload_agent::transfer::set_map_prefixes(Vec::new());
-    let claude_listed = write_listing(&pulls.join("claude.listing"), super::take_listed());
+    let claude_listing = super::take_listed();
+    // #294 review 4: a derived map the landed sessions of its lane did not
+    // use (the source keyed them otherwise) leaves them to be re-seated as
+    // before, a second copy: named, typed.
+    let mut key_maps = key_maps;
+    let noted = match (&mut key_maps, &claude_root, &claude_listing) {
+        (Ok(maps), Ok(real), Some(listed)) => key_options(run, home, plan, real)
+            .and_then(|options| bulkload_agent::reseat::keymap::unused(&options, maps, listed))
+            .and_then(|unused| {
+                for note in &unused {
+                    out(&format!(
+                        "estate-move key-map-unused from={} to={} seen={} cwd={:?} reason=source-keyed-otherwise",
+                        note.from, note.to, note.seen, note.cwd
+                    ))?;
+                }
+                maps.unused = unused;
+                Ok(())
+            }),
+        _ => Ok(()),
+    };
+    let claude_listed = write_listing(&pulls.join("claude.listing"), claude_listing);
     // The Codex index always lands beside, as this pass's snapshot: the
     // pull never writes the live index (review of #280, finding 6).
     bulkload_agent::transfer::set_listing(vec![
@@ -1214,6 +1240,7 @@ fn sessions_pull(
         suffix,
         claude,
         unmapped,
+        noted,
         claude_listed,
         codex,
         codex_listed,
@@ -1289,10 +1316,20 @@ fn derive_key_maps(
     plan: &Path,
     claude: &Path,
 ) -> Result<bulkload_agent::reseat::keymap::KeyMaps> {
+    bulkload_agent::reseat::keymap::derive(&key_options(run, home, plan, claude)?)
+}
+
+// The lanes ([`lane_options`]) over the real `.claude` (`claude`).
+fn key_options(
+    run: &Move,
+    home: &Path,
+    plan: &Path,
+    claude: &Path,
+) -> Result<bulkload_agent::reseat::Options> {
     let mut options = lane_options(run, home, plan)?;
     claude.clone_into(&mut options.dest_claude);
     claude.clone_into(&mut options.landing_claude);
-    bulkload_agent::reseat::keymap::derive(&options)
+    Ok(options)
 }
 
 // One line per mapped key and per key held unmapped (typed), then the
@@ -1336,10 +1373,8 @@ fn key_map_proof(run: &Move) -> Result<()> {
     // The live `.claude` resolved and owner-checked as the pull resolves
     // it (N1), never created: report only.
     let claude = owned_real(&dest_home(run)?.join(".claude"))?;
-    let maps = derive_key_maps(run, home, &plan, &claude)?;
-    let mut options = lane_options(run, home, &plan)?;
-    options.dest_claude.clone_from(&claude);
-    options.landing_claude = claude;
+    let options = key_options(run, home, &plan, &claude)?;
+    let maps = bulkload_agent::reseat::keymap::derive(&options)?;
     print_key_maps(&maps)?;
     let summary = bulkload_agent::reseat::keymap::proof(&options, &maps, &mut |line| out(line))?;
     let counts = summary

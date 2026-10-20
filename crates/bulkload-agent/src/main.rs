@@ -57,7 +57,10 @@ SUBCOMMANDS:
                 under the flag. An append-only file (.jsonl, .txt) whose
                 live copy is settled and holds the source's bytes and more
                 (the destination continued it, #280 finding 9) is left as
-                it is and recorded dest-ahead (covered), nothing written.
+                it is and recorded dest-ahead (covered), nothing written;
+                one written within the racy window is refused
+                DESTINATION_UNSETTLED, not remembered (the next pass
+                decides), never landed beside.
                 SUFFIX is one name component (e.g. .neo-20261019). Without
                 the flag a differing file is refused DESTINATION_OCCUPIED
                 and nothing is placed.
@@ -69,7 +72,7 @@ SUBCOMMANDS:
                 transfer record names each map used (mapped, accounted like
                 applied). A path that would reach a map's destination any
                 other way (the source holds that name itself) is refused
-                DESTINATION_OCCUPIED with everything under it: nothing
+                DESTINATION_MAP_CONFLICT with everything under it: nothing
                 merges. Refused FIELD_DOMAIN_VIOLATION before the session:
                 a side that is not a relative path of whole components, one
                 source or one destination twice, and a destination whose
@@ -290,7 +293,13 @@ SUBCOMMANDS:
                 the re-seat as before) and is named on an estate-move
                 key-map-held line (reason= ambiguous-source-key,
                 dest-key-collision, lane-unresolved); estate-move key-map
-                lines name the rest. --key-map-proof: report only, after a
+                lines name the rest, and estate-move key-map-unused lines
+                (after the pull) a map whose lane's sessions the source
+                keyed otherwise (re-seated as before: a second copy). A
+                source copy landed beside sting's own transcript under the
+                lane's key is judged by bytes: extended in place, covered,
+                or held (beside-diverged, counted in the closure line's
+                diverged=, and beside-held), holding the gate. --key-map-proof: report only, after a
                 pass; from MOVE_STATE/carry's plan, the same key map, then
                 one JSON line per file under each source-keyed directory of
                 the live DEST_HOME/.claude/projects (left by passes before

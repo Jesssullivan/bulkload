@@ -366,7 +366,7 @@ fn a_source_path_at_a_mapped_destination_is_refused_and_nothing_merges() {
         Mapped::write(&run.source(&format!("{to}/x.jsonl")), b"same name\n");
         run.settle();
         let stats = run.corpus.run().unwrap();
-        let occupied = |rel: &str| (format!("{to}{rel}"), "DESTINATION_OCCUPIED".to_owned());
+        let occupied = |rel: &str| (format!("{to}{rel}"), "DESTINATION_MAP_CONFLICT".to_owned());
         assert_eq!(
             refused(&stats),
             [
@@ -411,4 +411,51 @@ fn a_set_the_rules_refuse_refuses_before_either_store_exists() {
         .unwrap()
         .next()
         .is_none());
+}
+
+/// #294 review 2: an append-only live file written within the racy window
+/// (a session writing there now) is refused `DESTINATION_UNSETTLED`, typed,
+/// nothing landed beside it and nothing remembered: once it is quiet the
+/// next pass decides it (here: both continued, so it lands beside).
+#[test]
+fn a_live_file_written_now_is_unsettled_and_the_next_pass_decides() {
+    let run = Mapped::new(vec![pair(NEO, STING)], true);
+    let at = run.destination(&format!("{STING}/w.jsonl"));
+    Mapped::write(
+        &run.source(&format!("{NEO}/w.jsonl")),
+        b"{\"a\":1}\n{\"neo\":3}\n",
+    );
+    settle_racy_window(&run.corpus.base.join("source")).unwrap();
+    // The destination's session writes now, and its clock is now.
+    Mapped::write(&at, b"{\"a\":1}\n{\"sting\":2}\n");
+    set_capture_clock(&run.root, Some(crate::git_carry::pass_start_ns()));
+    let first = run.corpus.run();
+    set_capture_clock(&run.root, None);
+    let first = first.unwrap();
+    assert_eq!(
+        refused(&first),
+        [(
+            format!("{STING}/w.jsonl"),
+            "DESTINATION_UNSETTLED".to_owned()
+        )]
+    );
+    let mut beside = at.clone().into_os_string();
+    beside.push(std::ffi::OsStr::from_bytes(SUFFIX));
+    assert!(!Path::new(&beside).exists(), "never a beside copy");
+    assert_eq!(std::fs::read(&at).unwrap(), b"{\"a\":1}\n{\"sting\":2}\n");
+
+    // Quiet now (the default test clock is an hour ahead): decided again,
+    // not remembered.
+    let second = run.corpus.run().unwrap();
+    assert!(second.refusals.is_empty(), "{:?}", second.refusals);
+    assert_eq!(
+        second.applied_beside.len(),
+        1,
+        "{:?}",
+        second.applied_beside
+    );
+    assert_eq!(
+        std::fs::read(Path::new(&beside)).unwrap(),
+        b"{\"a\":1}\n{\"neo\":3}\n"
+    );
 }

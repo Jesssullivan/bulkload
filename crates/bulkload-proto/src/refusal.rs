@@ -371,6 +371,19 @@ pub enum BulkloadRefusal {
     /// WP0(d), OI-1003-Q18, #187). The Git carry's occupied destinations
     /// keep `GIT_DESTINATION_OCCUPIED`.
     DestinationOccupied,
+    /// `--beside` (#280 finding 9 review): an append-only destination file
+    /// (`.jsonl`, `.txt`) this store does not own was written within the
+    /// racy window of now, so whether the seat extends it, is covered by
+    /// it, or lands beside it cannot be judged: a writer may be at it.
+    /// Nothing is written and the refusal is not remembered; the next pass
+    /// decides it again once the file is quiet. Never a beside copy.
+    DestinationUnsettled,
+    /// `--map-prefix` (#280 finding 9 review): a source path would reach a
+    /// map's destination by another route than that map (the source holds
+    /// the destination's name itself, or a shorter map's image lies in a
+    /// longer map's destination). Refused with everything under it, so two
+    /// source paths never merge at one name.
+    DestinationMapConflict,
     /// The destination's parent directory is absent (#232). `copy` and
     /// `pull` create an absent DEST itself (mode 0700) when its parent
     /// exists, and never a parent: the operator named DEST, not the path
@@ -610,6 +623,8 @@ impl BulkloadRefusal {
             Self::DestinationSpaceInsufficient => "DESTINATION_SPACE_INSUFFICIENT",
             Self::SpaceExhausted(_) => "SPACE_EXHAUSTED",
             Self::DestinationOccupied => "DESTINATION_OCCUPIED",
+            Self::DestinationUnsettled => "DESTINATION_UNSETTLED",
+            Self::DestinationMapConflict => "DESTINATION_MAP_CONFLICT",
             Self::DestinationParentMissing => "DESTINATION_PARENT_MISSING",
             Self::DestinationKindMismatch => "DESTINATION_KIND_MISMATCH",
             Self::DestinationExchangeUnsupported => "DESTINATION_EXCHANGE_UNSUPPORTED",
@@ -715,6 +730,8 @@ impl BulkloadRefusal {
         "DESTINATION_SPACE_INSUFFICIENT",
         "SPACE_EXHAUSTED",
         "DESTINATION_OCCUPIED",
+        "DESTINATION_UNSETTLED",
+        "DESTINATION_MAP_CONFLICT",
         "DESTINATION_PARENT_MISSING",
         "DESTINATION_KIND_MISMATCH",
         "DESTINATION_EXCHANGE_UNSUPPORTED",
@@ -989,6 +1006,8 @@ mod tests {
             BulkloadRefusal::DestinationSpaceInsufficient,
             BulkloadRefusal::SpaceExhausted(None),
             BulkloadRefusal::DestinationOccupied,
+            BulkloadRefusal::DestinationUnsettled,
+            BulkloadRefusal::DestinationMapConflict,
             BulkloadRefusal::DestinationParentMissing,
             BulkloadRefusal::DestinationKindMismatch,
             BulkloadRefusal::DestinationExchangeUnsupported,

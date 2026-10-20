@@ -363,7 +363,7 @@ same report, totals and gate:
   `SRC_REL/` (whole components, the longest source wins) is decided, keyed
   (`row_key` over the mapped row), recorded and published at `DST_REL` plus
   the rest of its path, once. A path that would reach a map's destination
-  any other way is refused `DESTINATION_OCCUPIED` with everything under
+  any other way is refused `DESTINATION_MAP_CONFLICT` with everything under
   it (the owner rule: a destination path lands only through the map whose
   destination is the deepest holding it), so no two seats of a session
   meet at one name and nothing merges. A set with an invalid side, one
@@ -384,7 +384,14 @@ same report, totals and gate:
   source copy the pull put beside an archive link is consumed by its A-106
   replacement (one copy of the source's bytes; `--undo` puts it back), and
   one beside the destination's own regular transcript under the lane's key
-  is kept, `diverged`, nothing written.
+  is judged by bytes (#294 review 1): the live file extended in place when
+  it is a strict prefix and that is safe (else `beside-held`), `covered`
+  when the copy is its prefix, else `beside-diverged`, which holds the gate
+  for the operator's review (`diverged=` on the closure line). A derived map
+  whose lane's sessions the source keyed otherwise is named on a typed
+  `estate-move key-map-unused` line. Under `--beside` an append-only live
+  file written within the racy window is refused `DESTINATION_UNSETTLED`,
+  typed and not remembered (the next pass decides), never landed beside.
 
 A transfer row's identity (`item`, 64 hex) is a digest of the transfer's
 source (`SOURCE`, or `HOST:SOURCE` for `pull`), its destination, the path
