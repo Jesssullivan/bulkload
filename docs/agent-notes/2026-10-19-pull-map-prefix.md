@@ -230,6 +230,49 @@ They are fixed on this branch in new commits, after a signed merge of
    - Gap: a source path reached through a symlink keys by its target,
      whose lane is another one, so it is not found.
 
+## Receipt after the review (2026-10-20, at `60d769d`)
+
+- Host `honey`. Worktree `~/git-build/pull-map-prefix-20261019` is `fdc8589`
+  overlaid with every file of `60d769d` that differs from `a1c1cc1`, so its
+  tree is `60d769d`'s.
+- Environment and limits as in the first receipt.
+- A `local-gate` run (#278's) shared honey throughout, so only targeted
+  filters ran, one at a time.
+- `cargo fmt --all -- --check`: ok. `cargo clippy -p bulkload-agent -p
+  bulkload-proto --all-targets --locked -- -D warnings`: ok.
+- `bulkload-proto`: 18/18 (the code taxonomy test, with the two new codes).
+- Lib:
+
+  | Filter | Passed |
+  | --- | --- |
+  | `map_prefix` | 7/7 |
+  | `keymap` | 4/4 |
+  | `judge_tests` | 2/2 |
+  | `transfer::map` | 2/2 |
+  | `closure` | 38/38 |
+  | `transfer_outcome` | 8/8 |
+  | `reseat::` | 82/82 |
+  | `transfer::tests::beside` | 15/15 |
+  | `transfer::tests::prefix` | 6/6 |
+
+- Integration:
+
+  | Suite | Passed |
+  | --- | --- |
+  | `estate_move` | 6/6 (both new tests and #280's deflaked one-pass test included) |
+  | `estate_reseat` | 7/7 |
+  | `single_file_copy` | 17/17 |
+  | `estate_move_source_roots` | 6/6 |
+  | `estate_carried` | 12/12 |
+  | `source_command_registry` | 22/22 |
+  | `prefix_extend_cli` | 2/2 |
+  | `estate_adopt` | 40/40 |
+
+- Fault harness: `reseat` 23/23, `beside` 10/10, `prefix_` 9/9,
+  `receive_after` 6/6, `estate_converge` 23/23.
+- Still owed: the whole suite, `just rust-check`, the merge gate, and pzm
+  `darwin-check`.
+
 ## Open
 
 - Source-key directories already on sting stay (removing a transcript is
@@ -241,6 +284,14 @@ They are fixed on this branch in new commits, after a signed merge of
   re-seat re-keys them by `cwd` as before (a second copy).
 - A key two lane sources share is held, not mapped (strict: even when both
   would land at one destination key).
+- A source path reached through a symlink keys by its target; its derived
+  map goes unused without a `key-map-unused` note (review 4's gap).
+- A source copy whose bytes equal sting's transcript but which the pull
+  still landed beside (another mode, other links) is `covered` and kept:
+  removing it would only make the next pull land it again.
+- The re-seat's in-place extension, like the pull's, cannot see an
+  open-append-close writer between its size check and its write (#280's
+  residual), now for every small transcript too.
 - A beside output the pull left in an earlier pass (a racy destination, or
   before this lane) is not converged back into the live path (#280's C12).
 - `just darwin-check` on pzm is owed before merge.
