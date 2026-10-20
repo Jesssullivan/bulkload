@@ -169,6 +169,26 @@ pub struct Options {
     pub landing_claude: PathBuf,
     /// The landed `.codex`, holding the landed `state_5.sqlite` snapshot.
     pub landing_codex: PathBuf,
+    /// Where the landed Codex index is ([`LandingIndex`]).
+    pub landing_index: LandingIndex,
+    /// `--beside-suffix SUFFIX` (second review of #280, N2): the suffix the
+    /// run's pull landed differing seats beside their live paths with. On a
+    /// live-home landing, `<path>SUFFIX` beside a destination symlink (an
+    /// archive link) is the source's copy of that session or rollout, and is
+    /// re-seated as the landed one; the link is never read.
+    pub beside_suffix: Option<String>,
+    /// `--claude-listing FILE` (independent review of #280, N4): the
+    /// transcripts the pulls listed on the source, relative to its
+    /// `.claude` (`estate-move` keeps it cumulative over its passes, and
+    /// lists refused and skipped source paths too). On a live-home landing a
+    /// session in it is the source's (unmapped unless mapped or by ID); one
+    /// not in it is the destination's own, in place, unless the ledger
+    /// recorded it as the source's on an earlier pass (provenance is
+    /// sticky, verification of #280). Without it, the key's shape decides.
+    pub claude_listing: Option<std::collections::HashSet<Vec<u8>>>,
+    /// `--codex-listing FILE`: the same for the rollouts, relative to the
+    /// source's `.codex`.
+    pub codex_listing: Option<std::collections::HashSet<Vec<u8>>>,
     /// The destination home: its `git` directory is the default lane root.
     pub dest_home: PathBuf,
     /// The destination's live `.claude`.
@@ -253,6 +273,10 @@ impl Options {
             source_home: source_home.to_path_buf(),
             landing_claude: landing_home.join(".claude"),
             landing_codex: landing_home.join(".codex"),
+            landing_index: LandingIndex::InLanding,
+            beside_suffix: None,
+            claude_listing: None,
+            codex_listing: None,
             dest_home: dest_home.to_path_buf(),
             dest_claude: dest_home.join(".claude"),
             dest_codex: dest_home.join(".codex"),
@@ -276,6 +300,90 @@ impl Options {
             min_free_percent: crate::space::min_free_percent(),
             rebind: Vec::new(),
             replace_archived: Vec::new(),
+        }
+    }
+
+    /// The landed Codex index, when the run has one ([`LandingIndex`]).
+    #[must_use]
+    pub fn landing_index(&self) -> Option<PathBuf> {
+        match &self.landing_index {
+            LandingIndex::InLanding => Some(self.landing_codex.join(codex::STATE_DB)),
+            LandingIndex::At(path) => Some(path.clone()),
+            LandingIndex::Absent => None,
+        }
+    }
+
+    /// Whether the landed Codex index is the destination's live index (one
+    /// file under two names): never read as a snapshot (review of #280,
+    /// finding 6: it is written while it is read, and `immutable=1` then
+    /// gives wrong answers).
+    #[must_use]
+    pub fn landing_index_is_live(&self) -> bool {
+        let Some(landed) = self.landing_index() else {
+            return false;
+        };
+        match (
+            std::fs::canonicalize(landed),
+            std::fs::canonicalize(self.dest_codex.join(codex::STATE_DB)),
+        ) {
+            (Ok(landed), Ok(live)) => landed == live,
+            _ => false,
+        }
+    }
+
+    /// Whether the landed `.claude` is the destination's own live `.claude`
+    /// (a live-home landing, plan of record 2026-10-19, C9): the two resolve
+    /// to one directory. A landed session already under the key of its own
+    /// working directory is then in place, with nothing to re-seat.
+    #[must_use]
+    pub fn live_claude_landing(&self) -> bool {
+        match (
+            std::fs::canonicalize(&self.landing_claude),
+            std::fs::canonicalize(&self.dest_claude),
+        ) {
+            (Ok(landing), Ok(dest)) => landing == dest,
+            _ => false,
+        }
+    }
+
+    /// `path` with the beside suffix appended, when the run has one.
+    #[must_use]
+    pub fn beside_of(&self, path: &Path) -> Option<PathBuf> {
+        let suffix = self.beside_suffix.as_ref()?;
+        let mut beside = path.as_os_str().to_owned();
+        beside.push(suffix);
+        Some(PathBuf::from(beside))
+    }
+
+    /// The landed rollout at `rel` (relative to the landed `.codex`) as the
+    /// re-seat reads it (second review of #280, N2): the file there, or, on
+    /// a live-home landing where that is a symlink (the destination's own
+    /// archive link, never read), the source's copy the pull landed beside
+    /// it when there is one.
+    #[must_use]
+    pub fn landed_codex(&self, rel: &Path) -> PathBuf {
+        let path = self.landing_codex.join(rel);
+        if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            if let Some(beside) = self
+                .beside_of(&path)
+                .filter(|beside| std::fs::symlink_metadata(beside).is_ok_and(|meta| meta.is_file()))
+            {
+                return beside;
+            }
+        }
+        path
+    }
+
+    /// [`Self::live_claude_landing`] for `.codex`: the landed `.codex` is the
+    /// destination's live one (C9).
+    #[must_use]
+    pub fn live_codex_landing(&self) -> bool {
+        match (
+            std::fs::canonicalize(&self.landing_codex),
+            std::fs::canonicalize(&self.dest_codex),
+        ) {
+            (Ok(landing), Ok(dest)) => landing == dest,
+            _ => false,
         }
     }
 
@@ -308,6 +416,61 @@ impl Options {
 
 /// The default by-ID prefixes (OI-1003-Q198 C): neo's scratch directories.
 pub const BY_ID_PREFIXES: [&str; 2] = ["/private/tmp", "/tmp"];
+
+/// Where a run's landed Codex index is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LandingIndex {
+    /// `landing_codex/state_5.sqlite` (the default).
+    InLanding,
+    /// `--landing-codex-index FILE`: with a live-home landing (plan of
+    /// record 2026-10-19, C9) the snapshot this pass took sits beside the
+    /// live index as `state_5.sqlite<suffix>`.
+    At(PathBuf),
+    /// `--no-landing-codex-index`: this pass landed no snapshot (its index
+    /// seat was refused, or the source has none). The landed rollouts are
+    /// still re-seated, each by its header; no thread is read from an
+    /// index (review of #280, finding 6: a stale snapshot of an earlier
+    /// pass is never reused).
+    Absent,
+}
+
+/// Whether a session or thread outcome word leaves the session accounted
+/// for in an `estate-move` closure (C11).
+///
+/// Accounted: resumable at its lane (`placed`,
+/// `adopted`, `extended`, `superseded`, `unchanged`, `rebound`,
+/// `replaced-archived`, `in-place`, and the Codex row words `registered`,
+/// `destination-adopted`, `destination-holds`, `destination-row-only`), or
+/// kept with the destination's own copy beside it, as SPEC R2.2 rules
+/// (`diverged`, `dest-ahead`, `dest-continued`, `both-continued`,
+/// `dest-removed`, `extend-raced`). Every other word (a lane refusal code,
+/// `occupied`, `collision`, `held`, `unreadable-form`, `exchange-unsupported`,
+/// `index-conflict`, ...) leaves the landed bytes somewhere no resume finds
+/// them, and holds the gate.
+#[must_use]
+pub fn word_accounted(word: &str) -> bool {
+    matches!(
+        word,
+        "placed"
+            | "adopted"
+            | "extended"
+            | "superseded"
+            | "unchanged"
+            | "rebound"
+            | "replaced-archived"
+            | "in-place"
+            | "registered"
+            | "destination-adopted"
+            | "destination-holds"
+            | "destination-row-only"
+            | "diverged"
+            | "dest-ahead"
+            | "dest-continued"
+            | "both-continued"
+            | "dest-removed"
+            | "extend-raced"
+    )
+}
 
 /// Now, nanoseconds since the epoch.
 #[must_use]
@@ -452,6 +615,19 @@ impl Summary {
             .get(&(tool.to_owned(), word.to_owned()))
             .copied()
             .unwrap_or(0)
+    }
+
+    /// The session and thread outcomes of this pass that leave a landed
+    /// session not resumable at its lane and not kept beside
+    /// ([`word_accounted`]), as `tool/word` → count. `estate-move` holds its
+    /// gate while any remain (plan of record 2026-10-19, C11).
+    #[must_use]
+    pub fn unaccounted(&self) -> BTreeMap<String, u64> {
+        self.sessions
+            .iter()
+            .filter(|((_, word), count)| **count > 0 && !word_accounted(word))
+            .map(|((tool, word), count)| (format!("{tool}/{word}"), *count))
+            .collect()
     }
 
     fn line(&self) -> String {
@@ -615,8 +791,13 @@ fn settle_intents(
 /// and no destination index, `DESTINATION_SPACE_INSUFFICIENT` below the
 /// free-space floor. Then ledger, I/O and schema refusals. A session's own
 /// refusal is its line's `refused` code, never the run's.
+#[allow(clippy::too_many_lines)] // Preflight every tool, then each tool's pass.
 pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Result<Summary> {
     archive_roots_disjoint(options)?;
+    // Review of #280, finding 6: the live index is never the snapshot.
+    if options.codex && options.landing_index_is_live() {
+        return Err(BulkloadRefusal::FieldDomainViolation);
+    }
     let lanes = Lanes::new(options);
     let mut summary = Summary::default();
     let mut held = Held(Vec::new());

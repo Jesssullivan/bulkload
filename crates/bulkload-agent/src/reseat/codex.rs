@@ -325,7 +325,7 @@ pub fn landed_anything(options: &Options) -> Result<bool> {
     if !std::fs::metadata(&options.landing_codex).is_ok_and(|meta| meta.is_dir()) {
         return Err(BulkloadRefusal::ReseatLandingAbsent);
     }
-    Ok(options.landing_codex.join(STATE_DB).is_file()
+    Ok(options.landing_index().is_some_and(|index| index.is_file())
         || TREES.iter().any(|tree| {
             std::fs::read_dir(options.landing_codex.join(tree))
                 .is_ok_and(|mut entries| entries.next().is_some())
@@ -338,11 +338,110 @@ pub fn landed_anything(options: &Options) -> Result<bool> {
 /// # Errors
 /// `RESEAT_INDEX_ABSENT`.
 pub fn preflight(options: &Options) -> Result<()> {
-    if options.dest_codex.join(STATE_DB).is_file() {
+    // A destination with no index gets one seeded from the snapshot this
+    // pass landed, when that snapshot's Codex completed its backfill
+    // ([`seed_index`]); else the first real `codex` start would backfill
+    // the placed rollouts under their source `cwd` (review 0, finding 4),
+    // and nothing is written.
+    if options.dest_codex.join(STATE_DB).is_file() || seedable(options)?.is_some() {
         Ok(())
     } else {
         Err(BulkloadRefusal::ReseatIndexAbsent)
     }
+}
+
+/// The landed snapshot a destination with no index may be seeded from: one
+/// whose `backfill_state` holds a row (its Codex completed the backfill it
+/// runs once), so the seeded index never backfills again.
+fn seedable(options: &Options) -> Result<Option<PathBuf>> {
+    let Some(landed) = options.landing_index().filter(|index| index.is_file()) else {
+        return Ok(None);
+    };
+    let source = open_snapshot(&landed)?;
+    let present: bool = sql(source.query_row(
+        "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'backfill_state'",
+        [],
+        |row| row.get(0),
+    ))?;
+    if !present {
+        return Ok(None);
+    }
+    let complete: bool = sql(source.query_row(
+        "SELECT count(*) > 0 FROM backfill_state",
+        [],
+        |row| row.get(0),
+    ))?;
+    Ok(complete.then_some(landed))
+}
+
+/// Review of #280, finding 6: a destination with no Codex index gets one
+/// before any row is registered, seeded from the snapshot this pass landed:
+/// `VACUUM INTO` a temporary beside the live name, every row of `threads`,
+/// `thread_spawn_edges` and `thread_dynamic_tools` removed from that copy
+/// (the threads are registered next, each under its lane's destination
+/// `cwd` and rollout path), the copy sealed, then published under the live
+/// name without replacing anything. Every other table is kept, so the
+/// destination Codex finds its schema, migrations and `backfill_state`
+/// complete and never backfills the landed rollouts under their source
+/// `cwd` (reseat investigation, 2026-10-16, section 2.2). Returns whether it
+/// seeded one. Nothing is written when the live index exists.
+///
+/// # Errors
+/// `SQLite` and I/O refusals; `DESTINATION_OCCUPIED` when a live index
+/// appeared in between (it is never replaced).
+pub fn seed_index(options: &Options) -> Result<bool> {
+    let live = options.dest_codex.join(STATE_DB);
+    if std::fs::symlink_metadata(&live).is_ok() {
+        return Ok(false);
+    }
+    let Some(landed) = seedable(options)? else {
+        return Ok(false);
+    };
+    let root = super::root(&options.dest_codex)?;
+    let temp_name = format!(".{STATE_DB}.{}.bulkload-seed", std::process::id());
+    let temp = root.join(&temp_name);
+    // A temporary of this name is this process's own, left by nothing else.
+    let _ = std::fs::remove_file(&temp);
+    let seeded = (|| -> Result<()> {
+        let source = open_snapshot(&landed)?;
+        let target = super::key::utf8(&temp)?;
+        sql(source.execute("VACUUM INTO ?1", [target]))?;
+        drop(source);
+        let copy = sql(Connection::open(&temp))?;
+        for table in ["thread_dynamic_tools", "thread_spawn_edges", "threads"] {
+            let present: bool = sql(copy.query_row(
+                "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            ))?;
+            if present {
+                sql(copy.execute(&format!("DELETE FROM \"{table}\""), []))?;
+            }
+        }
+        sql(copy.close().map_err(|(_, error)| error))?;
+        let file = std::fs::File::open(&temp).refuse_at("reseat::codex::seed_index")?;
+        file.sync_all().refuse_at("reseat::codex::seed_index")?;
+        let directory = std::fs::File::open(&root).refuse_at("reseat::codex::seed_index")?;
+        let from = std::ffi::CString::new(temp_name.as_bytes())
+            .map_err(|_| BulkloadRefusal::PathNotPortable)?;
+        let to = std::ffi::CString::new(STATE_DB.as_bytes())
+            .map_err(|_| BulkloadRefusal::PathNotPortable)?;
+        match crate::io::publish_noreplace(&directory, &from, &to) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(BulkloadRefusal::DestinationOccupied)
+            }
+            Err(error) => return Err(crate::refuse::io(&error, "reseat::codex::seed_index")),
+        }
+        directory
+            .sync_all()
+            .refuse_at("reseat::codex::seed_index")?;
+        Ok(())
+    })();
+    if seeded.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    seeded.map(|()| true)
 }
 
 /// The bytes a pass would write placing the landed rollouts (the
@@ -354,7 +453,8 @@ pub fn planned(options: &Options, lanes: &Lanes, ledger: Option<&Ledger>) -> Res
     let Ok(root) = std::fs::canonicalize(&options.dest_codex) else {
         return Ok(0);
     };
-    let path = options.landing_codex.join(STATE_DB);
+    // No landed index: an absent path, so no thread is read from one.
+    let path = options.landing_index().unwrap_or_default();
     let cached = match (ledger, std::fs::symlink_metadata(&path)) {
         (Some(ledger), Ok(meta)) => ledger.snapshot_threads(&path, Identity::of(&meta))?,
         _ => None,
@@ -383,7 +483,7 @@ pub fn planned(options: &Options, lanes: &Lanes, ledger: Option<&Ledger>) -> Res
         total = total.saturating_add(place::planned(
             ledger,
             &root.join(dest_form(&rel)),
-            &options.landing_codex.join(&rel),
+            &options.landed_codex(&rel),
             &options.replace_archived,
         )?);
     }
@@ -399,10 +499,13 @@ pub fn planned(options: &Options, lanes: &Lanes, ledger: Option<&Ledger>) -> Res
         {
             continue;
         }
+        if file.link {
+            continue;
+        }
         total = total.saturating_add(place::planned(
             ledger,
             &root.join(dest_form(&file.rel)),
-            &options.landing_codex.join(&file.rel),
+            &file.landed,
             &options.replace_archived,
         )?);
     }
@@ -420,8 +523,16 @@ struct Pending {
 /// One landed rollout file under a rollout tree, relative to `.codex`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unindexed {
+    /// Its name relative to the landed `.codex`, as the destination names
+    /// it (a beside landing without its suffix).
     pub rel: PathBuf,
     pub id: Option<String>,
+    /// The file read for it: `landing_codex/rel`, or the source's copy
+    /// landed beside it ([`Options::landed_codex`], N2).
+    pub landed: PathBuf,
+    /// A symlink with no copy of the source's beside it: on a live-home
+    /// landing, the destination's own archive link, never read (N2).
+    pub link: bool,
 }
 
 /// The thread ID in a rollout file name (`rollout-<ts>-<uuid>.jsonl…`).
@@ -447,11 +558,32 @@ pub fn rollout_id(name: &str) -> Option<String> {
 /// # Errors
 /// The I/O refusal of a listing.
 pub fn unindexed(options: &Options, named: &BTreeSet<PathBuf>) -> Result<Vec<Unindexed>> {
+    let live = options.live_codex_landing();
+    let suffix = options.beside_suffix.as_deref().filter(|_| live);
     let mut out = Vec::new();
     for tree in TREES {
         let base = options.landing_codex.join(tree);
-        for rel in super::claude::walk(&base)? {
-            let rel = Path::new(tree).join(rel);
+        for found in super::claude::walk(&base)? {
+            let found = Path::new(tree).join(found);
+            let landed = options.landing_codex.join(&found);
+            // On a live-home landing (second review of #280, N2): the
+            // source's copy landed beside a live path of another kind is
+            // listed under that live name; a symlink with that copy beside
+            // it is left to the copy, one without is the destination's own.
+            let mapped = suffix.and_then(|suffix| {
+                found
+                    .to_str()
+                    .and_then(|text| text.strip_suffix(suffix))
+                    .map(PathBuf::from)
+            });
+            let link = mapped.is_none()
+                && std::fs::symlink_metadata(&landed)
+                    .is_ok_and(|meta| meta.file_type().is_symlink());
+            if link && options.landed_codex(&found) != landed {
+                continue;
+            }
+            let link = link && suffix.is_some();
+            let rel = mapped.unwrap_or(found);
             if named.contains(&rel) {
                 continue;
             }
@@ -459,7 +591,12 @@ pub fn unindexed(options: &Options, named: &BTreeSet<PathBuf>) -> Result<Vec<Uni
                 .file_name()
                 .and_then(|name| name.to_str())
                 .and_then(rollout_id);
-            out.push(Unindexed { rel, id });
+            out.push(Unindexed {
+                rel,
+                id,
+                landed,
+                link,
+            });
         }
     }
     Ok(out)
@@ -512,8 +649,18 @@ pub fn reseat(
     emit: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<()> {
     let root = super::root(&options.dest_codex)?;
+    // Review of #280, finding 6: a destination with no index gets one seeded
+    // from this pass's snapshot first.
+    if seed_index(options)? {
+        *summary.rows.entry("index-seeded".to_owned()).or_default() += 1;
+        emit(&format!(
+            "{{\"schema\":\"{SCHEMA}\",\"kind\":\"index\",\"tool\":\"{TOOL}\",\"outcome\":\"seeded\",\"index\":{}}}",
+            super::shown(&root.join(STATE_DB)),
+        ))?;
+    }
+    // No landed index: an absent path, so no thread is read from one.
     let mut snapshot = Snapshot {
-        path: options.landing_codex.join(STATE_DB),
+        path: options.landing_index().unwrap_or_default(),
         conn: None,
     };
     let db = root.join(STATE_DB);
@@ -562,6 +709,17 @@ pub fn reseat(
                     )?;
                     continue;
                 }
+                if word == "in-place" {
+                    summary.session(TOOL, "in-place");
+                    emit(&thread_line(
+                        (&thread.id, &thread.cwd),
+                        None,
+                        "in-place",
+                        None,
+                        None,
+                    ))?;
+                    continue;
+                }
                 let counted = if unrooted {
                     format!("{}:rollout-root", refusal.code())
                 } else if word == "refused" {
@@ -601,7 +759,7 @@ pub fn reseat(
                 respells.push((thread.id.clone(), old, dest_cwd.clone()));
             }
             if let Some(holding) = &claim.holds {
-                let landed = options.landing_codex.join(&rel);
+                let landed = options.landed_codex(&rel);
                 let proved = prove(
                     ledger,
                     holding,
@@ -632,9 +790,10 @@ pub fn reseat(
                 continue;
             }
         }
-        let landed = options.landing_codex.join(&rel);
+        let landed = options.landed_codex(&rel);
         let placer = Placer::new(ledger, &dest.root)
             .with_archived(&options.replace_archived)
+            .with_kept_suffix(options.beside_suffix.as_deref())
             .with_rebind(&options.rebind);
         let outcome = placer
             .place(&landed, &dest_rel, Kind::Rollout, &thread.id, None)?
@@ -1502,8 +1661,36 @@ fn reseat_unindexed(
     summary: &mut Summary,
     emit: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<()> {
+    // A live-home landing (plan of record 2026-10-19, C9): the landed
+    // `.codex` is the live one, so the destination's own rollouts are listed
+    // here too. One the destination already indexes, or one whose recorded
+    // working directory is no source path and has no lane, is the
+    // destination's own: `in-place`, nothing read past its name, nothing
+    // written.
+    let live = options.live_codex_landing();
     for file in unindexed(options, named)? {
-        let landed = options.landing_codex.join(&file.rel);
+        let landed = file.landed.clone();
+        // A live-home landing (second review of #280, N2 and N5): the
+        // destination's own archive link, its own `.jsonl.gz` and its
+        // oddly named files are in place, never read; so is another form of
+        // a thread the snapshot names (the bytes of both are carried).
+        if live
+            && (file.link
+                || file.id.is_none()
+                || file
+                    .rel
+                    .extension()
+                    .is_some_and(|extension| extension == "gz")
+                || file.id.as_deref().is_some_and(|id| ids.contains(id)))
+        {
+            let shown = file
+                .id
+                .clone()
+                .unwrap_or_else(|| file.rel.to_string_lossy().into_owned());
+            summary.session(TOOL, "in-place");
+            emit(&thread_line((&shown, ""), None, "in-place", None, None))?;
+            continue;
+        }
         let shown_id = file
             .id
             .clone()
@@ -1541,6 +1728,32 @@ fn reseat_unindexed(
             ))?;
             continue;
         }
+        // Provenance is sticky (verification of #280, N4 across passes): a
+        // rollout an earlier pass recorded as the source's (a ledger row of
+        // any outcome but `in-place`) is never taken for the destination's
+        // own; its typed outcome stands until dispositioned.
+        let known = ledger
+            .session(TOOL, &id)?
+            .is_some_and(|row| row.outcome != "in-place");
+        // By provenance (independent review of #280, N4): a rollout the
+        // pulls did not list on the source is the destination's own, in
+        // place, whatever its `cwd`; nothing of it is read.
+        if live
+            && !known
+            && options
+                .codex_listing
+                .as_ref()
+                .is_some_and(|listed| !listed.contains(file.rel.as_os_str().as_encoded_bytes()))
+        {
+            summary.session(TOOL, "in-place");
+            emit(&thread_line((&id, ""), None, "in-place", None, None))?;
+            continue;
+        }
+        if live && !known && row_of(&dest.conn, &id)?.is_some() {
+            summary.session(TOOL, "in-place");
+            emit(&thread_line((&id, ""), None, "in-place", None, None))?;
+            continue;
+        }
         let Some(cwd) = unindexed_cwd(ledger, &id, &landed)? else {
             remember_refused(
                 ledger,
@@ -1560,6 +1773,22 @@ fn reseat_unindexed(
         };
         let (dest_cwd, in_lane) = match lanes.lane(Path::new(&cwd))? {
             Some(lane) => (super::key::utf8(&lane.dest_cwd)?.to_owned(), true),
+            // On a live-home landing, a rollout with no lane outside the
+            // source home is the destination's own: in place, never given a
+            // row. Decided before the by-ID rule, whose `/tmp` prefixes would
+            // otherwise take the destination's own scratch sessions for neo's
+            // and write rows into its index (merge gate of #280, 2026-10-19).
+            // A source rollout there stays resumable by ID: `codex resume
+            // <id>` finds the file by its UUID.
+            None if live
+                && !known
+                && options.codex_listing.is_none()
+                && !Path::new(&cwd).starts_with(&options.source_home) =>
+            {
+                summary.session(TOOL, "in-place");
+                emit(&thread_line((&id, &cwd), None, "in-place", None, None))?;
+                continue;
+            }
             None if options.by_id(&cwd) => (cwd.clone(), false),
             None => {
                 remember_refused(
@@ -1618,6 +1847,7 @@ fn reseat_unindexed(
         }
         let placer = Placer::new(ledger, &dest.root)
             .with_archived(&options.replace_archived)
+            .with_kept_suffix(options.beside_suffix.as_deref())
             .with_rebind(&options.rebind);
         let outcome = placer
             .place(&landed, &dest_rel, Kind::Rollout, &id, None)?
@@ -2085,6 +2315,32 @@ fn locate(options: &Options, lanes: &Lanes, thread: &Thread) -> Result<Located> 
             None,
         )));
     };
+    // A live-home landing (second review of #280, N2): the destination's
+    // own archive link there, with no copy of the source's beside it, is
+    // never read; the thread is as if its landed rollout were absent.
+    let live = options.live_codex_landing();
+    if live
+        && options.beside_suffix.is_some()
+        && std::fs::symlink_metadata(options.landing_codex.join(&rel))
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+        && options.landed_codex(&rel) == options.landing_codex.join(&rel)
+    {
+        return Ok(Err((
+            "landing-absent",
+            BulkloadRefusal::CaptureAbsent,
+            None,
+        )));
+    }
+    // A `.jsonl.gz` on a live-home landing is carried at its live name
+    // byte for byte; Codex reads no `.gz` on either host (TIN-5268), so
+    // there is nothing to re-seat: in place (second review of #280, N5).
+    if live && rel.extension().is_some_and(|extension| extension == "gz") {
+        return Ok(Err((
+            "in-place",
+            BulkloadRefusal::ReseatUnreadableForm,
+            Some(rel),
+        )));
+    }
     if rel.extension().is_some_and(|extension| extension == "gz") {
         return Ok(Err((
             "unreadable-form",
