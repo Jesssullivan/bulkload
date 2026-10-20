@@ -3218,3 +3218,43 @@ mod prefix;
 // ---- plan of record 2026-10-19 C1/C2: `--beside SUFFIX` lands a differing
 // ---- file beside the live one --------------------------------------------
 mod beside;
+
+/// The streamed capture (SPEC rule 2 reset, B1): an excluded path (a
+/// repository's `objects`, a rebuildable directory) is never landed, its
+/// bytes never read from the source, and everything beside it lands.
+#[test]
+fn an_excluded_subtree_is_never_landed_or_read() {
+    let corpus = Corpus::new();
+    let source = corpus.base.join("source");
+    for (rel, bytes) in [
+        (".git/HEAD", &b"ref: refs/heads/main\n"[..]),
+        (".git/objects/pack/pack-1.pack", &[7u8; 4096][..]),
+        (".git/objectsish", b"not under objects"),
+        ("node_modules/dep/index.js", b"rebuildable"),
+        ("src/main.rs", b"fn main() {}\n"),
+    ] {
+        let path = source.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    let destination = std::fs::canonicalize(corpus.base.join("destination")).unwrap();
+    set_excluded(
+        &destination,
+        Some(vec![b".git/objects".to_vec(), b"node_modules".to_vec()]),
+    );
+    let ran = corpus.run();
+    set_excluded(&destination, None);
+    let stats = ran.unwrap();
+    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+    assert!(destination.join(".git/HEAD").is_file());
+    assert!(destination.join(".git/objectsish").is_file());
+    assert!(destination.join("src/main.rs").is_file());
+    assert!(!destination.join(".git/objects").exists());
+    assert!(!destination.join("node_modules").exists());
+    assert!(stats.excluded >= 2, "{stats:?}");
+    let landed: u64 = [".git/HEAD", ".git/objectsish", "src/main.rs"]
+        .iter()
+        .map(|rel| std::fs::metadata(source.join(rel)).unwrap().len())
+        .sum();
+    assert_eq!(stats.source_bytes_read, landed, "{stats:?}");
+}

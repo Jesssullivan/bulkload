@@ -408,6 +408,7 @@ const READS: &[&str] = &[
     "show-ref",
     "status",
     "symbolic-ref",
+    "upload-pack",
     "var",
     "verify-pack",
     "version",
@@ -473,11 +474,15 @@ const WRITERS: &[(&str, usize, &str)] = &[
     ),
     (
         "fetch",
-        5,
+        6,
         "From a bundle file into the capture's private repository, a chain's \
-         scratch repository or a destination. Never from a source repository. \
-         Five since #199: chain::flatten also fetches each bound plan base, a \
-         digest-checked private copy, into the chain's scratch repository.",
+         scratch repository or a destination; always aimed at the repository \
+         that takes the objects, never at a source. Five since #199: \
+         chain::flatten also fetches each bound plan base, a digest-checked \
+         private copy, into the chain's scratch repository. Six since the \
+         streamed capture (SPEC rule 2 reset, 2026-10-20): `stream::fetch` \
+         takes a snapshot's ids into the live destination repository from \
+         the source's `upload-pack`, which only reads the source.",
     ),
     (
         "hash-object",
@@ -703,6 +708,13 @@ const EXTRA_CONFIG: &[(&str, &str)] = &[
     (
         "pack.useBitmaps=false",
         "The estimate's pack-objects: no bitmap is read or written.",
+    ),
+    (
+        "uploadpack.allowAnySHA1InWant=true",
+        "stream::serve_upload_pack (SPEC rule 2 reset): the source end of a \
+         fetch by id answers any id the snapshot pinned (a reflog entry, an \
+         index blob), on the command line only; the source's configuration \
+         is never written.",
     ),
 ];
 

@@ -58,6 +58,7 @@ mod refs_scale_tests;
 pub mod registered;
 mod shallow;
 pub mod shared;
+pub mod stream;
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
