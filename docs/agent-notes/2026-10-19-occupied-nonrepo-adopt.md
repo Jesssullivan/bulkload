@@ -128,6 +128,19 @@ with no `.git` entry:
 | V1 | bare `--adopt` (no `--beside`) adopted the equal directory while the item's `<path>.neo-YYYYMMDD` copy existed detached (tin2835 shape): the duplicate check saw `<path>SUFFIX` only when the suffix was passed | fixed: `converge::registered_copy` refuses `GIT_DESTINATION_NONREPO_DUPLICATE` whenever a registered worktree other than the path is bulkload's landing of this item (its workspace ledger names the item) or a `<path>.<suffix>` sibling with a bulkload workspace ledger under any source, independent of `--beside` and HEAD; P129b (hand-plan copy, detached, bare `--adopt`) |
 | V2 | `locked` "initializing" stayed after a crash at `nonrepo_registered` and a pass without `--adopt` (OCCUPIED), and after a failed `.git` create | fixed: the pass without `--adopt` runs `git_carry::abandon_nonrepo` before refusing OCCUPIED; every refusal of `check_nonrepo` does; the registration steps (branch create, `register`, gitfile) run in one closure whose failure removes a partial gitfile it created and then abandons; `abandon_registration`'s guard is now "no `.git` names this administration directory" (a stranger's `.git` no longer protects our half-made one); fault row `estate_apply_nonrepo_no_adopt` |
 
+Fixes in `7e82094`; `origin/main` `912907c` (#290 deflake, #283) merged in
+`bf53c67` (one conflict, `tests/estate_move.rs`: main's strict
+`beside-converged=1` assertion taken, since #290 re-stamps `diverged` so the
+pass always recaptures it; this branch's `GIT_DESTINATION_NONREPO_DIFFERS:1`
+kept). Targeted runs at `bf53c67` on honey (nice 19, `CARGO_BUILD_JOBS=4
+RUST_TEST_THREADS=4`, one run at a time): fmt check ok; clippy `-D warnings`
+default and `fault-injection,io-trace` ok; `estate_adopt` 46 (P129b new);
+fault harness `nonrepo` 5 (`estate_apply_nonrepo_no_adopt` new),
+`estate_apply` 18; `estate_move` 1; `refusal_taxonomy` 5;
+`source_command_registry` 22; lib `converge` 41, `moving` 13;
+`bulkload-proto` 18. Full suite, `just rust-check`, the local gate and the
+Darwin check not run from this lane at this head.
+
 ## Open
 
 - (superseded by the review fix above: the preview now says `adopt` for a
