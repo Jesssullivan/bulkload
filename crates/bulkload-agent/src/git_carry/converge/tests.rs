@@ -1341,7 +1341,7 @@ fn a_refused_proof_records_what_it_proved_and_the_next_reads_only_the_rest() {
     assert_eq!(ledger_at(&target), landed, "the ledger moved");
     let proven: WorkspaceProven = landed::read(&directory.join(landed::WORKSPACE_PROVEN))
         .unwrap()
-        .expect("no record of what the refused proof proved");
+        .unwrap_or_else(|| panic!("no record of what the refused proof proved"));
     assert_eq!(
         proven
             .seats

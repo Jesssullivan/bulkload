@@ -332,12 +332,9 @@ pub(super) fn landed_sides(
                 Prefix {
                     len: file.block_len,
                     digest: file.block,
-                    trusted: file
-                        .print
-                        .clone()
-                        .filter(|print| {
-                            same_fs && print.mtime_ns < racy_from && print.ctime_ns < racy_from
-                        }),
+                    trusted: file.print.clone().filter(|print| {
+                        same_fs && print.mtime_ns < racy_from && print.ctime_ns < racy_from
+                    }),
                     strip: 0,
                 },
                 file.base.as_ref(),
@@ -723,12 +720,9 @@ fn trusted(record: &HandoffLanded, file: &HandoffFile, now: Option<&SeatPrint>, 
         .recorded_ns
         .saturating_sub(super::super::RACY_GRANULARITY_NS);
     record.fsid == fsid
-        && file
-            .print
-            .as_ref()
-            .is_some_and(|print| {
-                now == Some(print) && print.mtime_ns < racy_from && print.ctime_ns < racy_from
-            })
+        && file.print.as_ref().is_some_and(|print| {
+            now == Some(print) && print.mtime_ns < racy_from && print.ctime_ns < racy_from
+        })
 }
 
 /// The bytes of the block at byte 0 of `bytes`: a well-formed block's, or,
@@ -2425,12 +2419,9 @@ fn render_workspace(
                 };
                 let now = SeatPrint::of(&file.path, meta);
                 if trusted(record, file, now.as_ref(), fsid)
-                    || file
-                        .print
-                        .as_ref()
-                        .is_none_or(|print| {
-                            print.mtime_ns >= racy_from || print.ctime_ns >= racy_from
-                        })
+                    || file.print.as_ref().is_none_or(|print| {
+                        print.mtime_ns >= racy_from || print.ctime_ns >= racy_from
+                    })
                 {
                     continue;
                 }

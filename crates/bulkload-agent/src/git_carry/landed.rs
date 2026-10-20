@@ -485,7 +485,7 @@ impl WorkspaceProven {
     /// Whether this extends `ledger` on the file system `fsid`.
     #[must_use]
     pub fn extends(&self, ledger: &LandedWorkspace, fsid: u64) -> bool {
-        self.capture == ledger.capture && self.ledger_ns == ledger.recorded_ns && self.fsid == fsid
+        (self.capture, self.ledger_ns, self.fsid) == (ledger.capture, ledger.recorded_ns, fsid)
     }
 }
 
