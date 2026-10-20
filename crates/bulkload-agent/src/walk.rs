@@ -421,6 +421,9 @@ pub struct Walker<'root> {
     directories_listed: u64,
     /// Classify `SQLite` sidecars and attach `-wal` identities (#218).
     sqlite: bool,
+    /// [`Walker::single_seat`]: the one name visited; the root level lists
+    /// that name's sidecars too, but only for [`Level::holds`].
+    only: Option<CString>,
     _root: BorrowedFd<'root>,
 }
 
@@ -444,6 +447,54 @@ impl<'root> Walker<'root> {
         Self::with_limits(root, cross_device, WalkLimits::DEFAULT)
     }
 
+    /// A walk beneath `root`, a directory descriptor, that visits only the
+    /// one entry `name` (#232): the single-file source of `copy --file` and
+    /// `pull --file`. The directory is not listed. Its level holds `name`
+    /// and whichever of `name-wal`, `name-shm` and `name-journal` exist
+    /// beside it (one `fstatat` each), so a [`Walker::with_sqlite`] walk
+    /// still keys a database by its `-wal`'s identity (#218: a WAL commit
+    /// leaves the main file untouched); only `name` is visited, so no
+    /// sidecar is ever offered. `name` is stat'ed without following it and
+    /// yielded as in any walk: a regular file as a row, a symlink as a row
+    /// with its literal target, an absent name as `SOURCE_VANISHED`, and a
+    /// directory or special file as `SOURCE_ROOT_KIND_MISMATCH`, never
+    /// entered.
+    ///
+    /// # Errors
+    /// Refuses with the `fstat` or reopen failure of the root.
+    pub fn single_seat(root: BorrowedFd<'root>, name: &CStr, cross_device: bool) -> Result<Self> {
+        let root_dev = sys::fstat(root).refuse_at("walk::single_seat")?.node.dev;
+        let dir = sys::open_dir_at(root, c".").refuse_at("walk::single_seat")?;
+        let mut names = vec![name.to_owned()];
+        for suffix in SQLITE_SIDECAR_SUFFIXES {
+            let mut sidecar = name.to_bytes().to_vec();
+            sidecar.extend_from_slice(suffix);
+            if let Ok(sidecar) = CString::new(sidecar) {
+                if sys::fstatat_nofollow(&dir, &sidecar).is_ok() {
+                    names.push(sidecar);
+                }
+            }
+        }
+        names.sort_unstable();
+        Ok(Self {
+            root_dev,
+            cross_device,
+            limits: WalkLimits::DEFAULT,
+            stack: vec![Level {
+                dir,
+                prefix_len: 0,
+                names,
+                next: 0,
+            }],
+            path: Vec::new(),
+            ready: VecDeque::new(),
+            directories_listed: 1,
+            sqlite: false,
+            only: Some(name.to_owned()),
+            _root: root,
+        })
+    }
+
     /// [`Walker::new`] within `limits`.
     ///
     /// # Errors
@@ -463,6 +514,7 @@ impl<'root> Walker<'root> {
             ready: VecDeque::new(),
             directories_listed: 0,
             sqlite: false,
+            only: None,
             _root: root,
         };
         match sys::open_dir_at(root, c".")
@@ -526,6 +578,12 @@ impl<'root> Walker<'root> {
             return Visit::Skip;
         }
         let kind = kind_of(&stat);
+        // A single-seat walk (#232) carries one regular file or one symlink
+        // (as a link, R1); anything else at the name is not the kind the
+        // verb was given, refused typed and never entered (#283 review 1).
+        if self.only.is_some() && !matches!(kind, FileKind::Regular | FileKind::Symlink) {
+            return refuse(rel_path, BulkloadRefusal::SourceRootKindMismatch);
+        }
         // Engine temporaries are matched before either cap (#129): one is
         // recorded, never carried, so its depth or length refuses nothing.
         if kind == FileKind::Regular && temporary_kind(name.to_bytes()) == Some(FileKind::Regular) {
@@ -781,6 +839,10 @@ impl Iterator for Walker<'_> {
             let prefix_len = level.prefix_len;
             let level = self.stack.last()?;
             let name = level.names.get(at)?;
+            // A single-seat walk lists a name's sidecars for `holds` only.
+            if self.only.as_ref().is_some_and(|only| only != name) {
+                continue;
+            }
             self.path.truncate(prefix_len);
             if prefix_len != 0 {
                 self.path.push(b'/');
