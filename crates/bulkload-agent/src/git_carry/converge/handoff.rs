@@ -332,10 +332,9 @@ pub(super) fn landed_sides(
                 Prefix {
                     len: file.block_len,
                     digest: file.block,
-                    trusted: file
-                        .print
-                        .clone()
-                        .filter(|print| same_fs && print.mtime_ns < racy_from),
+                    trusted: file.print.clone().filter(|print| {
+                        same_fs && print.mtime_ns < racy_from && print.ctime_ns < racy_from
+                    }),
                     strip: 0,
                 },
                 file.base.as_ref(),
@@ -713,17 +712,17 @@ fn unrecorded(head: &[u8], ours: &str, landed: &mut dyn FnMut() -> Result<bool>)
 }
 
 /// Whether `record`'s print of `file` vouches for its bytes now: the same
-/// file system, the same print, and stamped before the racy window of the
-/// record's `recorded_ns` (as `prove` trusts the workspace ledger's print).
+/// file system, the same print, and both its stamps (mtime and ctime; #292
+/// review F1) before the racy window of the record's `recorded_ns` (as
+/// `prove` trusts the workspace ledger's print).
 fn trusted(record: &HandoffLanded, file: &HandoffFile, now: Option<&SeatPrint>, fsid: u64) -> bool {
     let racy_from = record
         .recorded_ns
         .saturating_sub(super::super::RACY_GRANULARITY_NS);
     record.fsid == fsid
-        && file
-            .print
-            .as_ref()
-            .is_some_and(|print| now == Some(print) && print.mtime_ns < racy_from)
+        && file.print.as_ref().is_some_and(|print| {
+            now == Some(print) && print.mtime_ns < racy_from && print.ctime_ns < racy_from
+        })
 }
 
 /// The bytes of the block at byte 0 of `bytes`: a well-formed block's, or,
@@ -1206,6 +1205,9 @@ fn retaken(
 /// An unreadable record or intent; a file-system error; a clear the
 /// settle finishes refuses as [`clear`] does (its intent kept).
 fn settle(worktree: &Path, dir: &Path, source: &str, ours: &str) -> Result<Settled> {
+    // The settled record's racy instant, before this settle's first read
+    // or write (C03): each print it records is re-taken below, after it.
+    let started_ns = super::super::pass_start_ns();
     let intent_path = dir.join(HANDOFF_INTENT);
     let record_path = dir.join(HANDOFF_LANDED);
     let intent = landed::read::<HandoffIntent>(&intent_path)?;
@@ -1291,7 +1293,7 @@ fn settle(worktree: &Path, dir: &Path, source: &str, ours: &str) -> Result<Settl
             base.inputs = [0; 32];
         }
         base.files = files;
-        base.recorded_ns = super::super::pass_start_ns();
+        base.recorded_ns = started_ns;
         if base.files.is_empty() && base.retired.is_empty() {
             landed::remove(&record_path)?;
         } else {
@@ -2313,6 +2315,12 @@ fn render_workspace(
     place: &Place,
     ours: &str,
 ) -> Result<Row> {
+    // The record's racy instant, before this render's first read of a
+    // target and its first write (C03): every print it records is taken
+    // after it, so a target the render wrote, or one a writer changed
+    // between that write and its print, stays racy until a rerun has read
+    // it again, however long the render takes.
+    let started_ns = super::super::pass_start_ns();
     let worktree = workspace.worktree;
     let this = canonical(worktree);
     let record_path = place.dir.join(HANDOFF_LANDED);
@@ -2411,10 +2419,9 @@ fn render_workspace(
                 };
                 let now = SeatPrint::of(&file.path, meta);
                 if trusted(record, file, now.as_ref(), fsid)
-                    || file
-                        .print
-                        .as_ref()
-                        .is_none_or(|print| print.mtime_ns >= racy_from)
+                    || file.print.as_ref().is_none_or(|print| {
+                        print.mtime_ns >= racy_from || print.ctime_ns >= racy_from
+                    })
                 {
                     continue;
                 }
@@ -2748,9 +2755,9 @@ fn render_workspace(
     #[cfg(test)]
     super::super::mid_pass::fire(&this, super::super::mid_pass::Stage::HandoffWritten);
     // The prints of what this run wrote (a kept target's is the one its
-    // bytes were checked at). Each is racy against `recorded_ns` (the
-    // pass's start), so converge trusts none until a rerun re-dates it
-    // after checking the bytes again.
+    // bytes were checked at). Each is racy against `recorded_ns`, this
+    // render's start, taken before its first write (C03), so converge
+    // trusts none until a rerun re-dates it after checking the bytes again.
     for file in &mut next.files {
         if matches!(file.kind, FileKind::ViaSymlink(_)) || file.print.is_some() {
             continue;
@@ -2758,7 +2765,7 @@ fn render_workspace(
         file.print = lstat(&worktree.join(OsStr::from_bytes(&file.path)))?
             .and_then(|meta| SeatPrint::of(&file.path, &meta));
     }
-    next.recorded_ns = super::super::pass_start_ns();
+    next.recorded_ns = started_ns;
     let rewrite = wrote || record.as_ref() != Some(&next);
     if rewrite {
         if next.files.is_empty() && next.retired.is_empty() {
