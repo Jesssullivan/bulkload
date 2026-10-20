@@ -445,7 +445,7 @@ pub(super) fn before_swap(_dir: &File, _name: &CStr) {
     });
 }
 
-fn set_hook(hook: Option<Box<dyn FnMut()>>) {
+pub(super) fn set_hook(hook: Option<Box<dyn FnMut()>>) {
     BEFORE_SWAP.with(|slot| *slot.borrow_mut() = hook);
 }
 
@@ -699,9 +699,9 @@ fn files_are_classed_by_the_union_they_take() {
     assert_eq!(Class::of(b"state_5.sqlite", false), Class::Sqlite);
     assert_eq!(Class::of(b"anything", true), Class::Sqlite);
     assert_eq!(Class::of(b"plugins/cache/x.bin", false), Class::Opaque);
-    // The append-log and SQLite unions are their lanes' (#294, #278):
-    // until they land those classes are held.
-    assert!(union_of(Class::AppendLog).is_none());
+    // The append-log union is the #294 lane's; the SQLite union is the
+    // #278 lane's, and until it lands that class is held.
+    assert!(union_of(Class::AppendLog).is_some());
     assert!(union_of(Class::Sqlite).is_none());
     assert!(union_of(Class::Config(Format::Json)).is_some());
     assert!(union_of(Class::Opaque).is_some());

@@ -378,7 +378,13 @@ fn temp_name(name: &CStr, attempt: usize) -> Result<CString> {
 /// Write `bytes` under a private name, durable, then trade it for the live
 /// file if the live file is still `stat`. `false`: a writer changed it, the
 /// trade is undone (or never made) and nothing of this attempt remains.
-fn swap_in(dir: &File, name: &CStr, stat: &Stat, bytes: &[u8], attempt: usize) -> Result<bool> {
+pub(super) fn swap_in(
+    dir: &File,
+    name: &CStr,
+    stat: &Stat,
+    bytes: &[u8],
+    attempt: usize,
+) -> Result<bool> {
     let temp = temp_name(name, attempt)?;
     let file = File::from(
         sys::create_excl_at(dir.as_fd(), &temp, stat.mode & 0o7777)
@@ -427,7 +433,12 @@ fn swap_in(dir: &File, name: &CStr, stat: &Stat, bytes: &[u8], attempt: usize) -
 
 /// Land the source's bytes where the destination holds no such file,
 /// create-only.
-fn create(target: &Target<'_>, name: &CStr, bytes: &[u8], attempt: usize) -> Result<Outcome> {
+pub(super) fn create(
+    target: &Target<'_>,
+    name: &CStr,
+    bytes: &[u8],
+    attempt: usize,
+) -> Result<Outcome> {
     let temp = temp_name(name, attempt)?;
     let file = File::from(
         sys::create_excl_at(target.dir.as_fd(), &temp, 0o600)
