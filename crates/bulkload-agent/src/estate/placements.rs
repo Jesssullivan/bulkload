@@ -5,7 +5,9 @@
 //! `.files` records in STATE (by identity), and, with `--undo`, taken back:
 //! each one still as it was placed (identity, size and time) is removed,
 //! then each directory the pass made that is empty now; anything changed
-//! since is kept and counted (review of #291, item 2).
+//! since is kept and counted (review of #291, item 2). The derived entries
+//! a pass ledgered as rebuildable (operator ruling 2026-10-20) are counted
+//! on the record's line, never placed, so never taken back.
 
 // Receipt paths print escaped and quoted, as every estate receipt's do.
 #![allow(clippy::unnecessary_debug_formatting)]
@@ -43,14 +45,19 @@ pub fn run(
             continue;
         };
         out(&format!(
-            "estate-placements record={path:?} item={} live={:?} done={} undone={} placed={} made-dirs={} held-derived={}",
+            "estate-placements record={path:?} item={} live={:?} done={} undone={} placed={} made-dirs={} rebuildable={} rebuildable-bytes={}",
             record.item,
             Path::new(OsStr::from_bytes(&record.live)),
             record.done,
             record.undone,
             record.placed.len(),
             record.made.len(),
-            record.held.len(),
+            record.rebuildable.len(),
+            record
+                .rebuildable
+                .iter()
+                .map(|entry| entry.size)
+                .sum::<u64>(),
         ))?;
         for entry in &record.placed {
             out(&format!(

@@ -98,10 +98,10 @@ file is counted, nothing excluded.
    instead of being required equal (the advance retirement requires remote
    URLs ⊆ live; this one does not, since configuration is not content and
    is ledgered).
-7. **Rebuildable roots in a beside tree refuse by default**
-   (`rebuildable:<path>`); `--drop-rebuildable` applies the capture's own
-   policy (the fixed `REBUILDABLE_DIRECTORIES`, nothing tracked below):
-   counted, dropped with the tree. That is the operator's call per run.
+7. **Rebuildable roots in a beside tree** first refused by default
+   (`rebuildable:<path>`, `--drop-rebuildable` to drop them); superseded by
+   the operator's ruling of 2026-10-20 ("Ledger as rebuildable", below):
+   they are derived output, ledgered and gone with the tree, no flag.
 8. **The clean path's refs follow the source.** Its namespace refs are the
    only holder of neo's work (no tree beside), so this item's own earlier
    refs move by compare-and-swap, as a beside landing's do; elsewhere
@@ -139,12 +139,57 @@ One adversarial read-only review (a refuter subagent, nothing run) at
   when the live store lacks them (`894c0e3`).
 - `estate-move --plan-only` previews `adopt:refs-in` with `beside=none`
   (`estate-diff --refs-in`).
-- estate-handoff into a `workspace-refs-in` live checkout: **not done**.
-  Hand-off is bound to a workspace ledger (it proves a target's bytes as
-  the landed blob plus its block, and records `handoff.landed` beside
-  `workspace.landed`); a refs-in live checkout is sting's own, with no
-  ledger, and its `AGENTS.md`/`CLAUDE.md` are sting's tracked files. Writing
-  a block there needs a design decision, not a small fix.
+- estate-handoff into a `workspace-refs-in` live checkout: first left
+  undone (hand-off is bound to a workspace ledger; a refs-in live checkout
+  is sting's own, its `AGENTS.md`/`CLAUDE.md` sting's tracked files);
+  decided 2026-10-20, below.
+
+## Operator ruling 2026-10-20 (interview): "Ledger as rebuildable"
+
+Relayed by the coordinator, on neo's untracked build output when a beside
+tree retires. Implemented:
+
+- Derived entries (`build/`, `dist/`, `.svelte-kit/`, `.artifacts/`,
+  `bazel-*` links, `mktemp`-named directories, `.serena/`, the rebuildable
+  roots: the classes held before) are **never placed into the live
+  checkout and never compared**. Each entry's path, kind, mode, size and
+  BLAKE3 (a link's target; whether the live checkout holds something at
+  its path, by `lstat` only) is ledgered as `rebuildable`: in the
+  retirement's ledger record (`beside-retire-<tag>-<ns>.retired`, and its
+  `.files` record), hashed under the destination lock before anything is
+  written, and the tree retires only when its prints at the second proof
+  are still the first proof's (so the hashes name the bytes removed).
+  Every other entry must still prove contained.
+- The same rule in the apply path: a clean source's derived seats are
+  ledgered in its `.files` record (BLAKE3 of the blob), never written; the
+  bytes stay in the capture's provenance.
+- Counted everywhere: receipt `files-rebuildable=N
+  files-rebuildable-bytes=B`; the retire report's `rebuildable=`
+  `rebuildable-bytes=` per tree and in the summary; `estate-placements`;
+  closure's `files` block (`rebuildable`, `rebuildable_bytes`); and a new
+  closure `beside_retirements` block, from any PRIVATE_STATE holding
+  retirement ledger records (outside the gate, as the omissions are).
+- `--place-derived` and `--drop-rebuildable` are **removed** (a run that
+  passes either is refused `FIELD_DOMAIN_VIOLATION`); the
+  `derived-held:` and `rebuildable:` refusals are gone.
+- One narrowing, mine: a derived name whose directory has a tracked file
+  at or under it (in the source's index or the live one) is a source
+  directory (`build/` holding tracked scripts), so an untracked file there
+  stays source-like and is placed create-only, never ledgered away
+  (`class_in`).
+- Source-like untracked files keep the create-only placement with its
+  manifest (`estate-placements [--undo]`).
+
+Hand-off for a `workspace-refs-in` item (the coordinator, 2026-10-20):
+estate-handoff never writes into such an item's live checkout (sting's
+own tracked `AGENTS.md`/`CLAUDE.md`). It records the hand-off facts in
+bulkload's STATE as a typed note instead, `{item}-{blake3(SOURCE)}.handoff-note`
+(`refs-in-live-checkout`: capture, live and source paths, PLAN, the refs
+its refs-in created and kept, the file tally, each file landed beside),
+its line's outcome `noted` (`unchanged`, `planned` on `--dry-run`,
+`checked`, `cleared` by `--clear`, which removes the note), and closure
+prints it on the item's row as `handoff_note` (`null` until recorded).
+The apply's H step leaves a refs-in item alone (C14).
 
 Independent review of #291 at `d310063` (relayed by the coordinator):
 
@@ -187,23 +232,29 @@ STATE made, nothing written). Report:
   live repository lacks (remote-tracking ones too) under the namespace, so
   none is dropped.
 
+## Verification of the 2026-10-20 change (stopped by priority change)
+
+On honey before the coordinator paused this lane (only #280, #294, #278
+move; nothing to run on honey or pzm): `cargo fmt`, `cargo check
+--all-targets` ok; unit rows `converge::files` 7/7 and `closure` 37/37,
+`source_command_registry` 22/22, `estate_clean_source` 22/22 (C12, C14,
+R4, R8 new or rewritten). Clippy found two doc lints, fixed in text only,
+not re-run. Not run yet: clippy after that fix, clippy with
+`fault-injection,io-trace`, `estate_handoff`, `estate_adopt`,
+`estate_move`, `estate_carried`, the fault harness, the full suite, and
+the regenerated read-only sting report. A last honey run's ssh session
+dropped (exit 255); its cargo target under
+`~/git-build/clean-source-20261019-cargo` is still to delete.
+
 ## Open
 
-- `estate-diff` / `estate-move --plan-only` still preview `beside=landing`
-  for a clean diverged item (estate-diff takes no `--refs-in`); the apply
-  then lands no tree.
-- estate-handoff writes no block into a `workspace-refs-in` live checkout
-  (`HANDOFF_NOT_LANDED`, as for a beside item's live path).
 - A retired standalone tree whose objects another repository than the
   live one borrows (alternates elsewhere) is not detected.
 - The clean assessment builds a second scratch repository (the adopt proof
   built one), one more index of the bundle for a diverged item.
 - No fault-harness rows for the reconcile (unit rows prove the write-ahead
   settle; a crash leaves only recorded temporaries the next pass removes).
-- A session whose cwd is inside a retired tree is left in a deleted
-  directory (no process inspection, as for the advance retirement).
 - The ruling's intent-ledger entry (above).
-- **Reflog-only commits** (11 trees on sting): the proof requires every
-  commit a beside tree's reflogs name to be in the live repository. They
-  are history Git itself expires; whether to drop them, or to carry them
-  in under `refs/<ns>-logged/` before a retirement, is the operator's call.
+- Closed since: the plan-only preview (`894c0e3`), reflog-only commits
+  carried (`894c0e3`), a process inside a tree refuses `in-use` (#289's
+  check), the refs-in hand-off (a note in STATE, 2026-10-20).

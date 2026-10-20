@@ -52,16 +52,15 @@
 //!    entry absent at the live checkout is placed, one that differs lands
 //!    at `<path>SUFFIX`); an entry whose beside path holds something else
 //!    refuses `occupied:<path>`; a path the live index tracks and its
-//!    worktree deleted is never undone (the entry lands beside). A
-//!    rebuildable root (the capture's own
-//!    [`super::super::REBUILDABLE_DIRECTORIES`], a real directory nothing
-//!    tracked is under) refuses `rebuildable:<path>`, unless the run drops
-//!    them as a capture omits them (`--drop-rebuildable`: each ledgered,
-//!    with what the live checkout holds at its path). Derived output
-//!    ([`super::super::converge::files::class_of`]) the reconcile would
-//!    have to write refuses `derived-held:<path>` until the operator rules
-//!    on build output (`--place-derived` writes it). A nested repository
-//!    refuses `nested:<path>`.
+//!    worktree deleted is never undone (the entry lands beside). Derived
+//!    output ([`super::super::converge::files::class_in`]: `build/`,
+//!    `dist/`, `.svelte-kit/`, `.artifacts/`, a `bazel-*` link, a
+//!    `mktemp`-named directory, `.serena/`, the capture's rebuildable roots
+//!    such as `target/` and `node_modules/`; a directory with tracked files
+//!    under it is source) is never placed and never compared: each entry
+//!    is ledgered as rebuildable (operator ruling 2026-10-20, "Ledger as
+//!    rebuildable": path, kind, mode, size and BLAKE3, a link's target)
+//!    and goes with the tree. A nested repository refuses `nested:<path>`.
 //!
 //! The tree's prints (and a linked tree's administration directory's) are
 //! taken before the proof and after it (a session writing there refuses
@@ -72,9 +71,11 @@
 //! repository's destination lock: the file-level reconcile runs
 //! (recorded write-ahead), the refs go in, the tree is proved again (every
 //! entry now present: placed or beside) and its HEAD and administration
-//! looked at once more, the ledger record is written
-//! (`beside-retire-<tag>-<ns>.retired` in STATE, one per retirement: path,
-//! live path, shape, HEAD, counts, refs, bytes, configuration), and the
+//! looked at once more (its prints still the first proof's, so the
+//! rebuildable ledger hashed in between is of the bytes removed), the
+//! ledger record is written (`beside-retire-<tag>-<ns>.retired` in STATE,
+//! one per retirement: path, live path, shape, HEAD, counts, refs, bytes,
+//! configuration, every rebuildable entry), and the
 //! tree is removed by the
 //! beside retirement's crash-safe removal ([`super::retire`]: a STATE
 //! record, a rename to a private name, a re-proof by prints, a linked
@@ -94,9 +95,7 @@ use serde::{Deserialize, Serialize};
 use super::super::converge::files::{self, Tally, Want};
 use super::super::converge::handoff::TARGETS;
 use super::super::converge::{advance, clean, head_of, same_dir};
-use super::super::{
-    durable, git, input, landed, native_refs, oid, output, REBUILDABLE_DIRECTORIES,
-};
+use super::super::{durable, git, input, landed, native_refs, oid, output};
 use super::retire::{self, Retired};
 use crate::{BulkloadRefusal, Result};
 
@@ -134,14 +133,9 @@ pub struct Proof {
     /// The files and links its index tracks (the HEAD's: it is clean).
     pub tracked: u64,
     /// What the file-level reconcile of its untracked and ignored entries
-    /// does (planned; `placed` and `beside` are still to write).
+    /// does (planned; `placed` and `beside` are still to write; the derived
+    /// ones `rebuildable`, ledgered by [`retire`]).
     pub tally: Tally,
-    /// Entries under a rebuildable root (`--drop-rebuildable`), not
-    /// reconciled.
-    pub rebuildable: u64,
-    /// Each of them, with what the live checkout holds at its path
-    /// (`equal`, `differs`, `absent`), for the ledger.
-    pub dropped: Vec<(Vec<u8>, String)>,
     /// Hand-off targets bulkload wrote there (a sealed block above a
     /// tracked file's bytes, or a target it created): bulkload's own.
     pub handoff: u64,
@@ -187,13 +181,6 @@ pub struct Rules<'a> {
     pub ns: &'a str,
     /// The SOURCE label (an advance's own marker on a lock is its).
     pub source: &'a str,
-    /// `--drop-rebuildable`: entries under a rebuildable root are counted
-    /// and go with the tree, as a capture omits them; without it one
-    /// refuses `rebuildable:<path>`.
-    pub drop_rebuildable: bool,
-    /// `--place-derived`: derived output is placed as any entry; without
-    /// it a tree that would need one placed refuses `derived-held:<path>`.
-    pub place_derived: bool,
 }
 
 /// [`prove`]'s answer.
@@ -227,15 +214,6 @@ fn allocated(root: &Path) -> Result<u64> {
         total += entry.meta.blocks() * 512;
     }
     Ok(total)
-}
-
-// Whether `path` or a path under it is in `tracked`.
-fn tracks(tracked: &BTreeSet<Vec<u8>>, path: &[u8]) -> bool {
-    let mut under = path.to_vec();
-    under.push(b'/');
-    let mut past = path.to_vec();
-    past.push(b'/' + 1);
-    tracked.contains(path) || tracked.range(under..past).next().is_some()
 }
 
 /// The commits a standalone tree's refs and stash name (each with the
@@ -705,24 +683,6 @@ fn carry_history(
     Ok(Ok(wanted.into_iter().collect()))
 }
 
-// What the live checkout at `live` holds at `path` against the beside
-// tree's entry there: `equal`, `differs` or `absent`.
-fn compared(beside: &Path, live: &Path, path: &[u8]) -> Result<String> {
-    let at = live.join(OsStr::from_bytes(path));
-    if fs::symlink_metadata(&at).is_err() {
-        return Ok("absent".to_owned());
-    }
-    let Some(want) = Want::on_disk(beside, path.to_vec())? else {
-        return Ok("differs".to_owned());
-    };
-    Ok(if files::holds_want(None, &at, &want)? {
-        "equal"
-    } else {
-        "differs"
-    }
-    .to_owned())
-}
-
 /// Prove the beside tree at `beside` a subset of the live checkout at
 /// `live` (module docs), by `rules`. Read-only.
 ///
@@ -750,8 +710,6 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
             head: String::new(),
             tracked: 0,
             tally: Tally::default(),
-            rebuildable: 0,
-            dropped: Vec::new(),
             handoff: 0,
             refs: Vec::new(),
             bytes: meta.blocks() * 512,
@@ -951,10 +909,7 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
             }
         }
     }
-    let mut rebuildable = 0_u64;
-    let mut dropped: Vec<(Vec<u8>, String)> = Vec::new();
     let mut handoff = blocks;
-    let mut roots: Vec<Vec<u8>> = Vec::new();
     let mut wants = Vec::new();
     for entry in retire::walk(beside, false)? {
         let path = entry.relative;
@@ -971,28 +926,6 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
             handoff += 1;
             continue;
         }
-        if roots.iter().any(|root| {
-            path.strip_prefix(root.as_slice())
-                .is_some_and(|rest| rest.first() == Some(&b'/'))
-        }) {
-            rebuildable += 1;
-            dropped.push((path.clone(), compared(beside, live, &path)?));
-            continue;
-        }
-        if entry.meta.is_dir()
-            && REBUILDABLE_DIRECTORIES
-                .iter()
-                .any(|candidate| candidate.as_bytes() == name)
-            && !tracks(&tracked, &path)
-        {
-            if !rules.drop_rebuildable {
-                return Ok(refused(format!("rebuildable:{}", shown(&path))));
-            }
-            rebuildable += 1;
-            dropped.push((path.clone(), compared(beside, live, &path)?));
-            roots.push(path);
-            continue;
-        }
         match Want::on_disk(beside, path.clone())? {
             Some(want) => wants.push(want),
             None => return Ok(refused(format!("special:{}", shown(&path)))),
@@ -1000,24 +933,11 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
     }
     wants.sort_by(|a, b| a.path.cmp(&b.path));
     let live_tracked = files::index_paths(live)?;
-    let planned = files::plan(
-        live,
-        rules.suffix,
-        (&wants, &live_tracked),
-        rules.place_derived,
-        None,
-    )?;
+    // Derived output is never placed or compared: ledgered as rebuildable
+    // by the retirement, it goes with the tree (operator ruling 2026-10-20).
+    let planned = files::plan(live, rules.suffix, (&wants, &live_tracked, &tracked), None)?;
     if let Some(first) = planned.occupied().first() {
         return Ok(refused(format!("occupied:{}", shown(first))));
-    }
-    // Derived output it would have to place waits for the operator's
-    // ruling on build output: the tree keeps it meanwhile.
-    if let Some(first) = planned.held(&wants).first() {
-        return Ok(refused(format!(
-            "derived-held:{}(+{})",
-            shown(first),
-            planned.held(&wants).len()
-        )));
     }
     if retire::prints(beside, admin.as_deref())? != before {
         return Ok(refused("raced"));
@@ -1029,8 +949,6 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
         head,
         tracked: files,
         tally: planned.tally(&wants),
-        rebuildable,
-        dropped,
         handoff,
         refs,
         bytes,
@@ -1056,7 +974,6 @@ pub struct RetiredRecord {
     pub head: String,
     pub tracked: u64,
     pub tally: Tally,
-    pub rebuildable: u64,
     pub handoff: u64,
     pub refs: Vec<(String, String)>,
     pub bytes: u64,
@@ -1069,9 +986,10 @@ pub struct RetiredRecord {
     pub prunable: u64,
     /// The refs its reflog commits went in under, `(name, commit)`.
     pub reflogs: Vec<(String, String)>,
-    /// Each rebuildable entry dropped with it, and what the live checkout
-    /// held at its path (`equal`, `differs`, `absent`).
-    pub dropped: Vec<(Vec<u8>, String)>,
+    /// Each derived entry that went with it, ledgered as rebuildable
+    /// (operator ruling 2026-10-20): path, kind, mode, size, BLAKE3 (a
+    /// link's target), whether the live checkout held something there.
+    pub rebuildable: Vec<files::Rebuildable>,
     /// Its reconcile's record (every placement, by identity).
     pub files_record: Vec<u8>,
     /// Unix nanoseconds at the proof.
@@ -1083,7 +1001,7 @@ pub struct RetiredRecord {
 }
 
 impl landed::Record for RetiredRecord {
-    const MAGIC: &'static [u8; 16] = b"bulkload-subset2";
+    const MAGIC: &'static [u8; 16] = b"bulkload-subset3";
 }
 
 /// The tag a beside tree's records are named by in STATE.
@@ -1236,7 +1154,6 @@ pub fn retire(
         head: proof.head.clone(),
         tracked: proof.tracked,
         tally: proof.tally,
-        rebuildable: proof.rebuildable,
         handoff: proof.handoff,
         refs: proof.refs.clone(),
         bytes: proof.bytes,
@@ -1244,7 +1161,6 @@ pub fn retire(
         exclude: proof.exclude.clone(),
         carried: proof.carried.clone(),
         prunable: proof.prunable,
-        dropped: proof.dropped.clone(),
         files_record: files_record.as_os_str().as_bytes().to_vec(),
         at_ns,
         ..RetiredRecord::default()
@@ -1266,21 +1182,31 @@ pub fn retire(
     let git_dir = landed::worktree_git_dir(live)?.ok_or(BulkloadRefusal::GitDestinationOccupied)?;
     let common = landed::common_dir(&git_dir)?;
     let _lock = landed::lock(&common, source)?;
-    landed::write(&ledger, &record)?;
     // The file-level reconcile, recorded write-ahead.
     files::settle(&files_record)?;
     let salt = files_record.as_os_str().as_bytes();
     let live_tracked = files::index_paths(live)?;
+    let sourced = files::index_paths(beside)?;
     let planned = files::plan(
         live,
         rules.suffix,
-        (&proof.wants, &live_tracked),
-        rules.place_derived,
+        (&proof.wants, &live_tracked, &sourced),
         None,
     )?;
-    if !planned.occupied().is_empty() || !planned.held(&proof.wants).is_empty() {
+    if !planned.occupied().is_empty() {
         return Ok(Retired::Kept("raced".to_owned()));
     }
+    // Its derived output, ledgered as rebuildable before anything is
+    // written (operator ruling 2026-10-20): each entry's path, kind, mode,
+    // size and BLAKE3 (a link's target), read from the tree.
+    record.rebuildable = match files::ledger(&planned, &proof.wants, None) {
+        Ok(ledgered) => ledgered,
+        Err(BulkloadRefusal::GitDestinationModified) => {
+            return Ok(Retired::Kept("raced".to_owned()))
+        }
+        Err(refusal) => return Err(refusal),
+    };
+    landed::write(&ledger, &record)?;
     let mut journal = files::Journal::begin(
         &files_record,
         files::FilesRecord {
@@ -1291,11 +1217,14 @@ pub fn retire(
             tracked: proof.tracked,
             temps: files::temps(live, &planned, salt),
             besides: planned.besides(&proof.wants),
+            rebuildable: record.rebuildable.clone(),
             ..files::FilesRecord::default()
         },
     )?;
-    let tally = files::execute(live, &planned, &proof.wants, (salt, &mut journal), None)?;
+    let mut tally = files::execute(live, &planned, &proof.wants, (salt, &mut journal), None)?;
+    tally.rebuildable_bytes = record.rebuildable.iter().map(|entry| entry.size).sum();
     journal.finish(tally)?;
+    record.tally = tally;
     // Its history, carried in (full history, nothing dropped): the
     // objects the live store lacks, its refs, its reflog commits; a name
     // taken since keeps the tree.
@@ -1309,10 +1238,13 @@ pub fn retire(
     let Verdict::Retirable(again) = prove(beside, live, rules)? else {
         return Ok(Retired::Kept("raced".to_owned()));
     };
+    // Its prints still the first proof's: the rebuildable ledger hashed in
+    // between names the bytes the removal takes.
     if again.tally.placed != 0
         || again.tally.beside != 0
         || again.tally.dirs_placed != 0
         || !again.reflogs.is_empty()
+        || again.prints != proof.prints
     {
         return Ok(Retired::Kept("raced".to_owned()));
     }

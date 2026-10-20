@@ -37,6 +37,13 @@
 //!   standalone copy whose commits the live repository holds is retired,
 //!   its branch created under the namespace and its configuration
 //!   ledgered.
+//! - C12, R4, R8 (operator ruling 2026-10-20, "Ledger as rebuildable"):
+//!   derived output (build output, rebuildable roots, `bazel-*` links) is
+//!   never written into the live checkout: each entry ledgered as
+//!   rebuildable and counted (receipt, `estate-placements`, closure); a
+//!   beside tree holding some retires once everything else is contained.
+//! - C14: `estate-handoff` records a refs-in item's hand-off facts in STATE
+//!   as a note, never a block in the live checkout's own files.
 //!
 //! Fixture repositories are created and destroyed here; their Git runs
 //! with no global configuration and no hooks (R-N98).
@@ -1012,13 +1019,14 @@ fn r3_a_standalone_copy_is_retired_only_once_its_commits_are_in() {
     assert_eq!(refs.get("refs/neo-20261016/heads/main"), Some(&head));
 }
 
-/// R4 (review M3, M4): a standalone copy whose `.git` holds an entry the
-/// proof cannot account for (a submodule's `modules/`) refuses
-/// `unknown-git:modules`; a rebuildable root in a beside tree refuses
-/// `rebuildable:<path>` unless the run drops it as a capture omits it
-/// (`--drop-rebuildable`, counted).
+/// R4 (review M3, M4; operator ruling 2026-10-20, "Ledger as
+/// rebuildable"): a standalone copy whose `.git` holds an entry the proof
+/// cannot account for (a submodule's `modules/`) refuses
+/// `unknown-git:modules`; a rebuildable root in a beside tree is derived
+/// output, never placed: each entry ledgered as rebuildable and counted,
+/// it goes with the tree, and closure counts the retirement.
 #[test]
-fn r4_unaccounted_git_entries_and_rebuildable_roots_refuse() {
+fn r4_unaccounted_git_entries_refuse_and_rebuildable_roots_are_ledgered() {
     let world = World::new();
     world.capture();
     let ran = world.apply(&FLAGS);
@@ -1035,7 +1043,9 @@ fn r4_unaccounted_git_entries_and_rebuildable_roots_refuse() {
     fs::write(world.beside().join("target/debug/app"), b"built\n").unwrap();
     let report = retire(&[], &state, &[world.beside().as_path()]);
     let line = line_of(&report.stdout, &world.beside()).to_owned();
-    assert!(line.contains("reason=rebuildable:target"), "{line}");
+    for held in ["verdict=retirable", "rebuildable=3", "rebuildable-bytes=6"] {
+        assert!(line.split_whitespace().any(|w| w == held), "{held}: {line}");
+    }
     // A bulkload landing's own receipts, and a worktree its `.git`
     // registers that is gone on this host (a copy's), are accounted for:
     // the receipts ledgered, the gone worktree's HEAD proved reachable.
@@ -1057,27 +1067,56 @@ fn r4_unaccounted_git_entries_and_rebuildable_roots_refuse() {
         ],
     );
     fs::remove_dir_all(&gone).unwrap();
-    let report = retire(&["--drop-rebuildable"], &state, &[world.beside().as_path()]);
+    let report = retire(&[], &state, &[world.beside().as_path()]);
     let line = line_of(&report.stdout, &world.beside()).to_owned();
     for held in [
         "verdict=retirable",
         "shape=standalone",
-        "rebuildable-dropped=3",
+        "rebuildable=3",
         "prunable-worktrees=1",
     ] {
         assert!(line.split_whitespace().any(|w| w == held), "{held}: {line}");
     }
-    let done = retire(
-        &["--delete", "--drop-rebuildable"],
-        &state,
-        &[world.beside().as_path()],
+    assert!(
+        report
+            .stdout
+            .contains(" rebuildable=3 rebuildable_bytes=6 "),
+        "{}",
+        report.stdout
     );
+    let done = retire(&["--delete"], &state, &[world.beside().as_path()]);
     assert!(
         line_of(&done.stdout, &world.beside()).contains("outcome=retired"),
         "{}",
         done.stdout
     );
     assert!(!world.beside().exists());
+    // Never placed in the live checkout.
+    assert!(!world.sting().join("target").exists());
+    // Closure over the retirement's state counts it, its rebuildable
+    // entries with it.
+    let closure = agent(&os(&[
+        &"closure-report",
+        &world.plan(),
+        &world.corpus(),
+        &SOURCE,
+        &world.state(),
+        &state,
+    ]));
+    for held in [
+        "\"beside_retirements\":{\"records\":1,\"retired\":1,\"removing\":0,\"kept\":0,",
+        "\"rebuildable\":3,\"rebuildable_bytes\":6,",
+        "\"shape\":\"standalone\",\"state\":\"retired\"",
+    ] {
+        assert!(closure.stdout.contains(held), "{held}: {}", closure.stdout);
+    }
+    // The flags the ruling retired are refused.
+    for gone in ["--drop-rebuildable", "--place-derived"] {
+        assert!(
+            !retire(&[gone], &state, &[world.beside().as_path()]).ok,
+            "{gone}"
+        );
+    }
 }
 
 /// R5 (operator ruling 2026-10-16, "full history. drop nothing. ever."): a
@@ -1270,36 +1309,193 @@ fn c11_a_kept_namespace_ref_holds_the_item_for_review() {
     );
 }
 
-/// C12 (review of #291, item 2): derived output (here `build/`) is held,
-/// counted and listed, never written, until the operator rules on build
-/// output; `--place-derived` writes it as any entry.
+/// C12 (operator ruling 2026-10-20, "Ledger as rebuildable"): derived
+/// output (here `build/`) is never written into the live checkout: each
+/// entry is ledgered as rebuildable in the item's `.files` record and
+/// counted, in the receipt, in `estate-placements` and in closure; the
+/// source-like files land as before.
 #[test]
-fn c12_derived_output_is_held_until_the_ruling() {
-    for place in [false, true] {
-        let world = World::new();
-        fs::create_dir_all(world.neo().join("build")).unwrap();
-        fs::write(world.neo().join("build/gen.txt"), b"generated\n").unwrap();
-        world.capture();
-        let mut flags = FLAGS.to_vec();
-        if place {
-            flags.push("--place-derived");
-        }
-        let ran = world.apply(&flags);
-        let (outcome, reason) = receipt(&ran.stdout);
-        assert_eq!(outcome, "workspace-refs-in", "{place}: {reason}");
-        let held = if place { "0" } else { "2" };
-        assert!(
-            word(&reason, &format!("files-held-derived={held}")),
-            "{place}: {reason}"
-        );
-        assert_eq!(
-            world.sting().join("build/gen.txt").exists(),
-            place,
-            "{place}"
-        );
-        // The source-like files land either way.
-        assert!(world.sting().join("notes/todo.md").exists(), "{place}");
+fn c12_derived_output_is_ledgered_rebuildable_never_written() {
+    let world = World::new();
+    fs::create_dir_all(world.neo().join("build")).unwrap();
+    fs::write(world.neo().join("build/gen.txt"), b"generated\n").unwrap();
+    world.capture();
+    let ran = world.apply(&FLAGS);
+    let (outcome, reason) = receipt(&ran.stdout);
+    assert_eq!(outcome, "workspace-refs-in", "{reason}");
+    for held in ["files-rebuildable=2", "files-rebuildable-bytes=10"] {
+        assert!(word(&reason, held), "{held}: {reason}");
     }
+    assert!(!world.sting().join("build").exists());
+    assert!(world.sting().join("notes/todo.md").exists());
+    let listed = agent(&os(&[&"estate-placements", &world.state()]));
+    assert!(
+        listed
+            .stdout
+            .contains(" rebuildable=2 rebuildable-bytes=10"),
+        "{}",
+        listed.stdout
+    );
+    let closure = world.closure();
+    assert!(
+        closure
+            .stdout
+            .contains("\"rebuildable\":2,\"rebuildable_bytes\":10}"),
+        "{}",
+        closure.stdout
+    );
+    assert!(
+        closure.stdout.contains("\"disposition\":\"applied\""),
+        "{}",
+        closure.stdout
+    );
+    // `--place-derived` is gone with the ruling.
+    let mut flags = FLAGS.to_vec();
+    flags.push("--place-derived");
+    assert!(!world.apply(&flags).ok);
+}
+
+/// C14 (the coordinator, 2026-10-20): `estate-handoff` never writes a
+/// block into a refs-in item's live checkout (sting's own, its tracked
+/// `AGENTS.md` here): it records the hand-off facts in STATE as a typed
+/// note, which closure prints on the item's row. A rerun is unchanged, a
+/// dry run plans, and `--clear` removes the note.
+#[test]
+fn c14_a_refs_in_hand_off_is_a_note_in_state_never_a_block() {
+    let world = World::new();
+    let sting = world.sting();
+    fs::write(sting.join("AGENTS.md"), b"sting's own agents file\n").unwrap();
+    git(&sting, &["add", "AGENTS.md"]);
+    git(
+        &sting,
+        &["commit", "--quiet", "-m", "sting's own", "--", "AGENTS.md"],
+    );
+    world.capture();
+    let ran = world.apply(&FLAGS);
+    assert_eq!(
+        receipt(&ran.stdout).0,
+        "workspace-refs-in",
+        "{}",
+        ran.stdout
+    );
+    let before = identity(&sting.join("AGENTS.md"));
+    let handoff = |extra: &[&str]| {
+        let mut list: Vec<OsString> = vec!["estate-handoff".into()];
+        list.extend(extra.iter().map(OsString::from));
+        list.extend(os(&[
+            &world.plan(),
+            &world.corpus(),
+            &world.state(),
+            &SOURCE,
+        ]));
+        agent(&list)
+    };
+    let row = |ran: &Ran| {
+        ran.stdout
+            .lines()
+            .find(|line| line.contains("\"kind\":\"workspace\""))
+            .unwrap_or_else(|| panic!("no row: {}\n{}", ran.stdout, ran.stderr))
+            .to_owned()
+    };
+    let dry = handoff(&["--dry-run"]);
+    assert!(
+        row(&dry).contains("\"outcome\":\"planned\""),
+        "{}",
+        dry.stdout
+    );
+    let noted = handoff(&[]);
+    assert!(noted.ok, "{}\n{}", noted.stdout, noted.stderr);
+    let line = row(&noted);
+    for held in [
+        "\"note\":\"refs-in-live-checkout\"",
+        "\"outcome\":\"noted\"",
+        "\"written_at_destination\":false",
+        "\"files_beside\":2",
+        "\"refs_created\":",
+    ] {
+        assert!(line.contains(held), "{held}: {line}");
+    }
+    assert!(noted.stdout.contains("\"noted\":1"), "{}", noted.stdout);
+    // Nothing written at the destination: its tracked AGENTS.md as it was,
+    // no CLAUDE.md made, no hand-off record or intent in its Git.
+    assert_eq!(identity(&sting.join("AGENTS.md")), before);
+    assert!(!sting.join("CLAUDE.md").exists());
+    let found = tree(&sting.join(".git"));
+    assert!(
+        !found
+            .keys()
+            .any(|path| path.ends_with("handoff.landed") || path.ends_with("handoff.intent")),
+        "{found:?}"
+    );
+    let notes: Vec<_> = fs::read_dir(world.state())
+        .unwrap()
+        .filter_map(|entry| {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            name.ends_with(".handoff-note").then_some(name)
+        })
+        .collect();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    let again = handoff(&[]);
+    assert!(
+        row(&again).contains("\"outcome\":\"unchanged\""),
+        "{}",
+        again.stdout
+    );
+    let closure = world.closure();
+    assert!(
+        closure
+            .stdout
+            .contains("\"handoff_note\":{\"note\":\"refs-in-live-checkout\",\"besides\":2}"),
+        "{}",
+        closure.stdout
+    );
+    let cleared = handoff(&["--clear"]);
+    assert!(
+        row(&cleared).contains("\"outcome\":\"cleared\""),
+        "{}",
+        cleared.stdout
+    );
+    assert!(world.closure().stdout.contains("\"handoff_note\":null"));
+    assert_eq!(identity(&sting.join("AGENTS.md")), before);
+}
+
+/// R8 (operator ruling 2026-10-20, "Ledger as rebuildable"): a beside
+/// tree's derived output (`.svelte-kit/`, a `bazel-*` link) is never placed
+/// in the live checkout and never compared: each entry is ledgered as
+/// rebuildable (BLAKE3, a link's target) and the tree retires once
+/// everything else is contained; its source-like files are placed as
+/// before.
+#[test]
+fn r8_derived_output_goes_with_the_tree_ledgered() {
+    let world = World::new();
+    world.capture();
+    let ran = world.apply(&FLAGS);
+    assert_eq!(receipt(&ran.stdout).0, "workspace-refs-in");
+    world.land_beside_standalone();
+    let beside = world.beside();
+    fs::create_dir_all(beside.join(".svelte-kit/output")).unwrap();
+    fs::write(beside.join(".svelte-kit/output/app.js"), b"compiled\n").unwrap();
+    std::os::unix::fs::symlink("/nowhere/bazel-bin", beside.join("bazel-bin")).unwrap();
+    fs::write(beside.join("src/build-notes.md"), b"source-like\n").unwrap();
+    let state = world.path("retire-state");
+    let report = retire(&[], &state, &[beside.as_path()]);
+    let line = line_of(&report.stdout, &beside).to_owned();
+    for held in ["verdict=retirable", "rebuildable=4", "rebuildable-bytes=27"] {
+        assert!(line.split_whitespace().any(|w| w == held), "{held}: {line}");
+    }
+    let done = retire(&["--delete"], &state, &[beside.as_path()]);
+    assert!(
+        line_of(&done.stdout, &beside).contains("outcome=retired"),
+        "{}",
+        done.stdout
+    );
+    assert!(!beside.exists());
+    assert!(!world.sting().join(".svelte-kit").exists());
+    assert!(fs::symlink_metadata(world.sting().join("bazel-bin")).is_err());
+    assert_eq!(
+        fs::read(world.sting().join("src/build-notes.md")).unwrap(),
+        b"source-like\n"
+    );
 }
 
 /// C13 (review of #291, item 2): every placement is recorded and can be

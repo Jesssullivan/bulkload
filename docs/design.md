@@ -1610,9 +1610,13 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   item refuses `GIT_BESIDE_FOREIGN` naming it, after every other entry is
   in and its refs went in. Derived output (`build/`, `dist/`,
   `.svelte-kit/`, `.artifacts/`, `bazel-*`, a `mktemp`-named directory,
-  `.serena/`, the rebuildable roots) that would be written is held, counted
-  and listed, until the operator rules on build output (`--place-derived`
-  writes it). A nested repository's files under a gitlink whose checkout
+  `.serena/`, the rebuildable roots; a directory with tracked files under
+  it is source) is never written, compared or placed (operator ruling
+  2026-10-20, "Ledger as rebuildable"): each entry is ledgered as
+  rebuildable in the `.files` record (path, kind, mode, size, BLAKE3, a
+  link's target, whether the live checkout holds something there) and
+  counted; its bytes stay in the capture's provenance. A nested
+  repository's files under a gitlink whose checkout
   the live tree lacks refuse `GIT_DESTINATION_PARENT_MISSING`, never a
   plain directory made there. The temporaries a pass may make are recorded
   write-ahead in `{item}-{blake3(SOURCE)}.files`, each directory it makes
@@ -1623,8 +1627,8 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   still as placed; the record
   ends with every entry counted (`placed`, `adopted`, `beside`,
   `beside_present`, `dirs_placed`, `dirs_adopted`, `dirs_beside`,
-  `occupied`, `held`, with source-like and derived counts), checked against
-  the entries planned. The live checkout's HEAD, index, tracked files, branches,
+  `occupied`, `rebuildable` and its bytes), checked against the entries
+  planned. The live checkout's HEAD, index, tracked files, branches,
   stash, configuration and `info/exclude` are never touched; the source's
   `info/exclude` and every captured byte stay in its provenance there.
   Outcome and journal `workspace-refs-in` (outcome variants 14 and 15,
@@ -1632,7 +1636,15 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   counts `applied` only with a finished `.files` record and a `.refs-in`
   record of the current capture (else `files-record-missing`,
   `files-record-mismatch`, `refs-in-record-missing`), its row printing
-  `files` and `refs_in`. A capture with a tracked change, or whose HEAD
+  `files` (with `rebuildable`, `rebuildable_bytes`), `refs_in` and
+  `handoff_note`. `estate-handoff` never writes a block into such an
+  item's live checkout (the destination's own; the coordinator,
+  2026-10-20): it records the hand-off facts in PRIVATE_STATE as a typed
+  note (`{item}-{blake3(SOURCE)}.handoff-note`, `refs-in-live-checkout`:
+  the capture, the live checkout and source paths, the refs created and
+  kept, the file tally, each file landed beside), its line's outcome
+  `noted`, and closure prints it as `handoff_note` (`null` before it ran);
+  the H step leaves the item alone. A capture with a tracked change, or whose HEAD
   no ref brings in (a detached commit), lands beside as before, and so does
   every capture without `--refs-in`. A beside tree an earlier pass made
   is left as it is (receipt `beside-existing=<path>`), for
@@ -1671,30 +1683,36 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   history, nothing dropped), and every untracked or
   ignored entry present and equal in the live checkout or landable there
   as a file-level beside (the reconcile above, planned; one occupied
-  refuses `occupied:<path>`; a rebuildable root refuses
-  `rebuildable:<path>` unless `--drop-rebuildable` drops it as a capture
-  omits it, each path ledgered with what the live checkout holds there;
-  derived output it would need written refuses `derived-held:<path>`
-  unless `--place-derived`; a nested repository refuses `nested:<path>`). Its
+  refuses `occupied:<path>`; derived output, the rebuildable roots with
+  it, is never placed or compared: ledgered as rebuildable, it goes with
+  the tree (operator ruling 2026-10-20); a nested repository refuses
+  `nested:<path>`). Its
   prints (a linked tree's administration directory's too) are taken
   before and after the proof (`raced`). A proof or retirement that fails
   with a refusal is that tree's line (`reason=error:<CODE>`), and the run
   goes on. Report only
   by default, one line per tree (`verdict=retirable` with `shape`, `head`,
   `tracked`, `present`, `to-place`, `to-beside`, `beside-present`,
-  `rebuildable`, `refs-to-import` and the allocated `bytes`, or
+  `rebuildable`, `rebuildable-bytes`, `refs-to-import` and the allocated
+  `bytes`, or
   `verdict=refused reason=...`) and a summary; nothing is written. With
-  `--delete`, under the live repository's destination lock: the ledger
-  record (`beside-retire-<tag>-<ns>.retired` in PRIVATE_STATE, one per
-  retirement: path, live path,
-  shape, HEAD, counts, refs, bytes, a standalone tree's `config` and
-  `info/exclude` bytes), the reconcile (recorded write-ahead), the refs
-  (create-only), a second proof (every entry now present) and a last look
-  at its HEAD and administration, the ledger marked deleting, then the
+  `--delete`, under the live repository's destination lock: the derived
+  entries hashed into the ledger record (`beside-retire-<tag>-<ns>.retired`
+  in PRIVATE_STATE, one per retirement: path, live path, shape, HEAD,
+  counts, refs, bytes, every rebuildable entry with its BLAKE3 or link
+  target, a standalone tree's `config` and `info/exclude` bytes), the
+  reconcile (recorded write-ahead), the refs (create-only), a second proof
+  (every entry now present, the tree's prints still the first proof's, so
+  the hashes name the bytes removed) and a last look at its HEAD and
+  administration, the ledger marked deleting, then the
   beside retirement's crash-safe removal (`beside-retire-<tag>.retire`,
   the rename aside, the re-proof by prints, the administration, the
   tree); `outcome=retired` or `outcome=kept reason=...`, and the ledger
   marked retired. A rerun finishes a removal a crash cut short.
+  `closure-report` over a PRIVATE_STATE holding these records adds a
+  `beside_retirements` block (retired, removing, kept; entries, placed,
+  beside, rebuildable and its bytes, refs, reflog refs, bytes; one row
+  per record), outside the gate as the omissions are.
 - **No empty beside directory.** `estate-carry-files` removes a
   destination directory it made when the item ends not carried and the
   directory is still empty (`rmdir`), and an empty beside destination a

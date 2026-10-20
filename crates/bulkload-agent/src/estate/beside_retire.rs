@@ -10,6 +10,10 @@
 //! written. With `--delete`, each retirable tree is reconciled into the
 //! live checkout, its refs created, ledgered in STATE and removed, one
 //! receipt line per tree (`outcome=retired` or `outcome=kept reason=...`).
+//! A tree's derived output (build output, rebuildable roots) is never
+//! placed: it is ledgered as rebuildable and goes with the tree (operator
+//! ruling 2026-10-20, "Ledger as rebuildable"), counted on its line and in
+//! the summary.
 
 // Receipt paths print escaped and quoted, as every estate receipt's do.
 #![allow(clippy::unnecessary_debug_formatting)]
@@ -40,12 +44,6 @@ pub struct RetireOptions {
     pub scan: Vec<PathBuf>,
     /// How deep `--scan` looks.
     pub depth: usize,
-    /// `--drop-rebuildable`: entries under a rebuildable root go with the
-    /// tree, counted, as a capture omits them.
-    pub drop_rebuildable: bool,
-    /// `--place-derived`: derived output a retirement needs placed is
-    /// placed (held otherwise, and the tree kept).
-    pub place_derived: bool,
 }
 
 /// What one run found and did.
@@ -54,6 +52,10 @@ pub struct Summary {
     pub candidates: u64,
     pub retirable: u64,
     pub retirable_bytes: u64,
+    /// The retirable trees' derived entries, ledgered as rebuildable, and
+    /// their bytes.
+    pub rebuildable: u64,
+    pub rebuildable_bytes: u64,
     pub empty: u64,
     pub refused: u64,
     pub retired: u64,
@@ -71,11 +73,13 @@ impl Summary {
     #[must_use]
     pub fn line(&self, delete: bool) -> String {
         format!(
-            "estate-beside-retire summary mode={} candidates={} retirable={} retirable_bytes={} empty={} refused={} retired={} retired_bytes={} kept={} settled={} pending_removals={} errors={}",
+            "estate-beside-retire summary mode={} candidates={} retirable={} retirable_bytes={} rebuildable={} rebuildable_bytes={} empty={} refused={} retired={} retired_bytes={} kept={} settled={} pending_removals={} errors={}",
             if delete { "delete" } else { "report" },
             self.candidates,
             self.retirable,
             self.retirable_bytes,
+            self.rebuildable,
+            self.rebuildable_bytes,
             self.empty,
             self.refused,
             self.retired,
@@ -91,7 +95,7 @@ impl Summary {
 fn proof_words(proof: &subset::Proof) -> String {
     let tally = &proof.tally;
     format!(
-        "shape={} head={} tracked={} present={} to-place={} to-beside={} beside-present={} dirs-present={} dirs-to-place={} dirs-beside={} to-write-source={} to-write-derived={} derived={} rebuildable-dropped={} rebuildable-dropped-live-equal={} handoff={} refs-to-import={} reflog-to-carry={} objects-to-carry={} prunable-worktrees={} bytes={}",
+        "shape={} head={} tracked={} present={} to-place={} to-beside={} beside-present={} dirs-present={} dirs-to-place={} dirs-beside={} to-write-source={} rebuildable={} rebuildable-bytes={} handoff={} refs-to-import={} reflog-to-carry={} objects-to-carry={} prunable-worktrees={} bytes={}",
         proof.shape.word(),
         if proof.head.is_empty() { "-" } else { &proof.head },
         proof.tracked,
@@ -103,14 +107,8 @@ fn proof_words(proof: &subset::Proof) -> String {
         tally.dirs_placed,
         tally.dirs_beside,
         tally.written_source,
-        tally.written_derived,
-        tally.derived,
-        proof.rebuildable,
-        proof
-            .dropped
-            .iter()
-            .filter(|(_, state)| state == "equal")
-            .count(),
+        tally.rebuildable,
+        tally.rebuildable_bytes,
         proof.handoff,
         proof.refs.len(),
         proof.reflogs.len(),
@@ -174,8 +172,6 @@ pub fn run(options: &RetireOptions, out: &mut dyn FnMut(&str) -> Result<()>) -> 
             suffix: &options.suffix,
             ns: &ns,
             source: &options.source,
-            drop_rebuildable: options.drop_rebuildable,
-            place_derived: options.place_derived,
         };
         // A refusal proving one tree is that tree's typed answer; the run
         // goes on to the next.
@@ -202,6 +198,8 @@ pub fn run(options: &RetireOptions, out: &mut dyn FnMut(&str) -> Result<()>) -> 
         };
         summary.retirable += 1;
         summary.retirable_bytes += proof.bytes;
+        summary.rebuildable += proof.tally.rebuildable;
+        summary.rebuildable_bytes += proof.tally.rebuildable_bytes;
         if proof.shape == subset::Shape::Empty {
             summary.empty += 1;
         }

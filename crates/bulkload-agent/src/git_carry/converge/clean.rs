@@ -28,8 +28,9 @@
 //! hold that the live repository does not get by ref: [`land`] writes no
 //! tree beside, and the source's untracked and ignored entries are reconciled
 //! file by file into the live checkout ([`super::files`]: absent placed,
-//! equal adopted, different landed as `<file>SUFFIX`), recorded in STATE
-//! (`{item}-{blake3(SOURCE)}.files`). The live checkout's HEAD, index,
+//! equal adopted, different landed as `<file>SUFFIX`; derived output never
+//! written, ledgered as rebuildable with its BLAKE3: operator ruling
+//! 2026-10-20), recorded in STATE (`{item}-{blake3(SOURCE)}.files`). The live checkout's HEAD, index,
 //! tracked files, branches, stash, configuration and `info/exclude` are
 //! never touched; the source's `info/exclude` and every captured byte stay
 //! in the capture's provenance in the live repository. Outcome and journal
@@ -59,6 +60,9 @@ pub struct Clean {
     /// The gitlinks the captured HEAD records (nested repositories'
     /// places).
     gitlinks: BTreeSet<Vec<u8>>,
+    /// Every path the captured HEAD tracks (a derived name with tracked
+    /// content under it is a source directory).
+    paths: BTreeSet<Vec<u8>>,
     tracked: u64,
     wants: Vec<Want>,
 }
@@ -318,6 +322,7 @@ pub fn assess(
         scratch,
         head,
         gitlinks,
+        paths,
         tracked,
         wants,
     }))
@@ -336,7 +341,7 @@ pub fn land(
     clean: &Clean,
     target: &Target<'_>,
     landing: &Landing<'_>,
-    (record, suffix, place_derived): (&Path, &str, bool),
+    (record, suffix): (&Path, &str),
 ) -> Result<Applied> {
     let workspace = target
         .workspace
@@ -371,10 +376,13 @@ pub fn land(
     let planned = files::plan(
         workspace,
         suffix,
-        (&clean.wants, &tracked),
-        place_derived,
+        (&clean.wants, &tracked, &clean.paths),
         Some(&mut objects),
     )?;
+    // Derived output is never written: each entry ledgered as rebuildable,
+    // its bytes in the capture's provenance (operator ruling 2026-10-20).
+    let rebuildable = files::ledger(&planned, &clean.wants, Some(&mut objects))?;
+    let rebuildable_bytes = rebuildable.iter().map(|entry| entry.size).sum();
     let mut journal = files::Journal::begin(
         record,
         FilesRecord {
@@ -386,11 +394,11 @@ pub fn land(
             temps: files::temps(workspace, &planned, salt),
             besides: planned.besides(&clean.wants),
             occupied: planned.occupied(),
-            held: planned.held(&clean.wants),
+            rebuildable,
             ..FilesRecord::default()
         },
     )?;
-    let tally = files::execute(
+    let mut tally = files::execute(
         workspace,
         &planned,
         &clean.wants,
@@ -398,6 +406,8 @@ pub fn land(
         Some(&mut objects),
     )?;
     objects.finish()?;
+    // A seat's size is its blob's, read for the ledger.
+    tally.rebuildable_bytes = rebuildable_bytes;
     let written = journal.finish(tally)?;
     if let Some(first) = written.occupied.first() {
         return Err(BulkloadRefusal::GitBesideForeign(

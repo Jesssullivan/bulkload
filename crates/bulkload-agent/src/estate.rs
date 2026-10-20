@@ -2561,7 +2561,7 @@ fn apply_item(
                         clean,
                         (item, &staged),
                         (&target, &landing),
-                        (state, &identity, suffix, options.place_derived),
+                        (state, &identity, suffix),
                     )
                 });
                 let landed = cleaned.and_then(|cleaned| {
@@ -2713,7 +2713,7 @@ fn clean_item(
         &git_carry::converge::Target<'_>,
         &git_carry::converge::Landing<'_>,
     ),
-    (state, identity, suffix, place_derived): (&Path, &str, &str, bool),
+    (state, identity, suffix): (&Path, &str, &str),
 ) -> Result<Option<(&'static str, git_carry::converge::Applied)>> {
     let words = refs_in(
         item,
@@ -2727,8 +2727,7 @@ fn clean_item(
         return Ok(None);
     }
     let record = files_record_path(state, landing.item, target.source);
-    let mut applied =
-        git_carry::converge::clean::land(clean, target, landing, (&record, suffix, place_derived))?;
+    let mut applied = git_carry::converge::clean::land(clean, target, landing, (&record, suffix))?;
     applied.custody = Some(match applied.custody.take() {
         Some(more) => format!("{more} {words}"),
         None => words,
@@ -2783,8 +2782,14 @@ pub fn files_record_path(state: &Path, identity: &str, source: &str) -> PathBuf 
 pub struct FilesSummary {
     /// The tracked files and links the source's HEAD holds (in by ref).
     pub tracked: u64,
-    /// How the untracked and ignored entries ended.
+    /// How the untracked and ignored entries ended (derived output
+    /// ledgered as rebuildable, operator ruling 2026-10-20).
     pub tally: git_carry::converge::files::Tally,
+    /// The item's hand-off note for this capture, when `estate-handoff`
+    /// recorded one (its live checkout is the destination's own: no block
+    /// is written there): the note and how many files it names landed
+    /// beside.
+    pub handoff_note: Option<(String, u64)>,
 }
 
 // The `.files` summary of `identity`'s current capture (`capture`,
@@ -2811,9 +2816,23 @@ fn files_summary(
     Some(if record.undone {
         Err("files-undone")
     } else if record.item == identity && current && record.done && record.occupied.is_empty() {
+        let handoff_note = states
+            .iter()
+            .rev()
+            .map(|state| handoff::note_path(state, identity, source))
+            .find(|path| path.is_file())
+            .and_then(|path| handoff::read_note(&path).ok().flatten())
+            .filter(|note| note.item == identity && note.capture == record.capture)
+            .map(|note| {
+                (
+                    note.note,
+                    u64::try_from(note.besides.len()).unwrap_or(u64::MAX),
+                )
+            });
         Ok(FilesSummary {
             tracked: record.tracked,
             tally: record.tally,
+            handoff_note,
         })
     } else {
         Err("files-record-mismatch")
@@ -4293,11 +4312,6 @@ pub struct ApplyOptions {
     /// After an advance, the item's beside landing is retired once proved
     /// equal to the live tree ([`git_carry::beside::retire`]).
     pub advance_ancestor: bool,
-    /// `--place-derived`: a clean source's derived untracked or ignored
-    /// entries (build output and the like, [`git_carry::converge::files::class_of`])
-    /// are written as any entry; without it they are held, counted and
-    /// listed, until the operator rules on build output.
-    pub place_derived: bool,
 }
 
 /// Apply explicit restores only; common Git administration is serialized.
@@ -4714,7 +4728,10 @@ pub use diff::{diff, DiffOptions, Summary as DiffSummary, SCHEMA as DIFF_SCHEMA}
 
 // `estate-handoff` (TIN-6569, OI-1003-Q183).
 mod handoff;
-pub use handoff::{handoff, HandoffMode, HandoffOptions, HandoffSummary, SCHEMA as HANDOFF_SCHEMA};
+pub use handoff::{
+    handoff, note_path as handoff_note_path, read_note as read_handoff_note, HandoffMode,
+    HandoffNote, HandoffOptions, HandoffSummary, NOTE_REFS_IN, SCHEMA as HANDOFF_SCHEMA,
+};
 mod retarget;
 pub use retarget::{mapped as retarget_mapped, retarget, Moved as Retargeted};
 

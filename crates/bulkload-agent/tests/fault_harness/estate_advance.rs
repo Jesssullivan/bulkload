@@ -315,7 +315,6 @@ fn options(advance: bool) -> ApplyOptions {
         side_roots: Vec::new(),
         refs_in: true,
         advance_ancestor: advance,
-        place_derived: false,
     }
 }
 

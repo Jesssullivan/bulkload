@@ -37,6 +37,20 @@
 //!   change and its HEAD came in by ref, so no tree landed beside; its
 //!   untracked and ignored files were placed, adopted or landed beside one
 //!   by one, every one counted (the row's `files` block, with `refs_in`).
+//!   Derived output was never written: each entry is ledgered as
+//!   rebuildable in the `.files` record and counted (`files.rebuildable`,
+//!   `files.rebuildable_bytes`; operator ruling 2026-10-20). The row's
+//!   `handoff_note` is the note `estate-handoff` recorded in STATE in place
+//!   of a block (the live checkout is the destination's own), or `null`.
+//!
+//! Beside-tree retirements (`estate-beside-retire --delete`) join the
+//! report from any `PRIVATE_STATE` that holds their ledger records
+//! ([`Report::join_retirements`]): a top-level `beside_retirements` block,
+//! after `omissions` and only when a record is there (`records`,
+//! `retired`, `removing`, `kept`, `entries`, `placed`, `beside`,
+//! `rebuildable`, `rebuildable_bytes`, `refs`, `reflog_refs`, `bytes`, one
+//! row per record). Like the omissions, it is accounted custody outside
+//! `planned`, every disposition and the gate.
 //! - `referenced-only`: the item plans no workspace, its outcome is
 //!   `RefsImported` (or `PreviousRefCustodyNotWorkspaceParity`, or
 //!   `IndexRepaired` from `git-repair-missing-index` with a state directory,
@@ -610,6 +624,46 @@ pub struct Report {
     /// The rebuildable roots the planned items' current captures omitted
     /// (#226 item 5, v4).
     pub omissions: Omissions,
+    /// The beside-tree retirements the state directories record, when any
+    /// do ([`Report::join_retirements`]).
+    pub retirements: Option<Retirements>,
+}
+
+/// The beside-tree retirements the state directories record.
+///
+/// Operator rulings 2026-10-16 21:24Z and 2026-10-20, "Ledger as
+/// rebuildable": each `estate-beside-retire` ledger record, what became of
+/// its tree, and what went with it. Accounted custody outside `planned`,
+/// every disposition and the gate, as the omissions are.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Retirements {
+    pub rows: Vec<Retirement>,
+}
+
+/// One retirement's ledger record.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Retirement {
+    /// The record's file name in its state directory.
+    pub record: String,
+    pub path: Vec<u8>,
+    pub live: Vec<u8>,
+    pub shape: String,
+    /// `retired` (the tree is gone), `removing` (its removal began; a rerun
+    /// finishes it) or `kept` (ledgered, then kept: raced or refused).
+    pub state: &'static str,
+    /// Its untracked and ignored entries, every one counted: placed,
+    /// landed beside, already there, rebuildable.
+    pub entries: u64,
+    pub placed: u64,
+    pub beside: u64,
+    /// Derived entries ledgered as rebuildable (each with its BLAKE3), and
+    /// their bytes.
+    pub rebuildable: u64,
+    pub rebuildable_bytes: u64,
+    /// Refs it created under the namespace, and reflog refs.
+    pub refs: u64,
+    pub reflog_refs: u64,
+    pub bytes: u64,
 }
 
 /// The rebuildable roots the planned items' current captures omitted (#226
@@ -650,6 +704,55 @@ impl Omissions {
     }
 }
 
+impl Retirements {
+    fn total(&self, of: impl Fn(&Retirement) -> u64) -> u64 {
+        self.rows
+            .iter()
+            .fold(0u64, |total, row| total.saturating_add(of(row)))
+    }
+
+    fn write_json(&self, out: &mut String) {
+        let count = |state: &str| self.rows.iter().filter(|row| row.state == state).count();
+        let _ = write!(
+            out,
+            ",\"beside_retirements\":{{\"records\":{},\"retired\":{},\"removing\":{},\"kept\":{},\"entries\":{},\"placed\":{},\"beside\":{},\"rebuildable\":{},\"rebuildable_bytes\":{},\"refs\":{},\"reflog_refs\":{},\"bytes\":{},\"rows\":[",
+            self.rows.len(),
+            count("retired"),
+            count("removing"),
+            count("kept"),
+            self.total(|row| row.entries),
+            self.total(|row| row.placed),
+            self.total(|row| row.beside),
+            self.total(|row| row.rebuildable),
+            self.total(|row| row.rebuildable_bytes),
+            self.total(|row| row.refs),
+            self.total(|row| row.reflog_refs),
+            self.total(|row| row.bytes),
+        );
+        for (index, row) in self.rows.iter().enumerate() {
+            let _ = write!(
+                out,
+                "{}{{\"record\":{},\"path\":{},\"live\":{},\"shape\":{},\"state\":\"{}\",\"entries\":{},\"placed\":{},\"beside\":{},\"rebuildable\":{},\"rebuildable_bytes\":{},\"refs\":{},\"reflog_refs\":{},\"bytes\":{}}}",
+                if index == 0 { "" } else { "," },
+                json_string(&row.record),
+                json_string(&row.path.escape_ascii().to_string()),
+                json_string(&row.live.escape_ascii().to_string()),
+                json_string(&row.shape),
+                row.state,
+                row.entries,
+                row.placed,
+                row.beside,
+                row.rebuildable,
+                row.rebuildable_bytes,
+                row.refs,
+                row.reflog_refs,
+                row.bytes,
+            );
+        }
+        out.push_str("]}");
+    }
+}
+
 /// What a joined transfer manifest bound the report to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestJoined {
@@ -661,6 +764,66 @@ pub struct ManifestJoined {
 }
 
 impl Report {
+    /// Join the beside-tree retirements `states` record (every
+    /// `beside-retire-*.retired` record, once by name): a block only when
+    /// one does.
+    ///
+    /// # Errors
+    /// Whatever reading a state directory or a record refuses.
+    pub fn join_retirements(&mut self, states: &[PathBuf]) -> Result<()> {
+        use crate::git_carry::beside::subset::RetiredRecord;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut rows = Vec::new();
+        for state in states {
+            let Ok(entries) = std::fs::read_dir(state) else {
+                continue;
+            };
+            let mut names: Vec<(String, PathBuf)> = Vec::new();
+            for entry in entries {
+                let entry = entry.refuse_at("closure::retirements")?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("beside-retire-") && name.ends_with(".retired") {
+                    names.push((name, entry.path()));
+                }
+            }
+            names.sort();
+            for (name, path) in names {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                let Some(record) = crate::git_carry::landed::read::<RetiredRecord>(&path)? else {
+                    continue;
+                };
+                let tally = &record.tally;
+                rows.push(Retirement {
+                    record: name,
+                    path: record.path.clone(),
+                    live: record.live.clone(),
+                    shape: record.shape.clone(),
+                    state: if record.retired {
+                        "retired"
+                    } else if record.deleting {
+                        "removing"
+                    } else {
+                        "kept"
+                    },
+                    entries: tally.entries(),
+                    placed: tally.placed + tally.dirs_placed,
+                    beside: tally.beside + tally.dirs_beside,
+                    rebuildable: u64::try_from(record.rebuildable.len()).unwrap_or(u64::MAX),
+                    rebuildable_bytes: record.rebuildable.iter().map(|entry| entry.size).sum(),
+                    refs: u64::try_from(record.refs.len()).unwrap_or(u64::MAX),
+                    reflog_refs: u64::try_from(record.reflogs.len()).unwrap_or(u64::MAX),
+                    bytes: record.bytes,
+                });
+            }
+        }
+        if !rows.is_empty() {
+            self.retirements = Some(Retirements { rows });
+        }
+        Ok(())
+    }
+
     /// Build the report from a ledger.
     #[must_use]
     pub fn from_ledger(ledger: &Ledger) -> Self {
@@ -1222,7 +1385,7 @@ impl Report {
                 let tally = &files.tally;
                 let _ = write!(
                     out,
-                    ",\"files\":{{\"tracked\":{},\"placed\":{},\"adopted\":{},\"beside\":{},\"beside_present\":{},\"dirs_placed\":{},\"dirs_adopted\":{},\"dirs_beside\":{},\"bytes_placed\":{}}}",
+                    ",\"files\":{{\"tracked\":{},\"placed\":{},\"adopted\":{},\"beside\":{},\"beside_present\":{},\"dirs_placed\":{},\"dirs_adopted\":{},\"dirs_beside\":{},\"bytes_placed\":{},\"rebuildable\":{},\"rebuildable_bytes\":{}}}",
                     files.tracked,
                     tally.placed,
                     tally.adopted,
@@ -1232,7 +1395,22 @@ impl Report {
                     tally.dirs_adopted,
                     tally.dirs_beside,
                     tally.bytes,
+                    tally.rebuildable,
+                    tally.rebuildable_bytes,
                 );
+                // The hand-off facts `estate-handoff` recorded in STATE in
+                // place of a block (the live checkout is the destination's
+                // own), or `null` before it ran.
+                match &files.handoff_note {
+                    Some((note, besides)) => {
+                        let _ = write!(
+                            out,
+                            ",\"handoff_note\":{{\"note\":{},\"besides\":{besides}}}",
+                            json_string(note),
+                        );
+                    }
+                    None => out.push_str(",\"handoff_note\":null"),
+                }
                 if let Some(refs) = &row.refs_in {
                     let _ = write!(
                         out,
@@ -1330,6 +1508,9 @@ impl Report {
             out.push_str(&json_string(item));
         }
         out.push_str("]}");
+        if let Some(retirements) = &self.retirements {
+            retirements.write_json(&mut out);
+        }
         if let Some(joined) = &self.transfer_manifest {
             let _ = write!(
                 out,
@@ -2451,6 +2632,7 @@ mod tests {
         let summary = crate::estate::FilesSummary {
             tracked: 3,
             tally: crate::git_carry::converge::files::Tally::default(),
+            handoff_note: None,
         };
         let refs = crate::estate::RefsInSummary {
             ns: "neo-20261016".to_owned(),

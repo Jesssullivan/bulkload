@@ -9,18 +9,36 @@
 //! `estate-apply` does, so it never runs beside an apply; `--check` and
 //! `--dry-run` write nothing, at the destination or in STATE. The source
 //! is never read.
+//!
+//! An item whose outcome is `workspace-refs-in` (operator ruling
+//! 2026-10-16 21:24Z: a clean source's refs in, no tree beside) has no
+//! landed workspace: its live checkout is the destination's own, and no
+//! block is ever written into its tracked `AGENTS.md` or `CLAUDE.md` (the
+//! coordinator, 2026-10-20). The hand-off facts are recorded in STATE
+//! instead, a typed note ([`HandoffNote`], `refs-in-live-checkout`,
+//! `{item}-{blake3(SOURCE)}.handoff-note`): the capture, the live
+//! checkout, the source path, the refs its refs-in created and kept, its
+//! file reconcile's count and each file landed beside. Its line's outcome
+//! is `noted` (`unchanged` when the note already says so; `planned` on a
+//! dry run, `checked` on a check, `cleared` by a clear, which removes the
+//! note), and closure prints the note on the item's row.
 
 use std::fs;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use super::{
-    exclusive, filename, hash_file, id, private_directory, read, retained_omissions, Capture, Plan,
+    exclusive, filename, files_record_path, hash_file, id, private_directory, read,
+    refs_in_record_path, retained_omissions, Capture, Plan,
 };
 use crate::closure::json_string;
+use crate::git_carry::converge::files::Tally;
 use crate::git_carry::converge::handoff::{
     self, render::shown, Estate, Mode, Omitted, Planned, Request, Row, Session, Workspace,
 };
+use crate::git_carry::landed;
 use crate::{BulkloadRefusal, Result};
 
 pub use handoff::SCHEMA;
@@ -66,6 +84,9 @@ pub struct HandoffOptions {
 pub struct HandoffSummary {
     pub workspaces: u64,
     pub written: u64,
+    /// Refs-in items whose hand-off facts were recorded in STATE as a
+    /// note, nothing written at the destination.
+    pub noted: u64,
     pub unchanged: u64,
     pub cleared: u64,
     pub planned: u64,
@@ -164,6 +185,198 @@ fn planned(plan: &Plan, corpus: &Path, state: &Path) -> Result<Vec<Planned>> {
         });
     }
     Ok(items)
+}
+
+/// The note of a refs-in item's hand-off: its live checkout is the
+/// destination's own, so no block is written there.
+pub const NOTE_REFS_IN: &str = "refs-in-live-checkout";
+
+/// What a refs-in item's hand-off records in STATE instead of a block
+/// (module docs): `{item}-{blake3(SOURCE)}.handoff-note`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffNote {
+    /// `estate::id` of the item.
+    pub item: String,
+    /// Why no block was written ([`NOTE_REFS_IN`]).
+    pub note: String,
+    /// The capture whose facts these are.
+    pub capture: [u8; 32],
+    /// The live checkout, and the source path it was captured from.
+    pub workspace: Vec<u8>,
+    pub source_path: Vec<u8>,
+    /// The SOURCE label and PLAN.
+    pub source: String,
+    pub plan: Vec<u8>,
+    /// The namespace its refs-in used, the refs it created (`(name, oid)`)
+    /// and the ones it kept at another value (`(name, existing, carried)`).
+    pub ns: String,
+    pub refs_created: Vec<(String, String)>,
+    pub refs_kept: Vec<(String, String, String)>,
+    /// How its untracked and ignored entries ended (derived output
+    /// ledgered as rebuildable), and each file landed beside as
+    /// `(source path, landed path)`.
+    pub tally: Tally,
+    pub besides: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Unix nanoseconds the note was recorded (`--as-of` when given).
+    pub at_ns: i128,
+}
+
+impl landed::Record for HandoffNote {
+    const MAGIC: &'static [u8; 16] = b"bulkload-hnote-1";
+}
+
+/// Where an item's hand-off note is in `state`.
+#[must_use]
+pub fn note_path(state: &Path, identity: &str, source: &str) -> PathBuf {
+    state.join(format!(
+        "{identity}-{}.handoff-note",
+        blake3::hash(source.as_bytes()).to_hex()
+    ))
+}
+
+/// The hand-off note at `path`, if any.
+///
+/// # Errors
+/// IO; a note that does not decode.
+pub fn read_note(path: &Path) -> Result<Option<HandoffNote>> {
+    landed::read::<HandoffNote>(path)
+}
+
+// Whether `identity`'s outcome record in `state` says its refs came in
+// with no tree beside (`workspace-refs-in`, or a re-apply's).
+fn refs_in_item(state: &Path, identity: &str) -> bool {
+    crate::outcome::read_record(&state.join(format!("{identity}.outcome"))).is_ok_and(|record| {
+        matches!(
+            record.outcome,
+            crate::outcome::Outcome::WorkspaceRefsIn
+                | crate::outcome::Outcome::PreviousWorkspaceRefsInNotRevalidated
+        )
+    })
+}
+
+// The note a refs-in item's hand-off records, from its records in STATE:
+// `HANDOFF_NOT_LANDED` when its refs-in or file record is missing or names
+// another capture.
+fn note_of(
+    (identity, workspace, source_path): (&str, &Path, &Path),
+    (plan, state, source): (&Path, &Path, &str),
+    current: Option<&[u8; 32]>,
+    at_ns: i128,
+) -> Result<HandoffNote> {
+    let capture = *current.ok_or(BulkloadRefusal::HandoffNotLanded)?;
+    let refs =
+        crate::git_carry::beside::read_refs_in(&refs_in_record_path(state, identity, source))?
+            .filter(|refs| refs.item == identity && refs.capture == capture)
+            .ok_or(BulkloadRefusal::HandoffNotLanded)?;
+    let files = crate::git_carry::converge::files::read_record(&files_record_path(
+        state, identity, source,
+    ))?
+    .filter(|files| files.item == identity && files.capture == capture && files.done)
+    .ok_or(BulkloadRefusal::HandoffNotLanded)?;
+    Ok(HandoffNote {
+        item: identity.to_owned(),
+        note: NOTE_REFS_IN.to_owned(),
+        capture,
+        workspace: canonical(workspace).as_os_str().as_bytes().to_vec(),
+        source_path: source_path.as_os_str().as_bytes().to_vec(),
+        source: source.to_owned(),
+        plan: plan.as_os_str().as_bytes().to_vec(),
+        ns: refs.ns,
+        refs_created: refs.created,
+        refs_kept: refs.kept,
+        tally: files.tally,
+        besides: files.besides,
+        at_ns,
+    })
+}
+
+// A refs-in item's hand-off (module docs): the note recorded in STATE
+// (render), removed (clear), or only read; the outcome word.
+fn note(
+    path: &Path,
+    mode: Mode,
+    wanted: impl FnOnce() -> Result<HandoffNote>,
+) -> Result<(&'static str, Option<HandoffNote>)> {
+    let held = read_note(path)?;
+    match mode {
+        Mode::Clear => {
+            if held.is_none() {
+                return Ok(("unchanged", None));
+            }
+            fs::remove_file(path).map_err(|error| crate::refuse::io(&error, "estate::handoff"))?;
+            if let Some(parent) = path.parent() {
+                landed::sync_dir(parent)?;
+            }
+            Ok(("cleared", None))
+        }
+        Mode::Check => Ok(("checked", held)),
+        Mode::DryRun => Ok(("planned", Some(wanted()?))),
+        Mode::Render => {
+            let wanted = wanted()?;
+            let same = held.as_ref().is_some_and(|held| {
+                HandoffNote {
+                    at_ns: wanted.at_ns,
+                    ..held.clone()
+                } == wanted
+            });
+            if same {
+                return Ok(("unchanged", held));
+            }
+            landed::write(path, &wanted)?;
+            Ok(("noted", Some(wanted)))
+        }
+    }
+}
+
+fn note_line(
+    (item, workspace, mode): (&str, &Path, &str),
+    result: &Result<(&'static str, Option<HandoffNote>)>,
+) -> String {
+    use std::fmt::Write as _;
+    let mut text = format!(
+        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"workspace\",\"item\":{},\"workspace\":{},\"mode\":\"{mode}\",\"note\":\"{NOTE_REFS_IN}\"",
+        json_string(item),
+        json_string(&shown(workspace.as_os_str().as_bytes())),
+    );
+    match result {
+        Err(refusal) => {
+            let _ = write!(
+                text,
+                ",\"outcome\":\"refused\",\"refusal\":{}",
+                json_string(refusal.code())
+            );
+        }
+        Ok((outcome, held)) => {
+            let _ = write!(
+                text,
+                ",\"outcome\":\"{outcome}\",\"written_at_destination\":false"
+            );
+            if let Some(held) = held {
+                let _ = write!(
+                    text,
+                    ",\"capture\":{},\"ns\":{},\"refs_created\":{},\"refs_kept\":{},\"files_placed\":{},\"files_beside\":{},\"rebuildable\":{},\"besides\":[",
+                    json_string(&hex(held.capture.get(..8).unwrap_or_default())),
+                    json_string(&held.ns),
+                    held.refs_created.len(),
+                    held.refs_kept.len(),
+                    held.tally.placed,
+                    held.tally.beside,
+                    held.tally.rebuildable,
+                );
+                for (index, (_, landed)) in held.besides.iter().enumerate() {
+                    let _ = write!(
+                        text,
+                        "{}{}",
+                        if index == 0 { "" } else { "," },
+                        json_string(&shown(landed))
+                    );
+                }
+                text.push(']');
+            }
+        }
+    }
+    text.push('}');
+    text
 }
 
 fn line_of(item: &str, workspace: &Path, mode: &str, result: &Result<Row>) -> String {
@@ -307,6 +520,37 @@ pub fn handoff(
         if !wanted.is_empty() && !wanted.contains(&canonical(workspace)) {
             continue;
         }
+        // A refs-in item's live checkout is the destination's own: its
+        // hand-off facts go in STATE as a note, never a block there.
+        if refs_in_item(state, &identity) {
+            let current = items
+                .iter()
+                .find(|planned| planned.id == identity)
+                .and_then(|planned| planned.current);
+            let at_ns = options.as_of.unwrap_or_else(now_ns);
+            let result = note(&note_path(state, &identity, source), mode, || {
+                note_of(
+                    (&identity, workspace, &item.source),
+                    (plan, state, source),
+                    current.as_ref(),
+                    at_ns,
+                )
+            });
+            summary.workspaces += 1;
+            match &result {
+                Ok(("noted", _)) => summary.noted += 1,
+                Ok(("cleared", _)) => summary.cleared += 1,
+                Ok(("planned", _)) => summary.planned += 1,
+                Ok(("checked", _)) => summary.checked += 1,
+                Ok(_) => summary.unchanged += 1,
+                Err(refusal) => {
+                    summary.refused += 1;
+                    first.get_or_insert_with(|| refusal.clone());
+                }
+            }
+            line(&note_line((&identity, workspace, mode_name), &result))?;
+            continue;
+        }
         let result = handoff::run(
             &Workspace {
                 item: &identity,
@@ -340,9 +584,10 @@ pub fn handoff(
         line(&line_of(&identity, workspace, mode_name, &result))?;
     }
     line(&format!(
-        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"summary\",\"mode\":\"{mode_name}\",\"workspaces\":{},\"written\":{},\"unchanged\":{},\"cleared\":{},\"planned\":{},\"checked\":{},\"refused\":{},\"open\":{open_total}}}",
+        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"summary\",\"mode\":\"{mode_name}\",\"workspaces\":{},\"written\":{},\"noted\":{},\"unchanged\":{},\"cleared\":{},\"planned\":{},\"checked\":{},\"refused\":{},\"open\":{open_total}}}",
         summary.workspaces,
         summary.written,
+        summary.noted,
         summary.unchanged,
         summary.cleared,
         summary.planned,
@@ -367,6 +612,11 @@ pub(super) fn after_apply(
     item: &super::Item,
 ) -> Option<String> {
     let workspace = item.workspace.as_deref()?;
+    // A refs-in item's live checkout is the destination's own: the H step
+    // never writes a block there (estate-handoff records its note).
+    if id(item).is_ok_and(|identity| refs_in_item(state, &identity)) {
+        return None;
+    }
     let stored = match handoff::recorded_options(workspace, source) {
         Ok(Some(stored)) => stored,
         Ok(None) => return None,
@@ -444,4 +694,12 @@ pub(super) fn after_levels(
         }
     }
     Ok(())
+}
+
+fn now_ns() -> i128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i128::try_from(since.as_nanos()).unwrap_or(i128::MAX)
+        })
 }

@@ -186,11 +186,17 @@ SUBCOMMANDS:
                 The live checkout's HEAD, index, tracked files, branches and
                 info/exclude are never touched. Derived output (build/,
                 dist/, .svelte-kit/, .artifacts/, bazel-*, mktemp-named
-                directories, .serena/, rebuildable roots) is held (counted,
-                listed, never written) unless --place-derived; a refs-in
+                directories, .serena/, rebuildable roots; a directory with
+                tracked files under it is source) is never written: each
+                entry ledgered as rebuildable (path, kind, mode, size,
+                BLAKE3 or link target) in ITEM-SOURCE.files and counted
+                (files-rebuildable=N; operator ruling 2026-10-20). A refs-in
                 that kept a namespace ref leaves the item pending review
                 (GIT_DESTINATION_OCCUPIED); estate-placements lists or undoes
-                every placement.
+                every placement. estate-handoff never writes a block into a
+                refs-in item's live checkout: it records the hand-off facts
+                in PRIVATE_STATE (ITEM-SOURCE.handoff-note, outcome noted),
+                and closure prints them on the item's row.
                 --advance-ancestor (operator ruling 2026-10-19, 'Yes, advance
                 those'; needs --adopt and --beside): a live checkout bulkload
                 did not land that differs from the capture is advanced in
@@ -371,7 +377,13 @@ SUBCOMMANDS:
                 URL is read for it or printed. A symlink other than one target
                 to another refuses HANDOFF_TARGET_UNSUPPORTED; an edited block of
                 this landing's HANDOFF_BLOCK_MODIFIED; an unlanded item
-                HANDOFF_NOT_LANDED; all with nothing written. A block another
+                HANDOFF_NOT_LANDED; all with nothing written. A refs-in item
+                (workspace-refs-in: its live checkout is the destination's
+                own) gets no block there: its hand-off facts (capture, refs
+                created and kept, file counts, files landed beside) are
+                recorded in PRIVATE_STATE as a note (ITEM-SOURCE.handoff-note,
+                outcome noted; --clear removes it), which closure prints on
+                the item's row; the H step leaves it alone. A block another
                 landing rendered, or one of this landing's that the target's
                 landed blob itself starts with (a round trip; each carried with
                 the source's bytes, whatever is written below it since) is
@@ -428,7 +440,7 @@ SUBCOMMANDS:
                 CAPTURE_ABSENT back (and for refs-only items riding on it).
                 --dry-run reads only and prints what each item would do.
                 One line per item
-    estate-beside-retire [--delete] [--drop-rebuildable] [--place-derived] [--scan ROOT]... [--depth N] SUFFIX SOURCE PRIVATE_STATE [BESIDE ...]
+    estate-beside-retire [--delete] [--scan ROOT]... [--depth N] SUFFIX SOURCE PRIVATE_STATE [BESIDE ...]
                 Operator ruling 2026-10-16 21:24Z: prove each beside tree
                 (each BESIDE, and every directory named *SUFFIX whose live
                 path exists under a --scan ROOT, to --depth levels, default
@@ -442,22 +454,28 @@ SUBCOMMANDS:
                 branches and tags held there by name, natively or under
                 refs/NS/, else created there create-only), and every
                 untracked or ignored entry present and equal in the live
-                checkout or landable there as a file-level beside (derived
-                output only with --place-derived, else derived-held:PATH;
-                only a tree bulkload landed, else not-bulkload-landed; a
-                process inside it refuses in-use; reflog-only commits are
-                carried in under refs/NS/reflog/, never dropped)
-                (FILE+SUFFIX); a rebuildable root (target/, node_modules/,
-                ...) refuses rebuildable:PATH unless --drop-rebuildable
-                (counted, dropped with the tree, as a capture omits it).
+                checkout or landable there as a file-level beside
+                (FILE+SUFFIX; only a tree bulkload landed, else
+                not-bulkload-landed; a process inside it refuses in-use;
+                reflog-only commits are carried in under refs/NS/reflog/,
+                never dropped). Derived output (build/, dist/,
+                .svelte-kit/, .artifacts/, bazel-*, mktemp-named
+                directories, .serena/, rebuildable roots such as target/
+                and node_modules/; a directory with tracked files under it
+                is source) is never placed or compared: each entry is
+                ledgered as rebuildable (path, kind, mode, size, BLAKE3 or
+                link target) and goes with the tree (operator ruling
+                2026-10-20, 'Ledger as rebuildable').
                 One line per tree: verdict=retirable with the counts and
                 bytes, or verdict=refused reason=... (typed; nothing
                 written), then a summary. Report only: nothing is written.
                 --delete: each retirable tree's entries are reconciled into
                 the live checkout and its refs created, it is proved again,
                 ledgered in PRIVATE_STATE (beside-retire-TAG-NS.retired: path,
-                live path, HEAD, counts, refs, bytes, a standalone tree's
-                config and info/exclude) and removed crash-safely (renamed
+                live path, HEAD, counts, refs, bytes, every rebuildable
+                entry, a standalone tree's config and info/exclude; closure-
+                report over that PRIVATE_STATE counts them in its
+                beside_retirements block) and removed crash-safely (renamed
                 aside, re-proved by prints, its administration and tree
                 deleted); outcome=retired, or outcome=kept reason=... A
                 rerun finishes a removal a crash cut short.
@@ -491,7 +509,10 @@ SUBCOMMANDS:
                 reads each capture's .omissions sidecar; a capture from
                 before it is read from its bundle's header (no omission ref:
                 zero roots), and why an item stays unknown is printed on
-                stderr (omissions-unknown REASON=N ...).
+                stderr (omissions-unknown REASON=N ...). A PRIVATE_STATE
+                holding estate-beside-retire ledger records adds a
+                beside_retirements block (retired, removing, kept, entries,
+                rebuildable and their bytes, refs), outside the gate.
                 Options, only before PLAN, each at most once:
                 --omissions-from-destination: for a capture from before the
                 sidecar whose bundle names an omission list, read that list
@@ -1278,6 +1299,7 @@ fn closure_command(args: &[std::ffi::OsString]) -> Result<()> {
         read_destinations,
     )?;
     let mut report = bulkload_agent::closure::Report::from_ledger(&ledger);
+    report.join_retirements(&states)?;
     join_transfer_inputs(
         &mut report,
         &transfers,
@@ -1884,7 +1906,6 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
                         beside: options.beside,
                         refs_in: options.refs_in,
                         advance_ancestor: options.advance_ancestor,
-                        place_derived: options.place_derived,
                     },
                 ),
                 &receipt,
@@ -2331,7 +2352,6 @@ struct EstateOptions {
     beside: Option<String>,
     refs_in: bool,
     advance_ancestor: bool,
-    place_derived: bool,
     activate_origin: Vec<String>,
     since: Option<i128>,
     scan: Vec<PathBuf>,
@@ -2358,10 +2378,6 @@ fn estate_options(args: &[std::ffi::OsString]) -> Result<(EstateOptions, &[std::
             }
             "--advance-ancestor" if !options.advance_ancestor => {
                 options.advance_ancestor = true;
-                at += 1;
-            }
-            "--place-derived" if !options.place_derived => {
-                options.place_derived = true;
                 at += 1;
             }
             "--beside" if options.beside.is_none() => {
@@ -2619,14 +2635,6 @@ fn beside_retire_command(args: &[std::ffi::OsString]) -> Result<()> {
         match arg {
             "--delete" if !options.delete => {
                 options.delete = true;
-                at += 1;
-            }
-            "--drop-rebuildable" if !options.drop_rebuildable => {
-                options.drop_rebuildable = true;
-                at += 1;
-            }
-            "--place-derived" if !options.place_derived => {
-                options.place_derived = true;
                 at += 1;
             }
             "--scan" => {
