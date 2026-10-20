@@ -22,9 +22,25 @@
 //!   `GIT_ADVANCE_NOT_ANCESTOR`, lands beside, closure pending review until
 //!   closure-dispose; an unchanged rerun proves nothing again.
 //! - A4 to A6: a dirty live checkout (`GIT_ADVANCE_NOT_CLEAN`), its branch
-//!   checked out elsewhere (`GIT_ADVANCE_BRANCH_BUSY`), another branch
-//!   name (`GIT_ADVANCE_BRANCH_MISMATCH`): each lands beside, the live
+//!   checked out elsewhere (`GIT_ADVANCE_BRANCH_BUSY`), a detached capture
+//!   (`GIT_ADVANCE_BRANCH_MISMATCH`): each lands beside, the live
 //!   checkout untouched.
+//! - A12 (review of #289, finding 1): a Git lock held at the live checkout
+//!   (`index.lock`, `HEAD.lock`) refuses `GIT_ADVANCE_NOT_CLEAN`, nothing
+//!   moved, the lock as it was.
+//! - S1 and S2 (operator ruling 2026-10-19, "Switch when clean"): the
+//!   capture on another branch than the clean live checkout's switches it
+//!   (the capture's branch created at the captured HEAD, the live branch
+//!   left where it was, the beside landing retired); a dirty checkout, or
+//!   a process inside it, refuses `GIT_SWITCH_*` and lands beside.
+//! - R1 and R2 (findings 2 and 5): a process inside the beside landing
+//!   keeps it (`in-use`, tried again once it is gone); a standalone beside
+//!   checkout's configuration entries and exclude patterns the live
+//!   repository lacks go in create-only, then it is retired; one whose key
+//!   the live configuration holds with another value is kept
+//!   (`configuration:<key>`).
+//! - A13 (C19): a process inside the live checkout refuses the advance
+//!   `GIT_ADVANCE_IN_USE`, no beside written; the next pass advances.
 //! - A7: ignored files present: kept; a captured ignored file of another
 //!   content at the same path lands as a file-level beside `<path>SUFFIX`
 //!   and the beside tree is still retired (the coordinator's decision).
@@ -102,11 +118,18 @@ struct Ran {
 }
 
 fn agent(args: &[OsString]) -> Ran {
-    let out = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
-        .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .output()
-        .unwrap();
+    agent_with(args, &[])
+}
+
+// `agent` with more environment (a HOME whose global Git configuration the
+// effective-configuration check reads, R2).
+fn agent_with(args: &[OsString], env: &[(&str, &Path)]) -> Ran {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"));
+    command.args(args).env("GIT_CONFIG_GLOBAL", "/dev/null");
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let out = command.output().unwrap();
     Ran {
         ok: out.status.success(),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -303,6 +326,24 @@ impl World {
         self.apply(&flags)
     }
 
+    /// `advance` with `HOME` (and `XDG_CONFIG_HOME` under it) at `home`.
+    fn advance_home(&self, home: &Path) -> Ran {
+        let mut list: Vec<OsString> = vec!["estate-apply".into()];
+        list.extend(FLAGS.iter().map(OsString::from));
+        list.push("--advance-ancestor".into());
+        list.extend(os(&[
+            &self.plan(),
+            &self.corpus(),
+            &self.state(),
+            &SOURCE,
+            &"1",
+        ]));
+        agent_with(
+            &list,
+            &[("HOME", home), ("XDG_CONFIG_HOME", &home.join(".config"))],
+        )
+    }
+
     fn diff(&self, extra: &[&str]) -> Ran {
         let mut list: Vec<OsString> = vec!["estate-diff".into()];
         list.extend(extra.iter().map(OsString::from));
@@ -392,6 +433,8 @@ impl Own {
         let sting = world.sting();
         let mut refs = own_refs(&sting);
         refs.remove("refs/heads/main");
+        // A switch's: created at neo's HEAD (S1).
+        refs.remove("refs/heads/feature");
         Self {
             stash: git(&sting, &["stash", "list", "--format=%H %gs"]),
             refs,
@@ -650,7 +693,7 @@ fn a4_a6_each_precondition_refuses_typed_and_lands_beside() {
         ("unstaged", "GIT_ADVANCE_NOT_CLEAN"),
         ("staged", "GIT_ADVANCE_NOT_CLEAN"),
         ("busy", "GIT_ADVANCE_BRANCH_BUSY"),
-        ("mismatch", "GIT_ADVANCE_BRANCH_MISMATCH"),
+        ("detached", "GIT_ADVANCE_BRANCH_MISMATCH"),
     ] {
         let world = World::new();
         let sting = world.sting();
@@ -674,7 +717,7 @@ fn a4_a6_each_precondition_refuses_typed_and_lands_beside() {
                 );
             }
             _ => {
-                git(&world.neo(), &["switch", "--quiet", "-c", "feature"]);
+                git(&world.neo(), &["switch", "--quiet", "--detach"]);
             }
         }
         world.capture();
@@ -903,4 +946,372 @@ fn the_flag_needs_adopt_and_beside() {
             ran.stderr
         );
     }
+}
+
+/// A12 (review of #289, finding 1): a Git lock another command holds at
+/// the live checkout is an operation in progress: refused typed, landed
+/// beside, nothing moved, the lock as it was.
+#[test]
+fn a12_a_held_git_lock_refuses_the_advance_with_nothing_moved() {
+    for lock in ["index.lock", "HEAD.lock"] {
+        let world = World::new();
+        let sting = world.sting();
+        world.capture();
+        fs::write(sting.join(".git").join(lock), b"another command's lock").unwrap();
+        let head = git(&sting, &["rev-parse", "HEAD"]);
+        let ran = world.advance();
+        assert!(ran.ok, "{lock}: {}\n{}", ran.stdout, ran.stderr);
+        let (outcome, reason) = receipt(&ran.stdout);
+        assert_eq!(outcome, "workspace-beside", "{lock}: {reason}");
+        assert!(
+            word(&reason, "advance-refused=GIT_ADVANCE_NOT_CLEAN"),
+            "{lock}: {reason}"
+        );
+        assert_eq!(git(&sting, &["rev-parse", "HEAD"]), head, "{lock}");
+        assert_eq!(
+            fs::read(sting.join(".git").join(lock)).unwrap(),
+            b"another command's lock",
+            "{lock}"
+        );
+    }
+}
+
+/// S1 (operator ruling 2026-10-19, "Switch when clean"; the
+/// `MassageIthaca` shape): neo works on `feature`, sting's clean checkout
+/// is on `main`. The advance switches it: `feature` created at neo's HEAD
+/// with neo's working-tree changes, sting's `main` exactly where it was
+/// (named in the receipt), its stash, branches, worktrees and ignored
+/// files untouched, the beside landing retired.
+#[test]
+fn s1_a_clean_checkout_on_another_branch_is_switched() {
+    let world = World::new();
+    git(&world.neo(), &["switch", "--quiet", "-c", "feature"]);
+    world.capture();
+    let ran = world.apply(&FLAGS);
+    assert_eq!(receipt(&ran.stdout).0, "workspace-beside");
+    let own = Own::of(&world);
+    let sting = world.sting();
+    let main = git(&sting, &["rev-parse", "main"]);
+    let diff = world.diff(&["--beside", SUFFIX, "--advance-ancestor"]);
+    assert!(
+        diff.stdout.contains("\"adopt\":\"advance-switch\""),
+        "{}",
+        diff.stdout
+    );
+    let ran = world.advance();
+    assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    let (outcome, reason) = receipt(&ran.stdout);
+    assert_eq!(outcome, "workspace-restored", "{reason}");
+    for held in [
+        "advanced=1",
+        "advance-switched=1",
+        "advance-beside=retired",
+        &format!("advance-switched-from=refs/heads/main@{}", main.trim()),
+    ] {
+        assert!(word(&reason, held), "{held}: {reason}");
+    }
+    assert_eq!(
+        git(&sting, &["symbolic-ref", "HEAD"]).trim(),
+        "refs/heads/feature"
+    );
+    assert_eq!(
+        git(&sting, &["rev-parse", "feature"]),
+        git(&world.neo(), &["rev-parse", "HEAD"])
+    );
+    assert_eq!(git(&sting, &["rev-parse", "main"]), main, "sting's main");
+    for file in [
+        "README",
+        "src/a.txt",
+        "src/b.txt",
+        "notes/todo.md",
+        "neo.log",
+    ] {
+        assert_eq!(
+            fs::read(sting.join(file)).unwrap(),
+            fs::read(world.neo().join(file)).unwrap(),
+            "{file}"
+        );
+    }
+    own.stays(&world);
+    assert!(!world.beside().exists());
+    let closure = world.closure(None);
+    assert!(
+        closure.stdout.contains("\"applied\":1") && closure.stdout.contains("\"switched\":true"),
+        "{}",
+        closure.stdout
+    );
+    let ran = world.advance();
+    assert_eq!(
+        receipt(&ran.stdout).0,
+        "previous-workspace-restoration-not-revalidated"
+    );
+}
+
+/// S2: the switch's conditions refused typed, each landing beside with
+/// nothing written at the live checkout: a dirty checkout
+/// (`GIT_SWITCH_NOT_CLEAN`), a process whose working directory is inside
+/// it (`GIT_SWITCH_IN_USE`, the ruling's condition c), the capture's
+/// branch held by sting at a commit of its own
+/// (`GIT_SWITCH_BRANCH_DIVERGED`). Closure holds each pending review.
+#[test]
+fn s2_each_switch_condition_refuses_typed_and_lands_beside() {
+    for (shape, code) in [
+        ("dirty", "GIT_SWITCH_NOT_CLEAN"),
+        ("in-use", "GIT_SWITCH_IN_USE"),
+        ("diverged", "GIT_SWITCH_BRANCH_DIVERGED"),
+    ] {
+        let world = World::new();
+        let sting = world.sting();
+        git(&world.neo(), &["switch", "--quiet", "-c", "feature"]);
+        let mut child = None;
+        match shape {
+            "dirty" => fs::write(sting.join("README"), b"sting's edit\n").unwrap(),
+            "in-use" => {
+                child = Some(
+                    Command::new("sleep")
+                        .arg("120")
+                        .current_dir(sting.join("src"))
+                        .spawn()
+                        .unwrap(),
+                );
+            }
+            _ => {
+                // A commit of sting's own (its stash's), no ancestor of
+                // neo's HEAD.
+                git(&sting, &["branch", "feature", "refs/stash"]);
+            }
+        }
+        world.capture();
+        let head = git(&sting, &["rev-parse", "HEAD"]);
+        let status = git(&sting, &["status", "--porcelain"]);
+        let ran = world.advance();
+        if let Some(mut child) = child {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        assert!(ran.ok, "{shape}: {}\n{}", ran.stdout, ran.stderr);
+        let (outcome, reason) = receipt(&ran.stdout);
+        assert_eq!(outcome, "workspace-beside", "{shape}: {reason}");
+        assert!(
+            word(&reason, &format!("advance-refused={code}")),
+            "{shape}: {reason}"
+        );
+        assert_eq!(git(&sting, &["rev-parse", "HEAD"]), head, "{shape}");
+        assert_eq!(
+            git(&sting, &["symbolic-ref", "HEAD"]).trim(),
+            "refs/heads/main",
+            "{shape}"
+        );
+        assert_eq!(git(&sting, &["status", "--porcelain"]), status, "{shape}");
+        let closure = world.closure(None);
+        assert!(
+            closure.stdout.contains(&format!(
+                "\"disposition\":\"refused-pending-review\",\"refusal\":\"{code}\""
+            )),
+            "{shape}: {}",
+            closure.stdout
+        );
+    }
+}
+
+/// R1 (review of #289, finding 2): a process whose working directory is
+/// inside the beside landing keeps it (`in-use`: a duplicate pending
+/// review), never removed under it; once the process is gone, a rerun
+/// tries again and retires it.
+#[test]
+fn r1_a_beside_landing_in_use_is_kept_then_retired_once_free() {
+    let world = World::new();
+    world.capture();
+    let ran = world.apply(&FLAGS);
+    assert_eq!(receipt(&ran.stdout).0, "workspace-beside");
+    let mut child = Command::new("sleep")
+        .arg("120")
+        .current_dir(world.beside().join("src"))
+        .spawn()
+        .unwrap();
+    let ran = world.advance();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    let (outcome, reason) = receipt(&ran.stdout);
+    assert_eq!(outcome, "workspace-restored", "{reason}");
+    assert!(word(&reason, "advance-beside=pending"), "{reason}");
+    assert!(word(&reason, "advance-beside-reason=in-use"), "{reason}");
+    holds_neo(&world);
+    assert!(world.beside().join(".git").is_file(), "kept whole");
+    assert!(world
+        .closure(None)
+        .stdout
+        .contains("\"refusal\":\"GIT_ADVANCE_BESIDE_KEPT\""));
+    let ran = world.advance();
+    assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    let (outcome, reason) = receipt(&ran.stdout);
+    assert_eq!(outcome, "workspace-restored", "{reason}");
+    assert!(word(&reason, "advance-beside=retired"), "{reason}");
+    assert!(!world.beside().exists());
+    let closure = world.closure(None);
+    assert!(
+        closure.stdout.contains("\"applied\":1"),
+        "{}",
+        closure.stdout
+    );
+}
+
+/// R2 (review of #289, finding 5; the coordinator's decision of
+/// 2026-10-20; its verification, r6 and r7): a standalone beside checkout
+/// whose configuration holds keys the live repository lacks (branch
+/// upstreams, the softconnect shape: `branch.main.merge` with two values)
+/// and an `info/exclude` pattern the live exclude lacks: the live
+/// repository takes them create-only, every value of each key (counted),
+/// and the beside is then retired. Kept (`configuration:<key>`), the live
+/// configuration untouched: a key the live configuration holds with
+/// another value (in its own file, or only in the global one the
+/// operator's Git reads), and a local identity (`user.email`, never
+/// carried) the live configuration does not hold.
+#[test]
+fn r2_a_standalone_beside_carries_absent_configuration_or_is_kept() {
+    for shape in ["carried", "differs", "global", "identity"] {
+        let world = World::new();
+        // Neo's own exclude pattern, which sting's copy (made earlier) lacks;
+        // the beside, a copy of neo, holds it as the capture does.
+        fs::create_dir_all(world.neo().join(".git/info")).unwrap();
+        fs::write(world.neo().join(".git/info/exclude"), b"*.scratch\n").unwrap();
+        world.capture();
+        let copied = Command::new("cp")
+            .arg("-a")
+            .arg(world.neo())
+            .arg(world.beside())
+            .status()
+            .unwrap();
+        assert!(copied.success());
+        let beside = world.beside();
+        git(&beside, &["config", "branch.main.remote", "origin"]);
+        git(
+            &beside,
+            &["config", "--add", "branch.main.merge", "refs/heads/main"],
+        );
+        git(
+            &beside,
+            &["config", "--add", "branch.main.merge", "refs/heads/topic"],
+        );
+        let sting = world.sting();
+        let home = world.path("home");
+        fs::create_dir_all(home.join(".config")).unwrap();
+        match shape {
+            "differs" => {
+                git(&sting, &["config", "branch.main.remote", "."]);
+            }
+            "global" => {
+                fs::write(
+                    home.join(".gitconfig"),
+                    b"[branch \"main\"]\n\tremote = upstream\n",
+                )
+                .unwrap();
+            }
+            "identity" => {
+                git(&beside, &["config", "user.email", "neo@example.invalid"]);
+            }
+            _ => {}
+        }
+        let ran = world.apply(&FLAGS);
+        assert_eq!(
+            receipt(&ran.stdout).0,
+            "workspace-beside",
+            "{shape}: {}\n{}",
+            ran.stdout,
+            ran.stderr
+        );
+        let config = fs::read(sting.join(".git/config")).unwrap();
+        let ran = world.advance_home(&home);
+        assert!(ran.ok, "{shape}: {}\n{}", ran.stdout, ran.stderr);
+        let (outcome, reason) = receipt(&ran.stdout);
+        assert_eq!(outcome, "workspace-restored", "{shape}: {reason}");
+        holds_neo(&world);
+        let kept = match shape {
+            "differs" | "global" => Some("configuration:branch.main.remote"),
+            "identity" => Some("configuration:user.email"),
+            _ => None,
+        };
+        if let Some(why) = kept {
+            assert!(word(&reason, "advance-beside=kept"), "{shape}: {reason}");
+            assert!(
+                word(&reason, &format!("advance-beside-reason={why}")),
+                "{shape}: {reason}"
+            );
+            assert!(world.beside().join(".git").is_dir(), "{shape}");
+            assert_eq!(
+                fs::read(sting.join(".git/config")).unwrap(),
+                config,
+                "{shape}: the live configuration"
+            );
+            continue;
+        }
+        for held in [
+            "advance-beside=retired",
+            "advance-config-added=3",
+            "advance-exclude-appended=1",
+        ] {
+            assert!(word(&reason, held), "{held}: {reason}");
+        }
+        assert!(!world.beside().exists());
+        assert_eq!(
+            git(&sting, &["config", "branch.main.remote"]).trim(),
+            "origin"
+        );
+        assert_eq!(
+            git(&sting, &["config", "--get-all", "branch.main.merge"]),
+            "refs/heads/main\nrefs/heads/topic\n",
+            "every value of the key, once each"
+        );
+        assert!(fs::read_to_string(sting.join(".git/info/exclude"))
+            .unwrap()
+            .lines()
+            .any(|line| line == "*.scratch"));
+        // Created only where absent: what the live configuration held is
+        // as it was, a byte prefix of the new file.
+        assert!(fs::read(sting.join(".git/config"))
+            .unwrap()
+            .starts_with(&config));
+    }
+}
+
+/// A13 (the coordinator's decision on #289, C19): a process whose working
+/// directory is inside the live checkout refuses the advance
+/// `GIT_ADVANCE_IN_USE`, with nothing written and no beside written for that
+/// pass (one exists already); never remembered as a decision, so the next
+/// pass, the process gone, advances.
+#[test]
+fn a13_a_live_checkout_in_use_is_refused_then_advanced_once_free() {
+    let world = World::new();
+    world.capture();
+    let ran = world.apply(&FLAGS);
+    assert_eq!(receipt(&ran.stdout).0, "workspace-beside");
+    let sting = world.sting();
+    let head = git(&sting, &["rev-parse", "HEAD"]);
+    let beside_head = identity(&world.beside().join("README"));
+    let mut child = Command::new("sleep")
+        .arg("120")
+        .current_dir(sting.join("src"))
+        .spawn()
+        .unwrap();
+    let ran = world.advance();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let (outcome, reason) = receipt(&ran.stdout);
+    assert!(
+        outcome.contains("GIT_ADVANCE_IN_USE") || reason.contains("GIT_ADVANCE_IN_USE"),
+        "{outcome} {reason}"
+    );
+    assert_eq!(git(&sting, &["rev-parse", "HEAD"]), head);
+    assert_eq!(identity(&world.beside().join("README")), beside_head);
+    assert!(world
+        .closure(None)
+        .stdout
+        .contains("\"refusal\":\"GIT_ADVANCE_IN_USE\""));
+    let ran = world.advance();
+    assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    let (outcome, reason) = receipt(&ran.stdout);
+    assert_eq!(outcome, "workspace-restored", "{reason}");
+    assert!(word(&reason, "advanced=1"), "{reason}");
+    holds_neo(&world);
 }

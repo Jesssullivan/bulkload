@@ -446,33 +446,16 @@ pub(in crate::git_carry) fn prove_adoptable(
     if standalone && exclude != exclude_digest(&meta.exclude(&scratch.repo)?) {
         differs.push("exclude".to_owned());
     }
-    let mut sides = sides(&scratch.repo, meta)?;
-    // Gap C12 (A-115): a beside checkout bulkload did not land may differ
-    // from the capture by a bulkload hand-off block at byte 0 of a target,
-    // and by nothing else.
-    if landing.beside {
-        super::handoff::declared_blocks(worktree, &mut sides)?;
-    }
-    let mut objects = BatchObjects::new(&scratch.repo)?;
-    let mut prints = Vec::with_capacity(sides.len());
-    let mut seats = Vec::new();
-    for (path, side) in &sides {
-        match seat(&mut objects, worktree, path, side)? {
-            Some(print) => prints.push(print),
-            None => seats.push(path.clone()),
+    let prints = match prove_seats(worktree, &scratch.repo, meta, landing.beside)? {
+        Ok(prints) => prints,
+        Err(seats) => {
+            differs.extend(seats);
+            Vec::new()
         }
-    }
-    objects.finish()?;
-    if !seats.is_empty() {
-        differs.push(format!("seats={}", seats.len()));
-        for path in seats.iter().take(3) {
-            differs.push(format!("seat={}", path.escape_ascii()));
-        }
-    }
+    };
     if !differs.is_empty() {
         return Ok(Found::Differs(differs));
     }
-    prints.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Found::Equal(Box::new(LandedWorkspace {
         item: landing.item.to_owned(),
         capture: landing.capture,
@@ -486,6 +469,73 @@ pub(in crate::git_carry) fn prove_adoptable(
         fsid: landed::fsid(worktree)?,
         seats: prints,
     })))
+}
+
+/// The seat half of the adopt proof: every seat the capture `meta` (read
+/// from the repository `objects_in`: a scratch one, or the destination's
+/// own once the capture is imported there) carries, tracked, untracked and ignored, held at `worktree`
+/// with its kind, mode and content, each under a print that held still
+/// while it was read. Their prints, sorted by path; or the components that
+/// differ (`seats=<n>` and the first `seat=<path>`s). Seats at `worktree`
+/// the capture does not carry are left alone. With `beside`, a sealed
+/// bulkload hand-off block at byte 0 of a target is the one difference
+/// allowed (gap C12, [`super::handoff::declared_blocks`]). Read-only.
+///
+/// # Errors
+/// Whatever reading the destination or the scratch repository refuses.
+pub(in crate::git_carry) fn prove_seats(
+    worktree: &Path,
+    objects_in: &Path,
+    meta: &Meta,
+    beside: bool,
+) -> Result<std::result::Result<Vec<SeatPrint>, Vec<String>>> {
+    let mut sides = sides(objects_in, meta)?;
+    // Gap C12 (A-115): a beside checkout bulkload did not land may differ
+    // from the capture by a bulkload hand-off block at byte 0 of a target,
+    // and by nothing else.
+    if beside {
+        super::handoff::declared_blocks(worktree, &mut sides)?;
+    }
+    let mut objects = BatchObjects::new(objects_in)?;
+    let mut prints = Vec::with_capacity(sides.len());
+    let mut seats = Vec::new();
+    for (path, side) in &sides {
+        match seat(&mut objects, worktree, path, side)? {
+            Some(print) => prints.push(print),
+            None => seats.push(path.clone()),
+        }
+    }
+    objects.finish()?;
+    if !seats.is_empty() {
+        let mut differs = vec![format!("seats={}", seats.len())];
+        differs.extend(
+            seats
+                .iter()
+                .take(3)
+                .map(|path| format!("seat={}", path.escape_ascii())),
+        );
+        return Ok(Err(differs));
+    }
+    prints.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(Ok(prints))
+}
+
+/// Whether every seat of `prints` at `worktree` still has its print
+/// (metadata only, run after the proof that read the bytes).
+///
+/// # Errors
+/// Whatever `lstat` refuses.
+pub(in crate::git_carry) fn seats_still(worktree: &Path, prints: &[SeatPrint]) -> Result<bool> {
+    for print in prints {
+        let Ok(path) = safe_destination(worktree, Path::new(OsStr::from_bytes(&print.path))) else {
+            return Ok(false);
+        };
+        let now = lstat(&path)?.and_then(|meta| SeatPrint::of(&print.path, &meta));
+        if !now.is_some_and(|now| now.same(print)) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 // One carried seat: its print when it holds the capture's kind, mode and
@@ -670,16 +720,7 @@ fn still(
     if standalone && exclude_digest(&read_exclude(common)?) != ledger.exclude {
         return Ok(false);
     }
-    for print in &ledger.seats {
-        let Ok(path) = safe_destination(worktree, Path::new(OsStr::from_bytes(&print.path))) else {
-            return Ok(false);
-        };
-        let now = lstat(&path)?.and_then(|meta| SeatPrint::of(&print.path, &meta));
-        if !now.is_some_and(|now| now.same(print)) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    seats_still(worktree, &ledger.seats)
 }
 
 /// A11a: adopt the checkout at `place` (no workspace ledger) for the

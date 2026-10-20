@@ -231,6 +231,29 @@ Run on honey (rows created and destroyed by the tests, R-N98):
   `/adopt-` in the path, so it failed under this lane's TMPDIR
   (`.../adopt-ancestor-20261019/...`); it now reads the scratch's own
   directory name (`<stage>/adopt-<n>/repo`). Test-only.
+- After the review of #289 and the "Switch when clean" ruling:
+  - lib (`git_carry::converge::tests`): `a_held_git_lock_refuses_the_advance_with_nothing_moved`,
+    `a_commit_cannot_interleave_with_an_advance`,
+    `an_edit_met_after_the_branch_moved_rolls_the_advance_back`,
+    `a_switch_lands_the_capture_on_its_branch_and_leaves_the_live_one`,
+    `a_switch_advances_an_ancestor_branch_and_refuses_a_diverged_one`,
+    `a_switch_refuses_each_condition_typed_with_nothing_written` (dirty,
+    merge, lock, busy, collides, a process inside),
+    `a_switch_met_by_an_edit_is_rolled_back`; `advance::tests` (markers,
+    reachability, switch typing); `procs::tests`. The two older race tests
+    move their branch or HEAD by `update-ref`/`symbolic-ref`, since a
+    `git commit` or `git switch` now cannot run under bulkload's lock.
+  - `estate_advance`: A12 (held `index.lock`/`HEAD.lock`), S1 (switch,
+    beside retired, `main` kept), S2 (switch dirty, in use, diverged), R1
+    (beside in use kept, retired once free), R2 (standalone beside with its
+    own branch upstreams kept, live config untouched); A4-A6's mismatch is
+    now a detached capture.
+  - fault harness: `estate_advance_after_branch_rolled_back`,
+    `_after_seat_rolled_back`, `_rollback_after_intent`, `_rollback_mid`,
+    `_switch_after_intent`, `_switch_head_branch`, `_switch_after_branch`,
+    `_switch_after_seat`, `_switch_after_index`, `_switch_after_ledger`,
+    `_retire_after_rename_live_edited`, `_retire_after_rename_written`,
+    `_retire_mid_written`.
 - The full `cargo test -p bulkload-agent --locked` and `just rust-check` on
   the pushed head are in the PR body with host, head and TMPDIR.
 
@@ -288,6 +311,102 @@ advance as a beside landing. And decision 7 above is withdrawn under
 lands entry by entry where the path is free (never over a live file; an
 occupied one is a kept file, landing as a file-level beside).
 
+## Operator ruling 2026-10-19 (interview): "Switch when clean"
+
+Relayed by the coordinator after the review found 4 of the 5 named sting
+repositories on another branch than neo's capture (`BRANCH_MISMATCH`).
+Verbatim from the relay:
+
+> when the live checkout is on a different branch than neo's capture, and
+> (a) live is clean (index + tracked files equal its HEAD, no
+> skip-worktree/assume-unchanged, submodules clean), (b) no git operation
+> in progress (rebase/merge/cherry-pick/bisect/am, index.lock, HEAD.lock),
+> (c) no process has its cwd or an open fd inside the checkout (/proc
+> scan, Linux; on Darwin refuse unless proven), (d) neo's branch is not
+> checked out in another worktree, (e) neo's commit is reachable after
+> refs-in, and (f) no untracked file collides with the capture — then
+> switch the live checkout to neo's branch at neo's commit (create the
+> branch create-only if absent; if it exists at an ancestor, CAS-advance
+> it; if it exists diverged, refuse typed), land the captured seats/index
+> as in the advance, and leave sting's previous branch ref exactly where
+> it was (record it in the receipt). Otherwise refuse typed (GIT_SWITCH_*
+> codes, pending review) and write nothing. Same rollback guarantee as the
+> advance. Then the beside retirement applies as for an advance.
+
+Implemented through the advance's own machinery (`advance.rs`): each
+condition maps to `GIT_SWITCH_NOT_CLEAN`, `_IN_PROGRESS`, `_IN_USE`,
+`_BRANCH_BUSY`, `_UNREACHABLE`, `_UNTRACKED_COLLIDES`, plus
+`_BRANCH_DIVERGED`, `_RACED`, `_ROLLED_BACK`. Readings taken:
+
+- "Different branch" is two branch names. One side detached stays
+  `GIT_ADVANCE_BRANCH_MISMATCH` (attaching or detaching the live checkout
+  was never ruled).
+- The live HEAD need not be an ancestor of neo's: its branch stays where
+  it was, so nothing of sting's is lost.
+- (e) is asked under the lock after the capture's import (its provenance
+  makes the commit reachable); `refs-in` itself runs after the workspace
+  step, as for every item.
+- (c) is asked in the read-only proof and again under the lock right
+  before the intent; this process itself is not counted.
+- The receipt names the branch left: `advance-switched-from=<ref>@<oid>`;
+  closure's `advance` block says `switched`.
+
+## Review of #289 at 9990aeb (coordinator's adversarial pass) and fixes
+
+| # | Finding | Fix |
+| --- | --- | --- |
+| 1 HIGH | No rollback after the branch CAS; a settle only went forward, so an edit after a crash wedged the checkout with HEAD advanced over the old index (a `git commit -a` then dropped neo's file). Held `index.lock` unchecked. | `index.lock`/`HEAD.lock` are in-progress markers. Bulkload holds its own marked `index.lock` from the under-lock proof through the index publish (a crash leaves it held; a stale marker of this source with no intent is removed under the lock). A foreign edit (or index change) after the branch moved rolls everything back (`rolling_back` durable first): seats by content to the live HEAD's bytes, the edit left, refs by CAS, lock released, `GIT_ADVANCE_ROLLED_BACK`, beside fallback. Settle: published index writes only records; HEAD back at the proof's → rollback; HEAD elsewhere → raced, intent dropped. Fault points `rollback_after_intent`, `rollback_mid`. |
+| 2 MED | A resumed `deleting`/`delete-failed` retirement deleted without re-proof; no cwd/fd check. | Re-proved before every deletion step: prints (admin dir included), `/proc/*/cwd` and `/proc/*/fd` (before the rename and before deletion; `in-use`), and a deletion cut short resumes only while no file's ctime is newer than the proof's start (`written-since`), else the tree goes back. The tree is deleted before its administration, so a put-back is whole. |
+| 3 MED | A pending `.retire` record only finished on `workspace-restored`; a refusal hid neo's copy at `.bulkload-retire-<hex>`, closure silent. | Pending retirements are finished or put back before the item's workspace step; transient put-backs are `pending` and retried; closure prints `retire_pending` and holds any beside not retired `GIT_ADVANCE_BESIDE_KEPT` pending review. |
+| 4 LOW-MED | Admin dir outside the prints; `remove_admin` never checked its location. | Prints include the admin dir; the proof requires it under `<common>/worktrees/` with `gitdir` naming `<beside>/.git` (`admin-foreign`); removal requires `worktrees/` and the proved `gitdir`. |
+| 5 LOW | Standalone retirement skipped config, `info/exclude`, `modules`, in-progress state; `refs/carry*` skipped both checks. | Kept typed (`configuration`, `exclude`, `modules`, `in-progress`), never carried into the live config (the advance never touches config). `refs/carry*` held by name and value, else must be reachable commits. softconnect's four branch upstreams will keep its beside, pending review. |
+| 6 LOW | A replaced seat's print came from a later `lstat`. | Printed from the written descriptor (`fstat`); a size/mtime moved since the rename records the pre-rename print (never matches). |
+
+## Coordinator decisions on the readings (2026-10-20, at 9116e01)
+
+1. Accepted: a detached side stays `GIT_ADVANCE_BRANCH_MISMATCH`
+   (switching off a detached HEAD could orphan a commit).
+2. Accepted: a switch does not need the live HEAD to be an ancestor
+   (sting's branch stays put).
+3. Changed: the no-process check applies to the plain advance too (C19: a
+   live agent must not have files change under it; the operator: work is
+   "topped up as agents exit organically"). `GIT_ADVANCE_IN_USE`,
+   retryable (never in the decided list a journal rerun keeps), pending
+   review, and no beside written for that pass when one exists (the item
+   refuses typed instead of landing beside).
+4. Changed: a standalone beside's configuration entries whose key the live
+   configuration lacks (softconnect's branch upstreams) are added to the
+   live configuration create-only (`git config --local --add` only while
+   the key is absent; never an existing value changed; only values
+   `safe_configuration_value` allows), counted in the receipt
+   (`advance-config-added=N`), and the beside is then retirable; a key the
+   live configuration holds with another value keeps it
+   (`configuration:<key>`). `info/exclude` patterns the live exclude lacks
+   are appended by the exclude union's rule (its lock, STATE record and
+   settle; `advance-exclude-appended=N`); a negation on either side, or an
+   exclude another converge proves, keeps the beside (`exclude`). The
+   source command registry's `config (writing form)` pin goes 3 to 4,
+   argued in its entry and recorded on bulkload#188.
+
+Tests: lib `an_advance_refuses_while_a_process_is_inside`; `estate_advance`
+A13 (in use: refused, no beside written, advanced once free) and R2 (two
+absent upstreams and an exclude pattern carried, then retired; a key held
+with another value kept, live config untouched).
+
+## Verification of #289 at 1b2e1f5 (coordinator, 2026-10-20)
+
+All six earlier findings confirmed fixed by probe; the switch and the
+rollback hold. Two configuration-carry defects, fixed with tests:
+
+| # | Defect | Fix |
+| --- | --- | --- |
+| r6 | A key with two values (`branch.main.merge`) the live repository lacked: the first value went in, then the carry read its own write as a conflict; the beside was kept, the live configuration left with one of two values, uncounted. | Decided per key against the proof's snapshot: every value of an absent key goes in, or none. The plan is in the retirement's STATE record (`config`) before the first write, so a crash mid-key is finished by the rerun (`settle`; fault point `estate.advance.retire_carried`, row `estate_advance_retire_carried`); a key holding anything but planned values keeps the beside. Counted per value (`advance-config-added`). |
+| r7 | `user.email` was carried into live's local configuration: absence was read from `--local` only (no includes, no global), and `safe_configuration_value` allows any `user.name`/`user.email`. | Identity and signing keys (`user.*`, `gpg.*`, `commit.gpgsign`, `tag.gpgsign`, `push.gpgsign`, `tag.forceSignAnnotated`) are never carried; one the live configuration does not hold keeps the beside (`configuration:user.email`). Absence is tested against the effective configuration: local with includes, plus the global (`$XDG_CONFIG_HOME`/`~/.config` `git/config`, `~/.gitconfig`) and system (`/etc/gitconfig`) files, each with includes, read by name (bulkload's own Git children run without them). |
+
+R2 covers both (two merge values carried and counted; a key held differently
+in the live file or only in the global file; a differing local identity),
+with `HOME` pointed at a fixture.
+
 ## Open
 
 - **A beside kept after an advance stays** until the operator disposes it
@@ -296,14 +415,33 @@ occupied one is a kept file, landing as a file-level beside).
 - **Kept directories** (a live ignored file or link where the capture holds
   a directory) still keep the beside tree: the file-level reconcile of such
   subtrees is the beside-only-unique lane's.
-- **Sessions with their cwd in a retired beside**: the retirement renames
-  and deletes the directory once it is proved equal (no write there since
-  the proof, checked by prints after the rename); a shell sitting there is
-  left in a deleted directory. Not detected (no process inspection).
-- A standalone beside checkout's `info/exclude` and configuration other
-  than its remote URLs are not compared before it is retired: their
-  captured form is in the capture's provenance, but an edit made there by
-  hand since its landing would go with it.
+- **The `/proc` check is best effort**: it sees only this user's
+  processes (other uids' links are unreadable) and only this mount
+  namespace's paths (a process in another mount namespace, a container,
+  resolves its cwd and fds to paths that do not compare); a process that
+  enters the tree between the last scan and the write is not seen; and a
+  link whose target name itself ends in ` (deleted)` is skipped as a
+  deleted file. On Darwin nothing is proved: an advance or switch refuses
+  `_IN_USE` and a retirement keeps the beside (`in-use`).
+- **A hand-deleted `index.lock`** (advance.rs, the settle's "someone's
+  HEAD since" branch): after a crash the advance's marked lock stays held
+  so the operator's Git refuses; an operator who deletes it by hand and
+  then moves HEAD (or commits over the half-advanced worktree) owns that
+  state: the settle drops the intent as `GIT_ADVANCE_RACED` and touches
+  nothing, so seats the advance had written stay as they are.
+- **Darwin**: with the process check on every advance, nothing advances or
+  switches on Darwin (unprovable, refused `GIT_ADVANCE_IN_USE` /
+  `GIT_SWITCH_IN_USE`); sting (Linux) is the target.
+- **A beside's configuration values are carried only for the keys
+  `safe_configuration_value` allows** (user identity, push/pull modes,
+  branch upstreams to `origin` or `.`, origin's default fetch refspec); any
+  other absent key keeps the beside (`configuration:<key>`).
+- **Gate codes on a journal rerun**: the metadata-only gate cannot see the
+  capture, so a rerun whose live checkout became dirty records
+  `GIT_ADVANCE_NOT_CLEAN` even where the item would be a switch.
+- **Rollback leaves gitlink directories** an advance created for nested
+  repositories (empty directories), and a directory the advance widened
+  that is not tracked keeps the widened mode.
 - **Global excludes**: bulkload's Git runs with no global configuration, so
   a file ignored only through a custom `core.excludesFile` reads as
   untracked; it collides (refusal, beside) only where the capture holds

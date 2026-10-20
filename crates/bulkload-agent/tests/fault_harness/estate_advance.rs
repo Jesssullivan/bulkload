@@ -29,6 +29,33 @@
 //!   the rerun finishes the advance from the proof's prints, then proves
 //!   the ledger it wrote and refuses `GIT_DESTINATION_MODIFIED`, the edit
 //!   kept (never recorded as bulkload's output).
+//! - `AdvanceRolledBack` (review of #289, finding 1): crashed after the
+//!   branch's compare-and-swap or mid-materialize, then a seat the advance
+//!   replaces (`a.txt`) edited at the live checkout: the rerun meets the
+//!   edit and rolls everything back (the seats to the live HEAD's bytes,
+//!   the branch by compare-and-swap, bulkload's `index.lock` released),
+//!   the edit kept, `GIT_ADVANCE_ROLLED_BACK`, the capture landed beside;
+//!   never HEAD advanced over the old index, never wedged.
+//! - `RollbackCrash`: the same rollback crashed after its intent or
+//!   mid-seat; the next rerun finishes it.
+//! - `Switch` (operator ruling 2026-10-19, "Switch when clean"): the
+//!   source on another branch (`feature`) than the clean live checkout
+//!   (`main`); crashed after the intent, between the branch's creation and
+//!   HEAD's move, after both, mid-materialize, after the index and after
+//!   the ledger; the rerun finishes the switch, the live `main` where it
+//!   was.
+//! - `RetireLiveEdited` (finding 3): the retirement crashed after its
+//!   rename, then the live checkout edited: the rerun finishes the
+//!   retirement before the item's workspace step, which then refuses
+//!   `GIT_DESTINATION_MODIFIED`; nothing is left hidden.
+//! - `RetireCarry` (the verification of #289, r6): a standalone beside
+//!   whose configuration holds a key the live repository lacks with two
+//!   values, crashed after the first went in: the rerun adds the second
+//!   (all of a key's values or none), then retires the beside.
+//! - `RetireWritten` (finding 2): the retirement crashed after its rename
+//!   or marked deleting, then a file written into the renamed tree: the
+//!   rerun never deletes it; the tree goes back to its path, kept (a
+//!   duplicate pending review), the file with it.
 //!
 //! The parent asserts after the crash that neither tree is lost: every
 //! live seat holds the live HEAD's bytes or the capture's, the live
@@ -77,6 +104,18 @@ pub enum EstateAdvance {
     /// print, so its proof refuses `GIT_DESTINATION_MODIFIED` and keeps the
     /// edit, never taking it for bulkload's output.
     AdvanceEdited,
+    /// `Advance`, a seat it replaces edited after the crash: rolled back.
+    AdvanceRolledBack,
+    /// `AdvanceRolledBack`'s rollback itself crashed, then finished.
+    RollbackCrash,
+    /// The live checkout on `main`, the source on `feature`: switched.
+    Switch,
+    /// `Retire` crashed after its rename, the live checkout then edited.
+    RetireLiveEdited,
+    /// `Retire` crashed, a file then written into the renamed tree.
+    RetireWritten,
+    /// `RetireStandalone` with a two-valued key to carry, crashed mid-key.
+    RetireCarry,
 }
 
 impl Scenario for EstateAdvance {
@@ -133,7 +172,7 @@ impl Drop for World {
 }
 
 impl World {
-    fn new(tag: &str) -> Self {
+    fn new(tag: &str, switch: bool) -> Self {
         let base = std::env::temp_dir().join(format!(
             "bulkload-w7-advance-{tag}-{}-{}",
             std::process::id(),
@@ -170,6 +209,9 @@ impl World {
             ],
         );
         fs::write(dst.join("sting.log"), b"sting's own ignored log\n").unwrap();
+        if switch {
+            git(&src, &["switch", "--quiet", "-c", "feature"]);
+        }
         fs::write(src.join("a.txt"), b"alpha, c1\n").unwrap();
         fs::write(src.join("e.txt"), b"epsilon\n").unwrap();
         git(&src, &["add", "a.txt", "e.txt"]);
@@ -308,8 +350,9 @@ fn files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     found
 }
 
-/// The live checkout's own state: its stash, branches and tags but `main`,
-/// its worktree's HEAD and its ignored file, which nothing may touch.
+/// The live checkout's own state: its stash, branches and tags but `main`
+/// (and `feature`, a switch's), its worktree's HEAD and its ignored file,
+/// which nothing may touch.
 fn own(world: &World) -> (String, Vec<String>, String, Vec<u8>) {
     let dst = world.dst();
     let refs: Vec<String> = git(&dst, &["for-each-ref", "--format=%(refname) %(objectname)"])
@@ -318,6 +361,7 @@ fn own(world: &World) -> (String, Vec<String>, String, Vec<u8>) {
             !line.starts_with("refs/carry")
                 && !line.starts_with("refs/neo-")
                 && !line.starts_with("refs/heads/main ")
+                && !line.starts_with("refs/heads/feature ")
         })
         .map(str::to_owned)
         .collect();
@@ -403,15 +447,32 @@ fn advance_child_entry() {
     panic!("the armed point was not reached: apply returned {outcome:?}");
 }
 
+#[allow(clippy::too_many_lines)]
 fn scenario(point: Point, nth: u64, kind: EstateAdvance) {
+    use EstateAdvance as K;
     let label = format!("{}:{nth}/{kind:?}", point.name());
-    let world = World::new(&point.name().replace('.', "-"));
+    let world = World::new(&point.name().replace('.', "-"), kind == K::Switch);
     std::thread::sleep(std::time::Duration::from_millis(2_100));
     world.capture();
-    if kind == EstateAdvance::RetireStandalone {
+    if matches!(kind, K::RetireStandalone | K::RetireCarry) {
         cp_a(&world.src(), &world.beside());
     }
-    let besides = !matches!(kind, EstateAdvance::Advance | EstateAdvance::AdvanceEdited);
+    if kind == K::RetireCarry {
+        let beside = world.beside();
+        git(&beside, &["config", "branch.main.remote", "origin"]);
+        git(
+            &beside,
+            &["config", "--add", "branch.main.merge", "refs/heads/main"],
+        );
+        git(
+            &beside,
+            &["config", "--add", "branch.main.merge", "refs/heads/side"],
+        );
+    }
+    let besides = !matches!(
+        kind,
+        K::Advance | K::AdvanceEdited | K::AdvanceRolledBack | K::RollbackCrash | K::Switch
+    );
     if besides {
         let rows = world.apply(false);
         assert_eq!(rows.len(), 1, "{label}");
@@ -424,8 +485,16 @@ fn scenario(point: Point, nth: u64, kind: EstateAdvance) {
     captured.insert(sting_log.clone(), live[&sting_log].clone());
     let mine = own(&world);
     let beside = besides.then(|| files(&world.beside()));
+    let main = git(&dst, &["rev-parse", "main"]);
 
-    crash(&world, &format!("{}:{nth}", point.name()));
+    // A rollback's crash comes on the rerun of an advance crashed after its
+    // branch moved, a seat it replaces edited in between.
+    let first = if kind == K::RollbackCrash {
+        "estate.advance.after_branch:1".to_owned()
+    } else {
+        format!("{}:{nth}", point.name())
+    };
+    crash(&world, &first);
 
     // Neither tree lost: every live seat is the live HEAD's or the
     // capture's, the live checkout's own state is as it was, and the
@@ -450,11 +519,16 @@ fn scenario(point: Point, nth: u64, kind: EstateAdvance) {
         assert_eq!(&files(&at), beside, "{label}: the beside landing's bytes");
     }
 
-    if kind == EstateAdvance::AdvanceEdited {
-        edited(&world, &label);
-        return;
+    match kind {
+        K::AdvanceEdited => return edited(&world, &label),
+        K::AdvanceRolledBack | K::RollbackCrash => {
+            return rolled_back(&world, &label, (&live, &main), (kind, point, nth));
+        }
+        K::RetireLiveEdited => return retire_live_edited(&world, &label),
+        K::RetireWritten => return retire_written(&world, &label),
+        _ => {}
     }
-    let rows = world.apply(kind != EstateAdvance::RetireNoFlag);
+    let rows = world.apply(kind != K::RetireNoFlag);
     assert_eq!(rows.len(), 1, "{label}");
     assert_eq!(rows[0].0, "workspace-restored", "{label}: {rows:?}");
     assert_eq!(files(&dst), captured, "{label}: the live checkout");
@@ -465,9 +539,25 @@ fn scenario(point: Point, nth: u64, kind: EstateAdvance) {
     );
     assert_eq!(
         git(&dst, &["symbolic-ref", "HEAD"]).trim(),
-        "refs/heads/main",
+        if kind == K::Switch {
+            "refs/heads/feature"
+        } else {
+            "refs/heads/main"
+        },
         "{label}"
     );
+    if kind == K::Switch {
+        // The live branch stays exactly where it was.
+        assert_eq!(git(&dst, &["rev-parse", "main"]), main, "{label}: main");
+        let reason = rows[0].1.clone().unwrap_or_default();
+        assert!(
+            reason
+                .split_whitespace()
+                .any(|word| word.starts_with("advance-switched-from=refs/heads/main@")),
+            "{label}: {reason}"
+        );
+    }
+    assert!(!dst.join(".git/index.lock").exists(), "{label}: the lock");
     assert_eq!(
         git(&dst, &["diff", "--cached", "--name-only"]),
         git(&world.src(), &["diff", "--cached", "--name-only"]),
@@ -498,10 +588,164 @@ fn scenario(point: Point, nth: u64, kind: EstateAdvance) {
         .collect();
     assert!(records.is_empty(), "{label}: {records:?}");
     assert_eq!(world.unaccounted(), 0, "{label}");
+    if kind == K::RetireCarry {
+        assert_eq!(
+            git(&dst, &["config", "--get-all", "branch.main.merge"]),
+            "refs/heads/main\nrefs/heads/side\n",
+            "{label}: both values, once each"
+        );
+        assert_eq!(
+            git(&dst, &["config", "branch.main.remote"]),
+            "origin\n",
+            "{label}"
+        );
+    }
     let rows = world.apply(true);
     assert_eq!(
         rows[0].0, "previous-workspace-restoration-not-revalidated",
         "{label}: a second rerun is a no-op"
+    );
+}
+
+/// The `AdvanceRolledBack` and `RollbackCrash` rows after the crash (module
+/// docs): `live` is the live checkout's tree before, `main` its branch.
+fn rolled_back(
+    world: &World,
+    label: &str,
+    (live, main): (&BTreeMap<PathBuf, Vec<u8>>, &str),
+    (kind, point, nth): (EstateAdvance, Point, u64),
+) {
+    let dst = world.dst();
+    let edit = b"alpha, the operator's edit after the crash\n";
+    fs::write(dst.join("a.txt"), edit).unwrap();
+    if kind == EstateAdvance::RollbackCrash {
+        crash(world, &format!("{}:{nth}", point.name()));
+    }
+    let rows = world.apply(true);
+    assert_eq!(rows.len(), 1, "{label}");
+    assert_eq!(rows[0].0, "workspace-beside", "{label}: {rows:?}");
+    let reason = rows[0].1.clone().unwrap_or_default();
+    assert!(
+        reason
+            .split_whitespace()
+            .any(|word| word == "advance-refused=GIT_ADVANCE_ROLLED_BACK"),
+        "{label}: {reason}"
+    );
+    // Everything back but the edit: the branch, every seat, the index.
+    assert_eq!(git(&dst, &["rev-parse", "main"]), main, "{label}: main");
+    assert_eq!(git(&dst, &["rev-parse", "HEAD"]), main, "{label}: HEAD");
+    assert_eq!(
+        git(&dst, &["symbolic-ref", "HEAD"]).trim(),
+        "refs/heads/main",
+        "{label}"
+    );
+    let mut expected = live.clone();
+    expected.insert(PathBuf::from("a.txt"), edit.to_vec());
+    assert_eq!(files(&dst), expected, "{label}: the live checkout");
+    assert_eq!(
+        git(&dst, &["status", "--porcelain", "--untracked-files=no"]),
+        " M a.txt\n",
+        "{label}: the index is the live HEAD's"
+    );
+    assert!(!dst.join(".git/index.lock").exists(), "{label}: the lock");
+    assert!(
+        !dst.join(".git/bulkload/v1/neo/advance.intent").exists(),
+        "{label}"
+    );
+    assert!(
+        world.beside().join(".git").is_file(),
+        "{label}: landed beside"
+    );
+    let ledger = estate::ledger(
+        &world.base.join("plan"),
+        &world.base.join("corpus"),
+        "neo",
+        &[world.base.join("applied")],
+    )
+    .unwrap();
+    let report = bulkload_agent::closure::Report::from_ledger(&ledger);
+    assert_eq!(report.unaccounted, 0, "{label}");
+    assert_eq!(
+        report.refusals.get("GIT_ADVANCE_ROLLED_BACK"),
+        Some(&1),
+        "{label}: {:?}",
+        report.refusals
+    );
+    // Never wedged: the next rerun refuses afresh (the edit is not clean)
+    // and its beside journal stands.
+    let rows = world.apply(true);
+    assert_eq!(
+        rows[0].0, "previous-workspace-beside-not-revalidated",
+        "{label}: {rows:?}"
+    );
+}
+
+/// The `RetireLiveEdited` row after its crash (module docs).
+fn retire_live_edited(world: &World, label: &str) {
+    let dst = world.dst();
+    let edit = b"alpha, edited after the retirement's crash\n";
+    fs::write(dst.join("a.txt"), edit).unwrap();
+    let rows = world.apply(true);
+    assert_eq!(rows.len(), 1, "{label}");
+    assert!(
+        rows[0]
+            .1
+            .as_deref()
+            .is_some_and(|reason| reason.contains("GIT_DESTINATION_MODIFIED")),
+        "{label}: {rows:?}"
+    );
+    // The retirement finished first: nothing hidden, nothing pending.
+    assert!(!world.beside().exists(), "{label}");
+    assert!(world.retiring().is_empty(), "{label}");
+    let records: Vec<PathBuf> = fs::read_dir(world.base.join("applied"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "retire"))
+        .collect();
+    assert!(records.is_empty(), "{label}: {records:?}");
+    assert_eq!(
+        fs::read(dst.join("a.txt")).unwrap(),
+        edit,
+        "{label}: the edit"
+    );
+}
+
+/// The `RetireWritten` row after its crash (module docs).
+fn retire_written(world: &World, label: &str) {
+    let renamed = world.retiring();
+    assert_eq!(renamed.len(), 1, "{label}: renamed");
+    fs::write(renamed[0].join("written-since.txt"), b"a session's file\n").unwrap();
+    let rows = world.apply(true);
+    assert_eq!(rows.len(), 1, "{label}");
+    assert_eq!(rows[0].0, "workspace-restored", "{label}: {rows:?}");
+    let reason = rows[0].1.clone().unwrap_or_default();
+    assert!(
+        reason
+            .split_whitespace()
+            .any(|word| word == "advance-beside=kept"),
+        "{label}: {reason}"
+    );
+    // Never deleted: back at its path, the file with it, kept.
+    assert!(world.retiring().is_empty(), "{label}");
+    assert_eq!(
+        fs::read(world.beside().join("written-since.txt")).unwrap(),
+        b"a session's file\n",
+        "{label}"
+    );
+    let ledger = estate::ledger(
+        &world.base.join("plan"),
+        &world.base.join("corpus"),
+        "neo",
+        &[world.base.join("applied")],
+    )
+    .unwrap();
+    let report = bulkload_agent::closure::Report::from_ledger(&ledger);
+    assert_eq!(report.unaccounted, 0, "{label}");
+    assert_eq!(
+        report.refusals.get("GIT_ADVANCE_BESIDE_KEPT"),
+        Some(&1),
+        "{label}: {:?}",
+        report.refusals
     );
 }
 

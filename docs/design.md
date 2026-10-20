@@ -282,6 +282,10 @@ own transfer and records the result in the estate ledger.
     for `GIT_BESIDE_FOREIGN`, `refusal_detail`, the refusal as recorded
     (it names the beside path). Both are added keys; no total, disposition
     or gate changes;
+  - (2026-10-19) on an `applied-beside` row, `beside_reason`: the refusal
+    code that sent the capture beside (`GIT_DESTINATION_DIVERGED`,
+    `GIT_DESTINATION_NONREPO_DIFFERS`), from the item's `.beside-reason`
+    record. An added key only;
   - (`--advance-ancestor`, 2026-10-19) an `advance` block on a row whose
     item's `.advance` record names its current capture (`outcome`:
     `advanced` or the `GIT_ADVANCE_*` code; `detail`; `beside`; `reason`;
@@ -1257,6 +1261,71 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   row (what the apply tries; no proof is run for it). A beside checkout
   bulkload landed first is a worktree of the live repository: `git
   worktree list` there shows it.
+- **An occupied non-repo directory (2026-10-19, the td01 batch).** Six
+  linked worktrees of tinyland.dev exist on sting as directories with
+  their files and no `.git` at all (the 2026-08-29 ceremony stripped them);
+  `estate-apply` refused each `GIT_DESTINATION_OCCUPIED`. Under `--adopt`, a
+  linked worktree item whose planned path is such a directory is proved
+  read-only first (`converge::check_nonrepo`): spelled canonically, no
+  registration of the repository naming it (unless a landing intent of
+  this item does: its own registration a crash cut short), the first linked
+  landing's checks, and every seat the capture carries, tracked, untracked
+  and ignored, held there with its kind, mode and bytes (`adopt::prove_seats`);
+  files the capture does not carry are left alone. Equal, it is adopted by
+  registering it again, as `git worktree add` would and with nothing in it
+  written (`git_carry::adopt_nonrepo_linked`): under the destination lock
+  the capture is imported, the native ref step runs and HEAD is planned as
+  for a first linked landing; the directory is checked again; the landing
+  intent; a branch `worktree add -b` would create in a foreign repository;
+  the administration directory `worktrees/<id>` (`commondir`, `HEAD`, then
+  `gitdir`; `<id>` the directory's name, numbered when taken;
+  `estate.apply.nonrepo_registered`); the `.git` gitfile, created new
+  (`estate.converge.linked_added`); the index from the capture; and the
+  workspace ledger from the proof's prints once they still hold. A crash
+  is finished forward: before the gitfile by the same adoption reusing its
+  administration directory, after it by `recover_linked_landing`, which
+  sets no mode a seat already holds. The receipt counts `adopted-nonrepo`
+  and closure says `applied`; later passes converge it as any landing.
+  One that differs, or a standalone item's (no registration to re-create,
+  no repository to land beside into), refuses
+  `GIT_DESTINATION_NONREPO_DIFFERS` with nothing written; under `--beside`
+  a linked item's capture lands beside it exactly as a diverged checkout's
+  does (refs in, the directory untouched), and the beside landing records
+  the code that sent it there (`beside-reason=<CODE>` in the receipt,
+  `{item}-{blake3(SOURCE)}.beside-reason` in STATE, `beside_reason` on
+  closure's `applied-beside` row; `GIT_DESTINATION_DIVERGED` for a diverged
+  checkout). `estate-diff` reports `nonrepo-adoptable`, `nonrepo-duplicate`
+  or `nonrepo-differs` with the differing seats and the beside component,
+  and `estate-move`'s plan previews a linked item's non-repo directory as
+  `adopt` (`nonrepo-adopt-or-beside`).
+  Review of #286 (2026-10-19): an equal directory is never registered as a
+  second copy of the same worktree: when the captured branch is checked
+  out by another worktree of the repository (the td01 shape: the item's
+  beside landing from an earlier pass holds it) or the item's beside
+  landing exists at `<path>SUFFIX`, it refuses
+  `GIT_DESTINATION_NONREPO_DUPLICATE`, nothing written, pending review
+  (retiring a beside proven equal, as #289 retires one, is the follow-up).
+  Its verification (2026-10-19): the same refusal, with or without
+  `--beside` and whatever the copy's HEAD (the tin2835 shape is a detached
+  `<path>.neo-YYYYMMDD`), when any registered worktree of the repository is
+  bulkload's landing of this item (its workspace ledger names the item) or
+  a `<path>.<suffix>` sibling bulkload landed under any source.
+  The adoption's landing intent carries a marker: a crash past the gitfile
+  is finished by proving every seat again (content and mode, read from the
+  capture imported into the repository) and writing none, a missing or
+  changed seat refusing `GIT_DESTINATION_MODIFIED`, and the ledger is that
+  proof's. The administration directory is held `locked` "initializing"
+  until the gitfile is written, as `git worktree add` holds it; a relative
+  `gitdir` names the directory as an absolute one does; the re-check runs
+  under the lock before the import, the native ref step and any exclude
+  append; and a later pass that does not adopt it (a refusal, or a pass
+  without `--adopt`) removes the registration a crash left before the
+  gitfile, as does a failure of the adopting pass itself before its
+  gitfile names the registration (a partial gitfile it created is removed
+  first): nothing stays `locked` "initializing" for `git worktree prune`
+  or `git branch -f` to trip over. The removal is ownership-checked: only
+  an administration directory still locked "initializing", holding only
+  what the adoption writes, no `.git` naming it, and this item's intent.
 - **Beside landings converge, and a beside path is adopted by proof (gap
   C12, plan of record rev 2; operator ruling A-115, 2026-10-18,
   "Landings placed beside refuse every later pass once neo changes" →
@@ -1315,11 +1384,13 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   under the destination lock (`git_carry::converge::advance`): its HEAD is
   born and an ancestor of (or equal to) the captured HEAD
   (`GIT_ADVANCE_NOT_ANCESTOR`); its branch is the captured one, or both
-  are detached (`GIT_ADVANCE_BRANCH_MISMATCH`: it is never detached or
-  switched instead); that branch is a plain ref at the live HEAD that no
+  are detached (`GIT_ADVANCE_BRANCH_MISMATCH` when one is detached: it is
+  never detached or attached instead; two branch names switch when clean,
+  below); that branch is a plain ref at the live HEAD that no
   other worktree has checked out (or a rebase or bisect there holds) and
   no pending bulkload intent names (`GIT_ADVANCE_BRANCH_BUSY`); its index
-  and tracked files are clean, with no operation in progress and no
+  and tracked files are clean, with no operation in progress, no Git lock
+  held (`index.lock`, `HEAD.lock`; review of #289) and no
   assume-unchanged or skip-worktree entry, and every seat the advance
   replaces or removes holds its HEAD's bytes (`GIT_ADVANCE_NOT_CLEAN`); its
   untracked files that are not ignored collide with no path the capture
@@ -1354,7 +1425,43 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   step runs: the live checkout's other branches, stash, worktrees,
   configuration and `info/exclude` are never touched, and the captured
   branches, tags and stash entries go in under `refs/<ns>/` and
-  `refs/<ns>-stash/` (`--refs-in`). An ignored entry of the live checkout
+  `refs/<ns>-stash/` (`--refs-in`). Bulkload holds the live checkout's
+  own `index.lock` (marked `bulkload-advance <source> <tag>`) from the
+  proof under the destination lock to the index publish, so no `git
+  commit -a` of the operator's interleaves; a crash leaves it held, so
+  their Git refuses typed until the rerun settles (a marker of this source
+  with no intent pending is removed under the lock). Never HEAD advanced
+  over the old index (review of #289, finding 1): a third party's edit met
+  after the branch moved, or an index changed under the lock, rolls the
+  advance back, the intent marked first (a rerun finishes the rollback,
+  never the advance): every seat it laid down back to the live HEAD's
+  bytes, classified by content (one holding neither side is the edit,
+  left), the branch by compare-and-swap, the lock released,
+  `GIT_ADVANCE_ROLLED_BACK` naming the seats left to the edit, and the
+  capture lands beside in the same pass. **Switch when clean (operator
+  ruling 2026-10-19, interview).** A live checkout on another branch than
+  the capture's is switched to the capture's branch at the captured HEAD
+  by the same machinery when it is clean (`GIT_SWITCH_NOT_CLEAN`), no Git
+  operation or lock is in progress (`GIT_SWITCH_IN_PROGRESS`), no process
+  has its working directory or an open file inside it (`/proc`, Linux;
+  refused elsewhere, `GIT_SWITCH_IN_USE`), the capture's branch is checked
+  out nowhere (`GIT_SWITCH_BRANCH_BUSY`), the captured HEAD is reachable
+  once the capture is in (`GIT_SWITCH_UNREACHABLE`) and no untracked file
+  collides (`GIT_SWITCH_UNTRACKED_COLLIDES`): the capture's branch is
+  created create-only, or advanced by compare-and-swap from an ancestor
+  (diverged: `GIT_SWITCH_BRANCH_DIVERGED`), HEAD put on it by its own
+  compare-and-swap, and the live branch left exactly where it was
+  (`advance-switched=1`, `advance-switched-from=<branch>@<oid>`, closure
+  `switched`); races and rollbacks are `GIT_SWITCH_RACED` and
+  `GIT_SWITCH_ROLLED_BACK`, each refusal landing beside, pending review.
+  `estate-diff` previews it as `adopt:"advance-switch"`. Neither an
+  advance nor a switch runs while a process has its working directory or
+  an open file inside the live checkout (`/proc`, Linux; unprovable
+  elsewhere, refused): `GIT_ADVANCE_IN_USE` (`GIT_SWITCH_IN_USE`), the
+  coordinator's decision on #289 (C19: a live agent never has files change
+  under it; work is topped up as agents exit). It is retryable, never
+  remembered as a decision, and no beside is written for that pass when
+  one exists already (the item refuses typed, pending review). An ignored entry of the live checkout
   is never touched: where the capture holds a seat it does not track, the
   live entry and its subtree are left (`advance-kept=N`, recorded); a
   captured file or link among them lands as a file-level beside,
@@ -1376,13 +1483,17 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   the advance left is never touched, its `info/exclude` is never replaced
   or proved, and its branch moves with HEAD by compare-and-swap from the
   value bulkload left it at (never detached for being a foreign
-  repository's). A crash after the intent settles forward on the rerun
-  (each seat by its content: the live HEAD's, the capture's, or a third
-  party's, which refuses `GIT_CONVERGE_INTERRUPTED` with the intent kept),
-  recording the proof's prints for seats no operation touches (an edit
-  since the crash is then a difference the ledger's proof refuses
-  `GIT_DESTINATION_MODIFIED`, never bulkload's output); one whose branch
-  never moved drops the intent and proves afresh. A rerun with or without
+  repository's). A crash after the intent settles on the rerun: forward
+  (each seat by its content: the live HEAD's or the capture's; a third
+  party's rolls it back instead), recording the proof's prints for seats
+  no operation touches (an edit since the crash is then a difference the
+  ledger's proof refuses `GIT_DESTINATION_MODIFIED`, never bulkload's
+  output); an index already published only writes the records (a seat
+  holding anything but its captured side gets a print nothing matches);
+  HEAD back where the proof found it rolls back; HEAD someone moved
+  elsewhere is theirs (raced, the intent dropped, nothing touched); one
+  whose ref step never happened (a switch's branch created without HEAD
+  put back) drops the intent and proves afresh. A rerun with or without
   the flag finishes it (a pending advance intent or STATE retirement
   record ends no journal), and the beside landing of an advance a flagged
   pass began is retired by the rerun that finishes it.
@@ -1409,25 +1520,53 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   repository's refs; for a standalone one, every ref held by the live
   repository by name and value (its own, under the beside namespace, or
   in the capture's provenance), no hook of its own and no remote URL the
-  live repository lacks. Its prints are taken before the proof and again
-  after it (a write while the proof read it keeps it, `raced`). Any
+  live repository lacks, no `modules` directory and no operation in
+  progress (`modules`, `in-progress`; review of #289, finding 5), its
+  `refs/carry*` held by name and value or reachable commits; its
+  configuration entries (per-machine `core.*` keys aside) whose key the
+  live repository's effective configuration lacks (its own with includes,
+  and the global and system files the operator's Git reads), and its
+  `info/exclude` patterns the live exclude lacks, are added to the live
+  repository first, create-only (the coordinator's decision of
+  2026-10-20: `git config --add` only for an absent key, every value of
+  it or none, planned in the retirement's STATE record so a crash mid-key
+  is finished by the rerun, with values `safe_configuration_value`
+  allows; patterns by the exclude union's rule; receipt
+  `advance-config-added=N` values, `advance-exclude-appended=N`), while a
+  key the live configuration holds with another value, one not safe to
+  carry, or an identity or signing key (`user.*`, `gpg.*`, `*.gpgsign`:
+  never carried) it does not hold keeps the beside (`configuration:<key>`),
+  as does a pattern no pure union carries (`exclude`); a linked one's administration directory under the
+  live repository's `worktrees/`, its `gitdir` naming the beside
+  (`admin-foreign`; finding 4). Its prints, a linked landing's
+  administration directory included, are taken before the proof and
+  again after it (a write while the proof read it keeps it, `raced`); a
+  process with its working directory or an open file inside it keeps it
+  (`in-use`, `/proc` on Linux; unprovable elsewhere, kept; finding 2). Any
   difference keeps it with the reason
   (`differs:head`, `differs:index`, `differs:seat=<path>`,
   `missing:<path>`, `extra:<path>`, `unreachable`, ...). The removal is
-  recorded in STATE first (`{item}-{blake3(SOURCE)}.retire`), renames the
-  checkout to a private `.bulkload-retire-<tag>` beside it, re-proves it
-  by the digest of every entry's print (a write since puts it back,
-  `raced`), marks the record deleting, removes a linked landing's
-  administration directory (its `gitdir` must hold what it held when
-  proved, or be gone after a crash), deletes the renamed tree (its
-  identity checked; its directories made writable first, a failure kept
-  `delete-failed` for the next pass) and removes the record; a rerun
-  finishes from the record. The `.advance` record and the receipt say
-  `advance-beside=retired|kept|absent` (with `advance-beside-reason=`),
-  and closure prints them in the row's `advance` block. A kept beside is a
-  duplicate (the coordinator's decision on #289): closure holds the item
-  `refused-pending-review` with `GIT_ADVANCE_BESIDE_KEPT reason="..."`
-  until `closure-dispose`.
+  recorded in STATE first (`{item}-{blake3(SOURCE)}.retire`, with when
+  the proof began), renames the checkout to a private
+  `.bulkload-retire-<tag>` beside it (no process inside it first), and
+  re-proves it before every deletion step: its prints unchanged and no
+  process inside, else it goes back (`raced`, `in-use`); a deletion a
+  crash or a failure cut short resumes only while no file under it has a
+  ctime after the proof began (else what is left goes back,
+  `written-since`). Then it marks the record deleting, deletes the
+  renamed tree (its identity checked; its directories made writable
+  first, a failure kept `delete-failed` for the next pass), removes a
+  linked landing's administration directory (under `worktrees/`, its
+  `gitdir` as proved, or gone after a crash) and removes the record. A
+  rerun finishes or puts back a pending record before the item's
+  workspace step, whatever that step answers (finding 3). The `.advance`
+  record and the receipt say `advance-beside=retired|kept|pending|absent`
+  (with `advance-beside-reason=`; `pending`: put back for a transient
+  reason and tried again by the next pass), and closure prints them in the
+  row's `advance` block with `retire_pending` (a `.retire` record under
+  way). A beside not retired is a duplicate (the coordinator's decision on
+  #289): closure holds the item `refused-pending-review` with
+  `GIT_ADVANCE_BESIDE_KEPT reason="..."` until `closure-dispose`.
 - **A clean source lands no tree beside (operator ruling 2026-10-16
   21:24Z: "refs in always; a tree beside ONLY where neo has uncommitted
   work").** Under `estate-apply --adopt --beside SUFFIX --refs-in` (so

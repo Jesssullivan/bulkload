@@ -139,8 +139,9 @@ pub struct Proof {
     /// Worktrees a standalone tree's `.git` registers that are gone on
     /// this host (prunable: a copy's, naming another host's paths).
     pub prunable: u64,
+    /// The prints of the tree and a linked tree's administration directory
+    /// (its HEAD, index and reflogs live there), taken before the proof.
     prints: [u8; 32],
-    admin_prints: [u8; 32],
     wants: Vec<Want>,
 }
 
@@ -151,6 +152,8 @@ pub struct Rules<'a> {
     pub suffix: &'a str,
     /// The ref namespace (the suffix without its leading `.`).
     pub ns: &'a str,
+    /// The SOURCE label (an advance's own marker on a lock is its).
+    pub source: &'a str,
     /// `--drop-rebuildable`: entries under a rebuildable root are counted
     /// and go with the tree, as a capture omits them; without it one
     /// refuses `rebuildable:<path>`.
@@ -286,14 +289,12 @@ fn unreachable(live: &Path, mut commits: Vec<(String, String)>) -> Option<String
 // `AGENTS.md` or `CLAUDE.md` above its HEAD's bytes the one difference
 // allowed (estate-handoff writes them into beside landings): `Some(n)` with
 // the targets that carry one, `None` when it is not clean.
-fn clean_but_blocks(beside: &Path, git_dir: &Path) -> Result<Option<u64>> {
-    if advance::status(beside, git_dir)?.is_some() {
+fn clean_but_blocks(beside: &Path, git_dir: &Path, source: &str) -> Result<Option<u64>> {
+    if advance::status(beside, git_dir, source)?.is_some() {
         return Ok(Some(0));
     }
-    for name in advance::IN_PROGRESS {
-        if retire::lstat(&git_dir.join(name))?.is_some() {
-            return Ok(None);
-        }
+    if advance::in_progress(git_dir, source)? {
+        return Ok(None);
     }
     let tagged = output(git(beside).args(["ls-files", "-v", "-z"]))?;
     if tagged
@@ -540,13 +541,6 @@ fn receipts(git_dir: &Path) -> Result<Option<Receipts>> {
     Ok(Some(read))
 }
 
-// The prints of a linked tree's administration directory (its HEAD, index
-// and reflog live there): a commit made in the tree while it is proved
-// changes them.
-fn admin_prints(admin: Option<&Path>) -> Result<[u8; 32]> {
-    admin.map_or(Ok([0; 32]), retire::prints)
-}
-
 /// Prove the beside tree at `beside` a subset of the live checkout at
 /// `live` (module docs), by `rules`. Read-only.
 ///
@@ -561,7 +555,7 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
     if !meta.is_dir() {
         return Ok(refused("not-a-directory"));
     }
-    let before = retire::prints(beside)?;
+    let empty_prints = retire::prints(beside, None)?;
     if fs::read_dir(beside).refuse_at(SITE)?.next().is_none() {
         return Ok(Verdict::Retirable(Box::new(Proof {
             shape: Shape::Empty,
@@ -576,8 +570,7 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
             exclude: Vec::new(),
             carried: Vec::new(),
             prunable: 0,
-            prints: before,
-            admin_prints: [0; 32],
+            prints: empty_prints,
             wants: Vec::new(),
         })));
     }
@@ -618,13 +611,16 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
         return Ok(refused("other-repository"));
     };
     let admin = (shape == Shape::Linked).then(|| git_dir.clone());
-    let admin_before = admin_prints(admin.as_deref())?;
-    if retire::lstat(&git_dir.join("index.lock"))?.is_some() {
-        return Ok(refused("index-locked"));
+    // The prints before the proof (the tree's, and a linked tree's
+    // administration's): a write while it reads them refuses `raced`.
+    let before = retire::prints(beside, admin.as_deref())?;
+    // An operation in progress, or a Git lock held, there.
+    if advance::in_progress(&git_dir, rules.source)? {
+        return Ok(refused("in-progress"));
     }
-    // 2. Tracked-clean (and every in-progress operation and hidden flag),
-    // a sealed hand-off block the one difference allowed.
-    let Some(blocks) = clean_but_blocks(beside, &git_dir)? else {
+    // 2. Tracked-clean (and every hidden flag), a sealed hand-off block the
+    // one difference allowed.
+    let Some(blocks) = clean_but_blocks(beside, &git_dir, rules.source)? else {
         return Ok(refused("tracked-changes"));
     };
     // 3. Its HEAD, reachable from a ref of the live repository.
@@ -769,7 +765,7 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
     if let Some(first) = planned.occupied().first() {
         return Ok(refused(format!("occupied:{}", shown(first))));
     }
-    if retire::prints(beside)? != before || admin_prints(admin.as_deref())? != admin_before {
+    if retire::prints(beside, admin.as_deref())? != before {
         return Ok(refused("raced"));
     }
     let files = u64::try_from(tracked.iter().filter(|path| !dirs.contains(*path)).count())
@@ -788,7 +784,6 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
         carried,
         prunable,
         prints: before,
-        admin_prints: admin_before,
         wants,
     })))
 }
@@ -1038,24 +1033,27 @@ pub fn retire(
         super::create(live, &planned.create)?;
     }
     // Proved again: every entry is now in the live checkout.
+    let started = retire::proof_start_ns();
     let Verdict::Retirable(again) = prove(beside, live, rules)? else {
         return Ok(Retired::Kept("raced".to_owned()));
     };
     if again.tally.placed != 0 || again.tally.beside != 0 || again.tally.dirs_placed != 0 {
         return Ok(Retired::Kept("raced".to_owned()));
     }
-    // The last look before the rename: a commit made there since the
-    // proof (its HEAD, index or reflog) keeps the tree.
-    let admin = (again.shape == Shape::Linked)
-        .then(|| landed::worktree_git_dir(beside).ok().flatten())
-        .flatten();
-    if head_of(beside)?.oid != again.head || admin_prints(admin.as_deref())? != again.admin_prints {
+    // The last look before the rename (its prints again inside the
+    // removal): a commit made there since the proof keeps the tree.
+    if head_of(beside)?.oid != again.head {
         return Ok(Retired::Kept("raced".to_owned()));
     }
     record.deleting = true;
     landed::write(&ledger, &record)?;
     let capture = *blake3::hash(format!("{item}\0{}", proof.head).as_bytes()).as_bytes();
-    let done = retire::remove_proved(&intent, beside, (&item, capture), again.prints)?;
+    let done = retire::remove_proved(
+        &intent,
+        (beside, live),
+        (&item, capture),
+        (again.prints, started),
+    )?;
     if done == Retired::Retired {
         mark_retired(&ledger)?;
     }

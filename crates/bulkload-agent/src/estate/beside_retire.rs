@@ -160,6 +160,7 @@ pub fn run(options: &RetireOptions, out: &mut dyn FnMut(&str) -> Result<()>) -> 
         let rules = subset::Rules {
             suffix: &options.suffix,
             ns: &ns,
+            source: &options.source,
             drop_rebuildable: options.drop_rebuildable,
         };
         // A refusal proving one tree is that tree's typed answer; the run

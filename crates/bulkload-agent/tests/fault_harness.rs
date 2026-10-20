@@ -1558,6 +1558,42 @@ scenarios! {
     estate_advance_after_seat_rerun_without_flag => EstateAdvanceAfterSeat: 1, EstateAdvance::RetireNoFlag;
     estate_advance_retire_after_rename_rerun_without_flag => EstateAdvanceRetireAfterRename: 1, EstateAdvance::RetireNoFlag;
     estate_advance_after_branch_then_edited => EstateAdvanceAfterBranch: 1, EstateAdvance::AdvanceEdited;
+    // Review of #289, finding 1: a seat the advance replaces edited after
+    // its crash rolls it back, never HEAD advanced over the old index (the
+    // rollback itself crashed after its intent and mid-seat, then
+    // finished). Operator ruling 2026-10-19, "Switch when clean": a switch
+    // crashed at each step, between its branch's creation and HEAD's move
+    // too. Findings 2 and 3: a retirement finished before the workspace
+    // step, and never over a write made since its proof.
+    estate_advance_after_branch_rolled_back => EstateAdvanceAfterBranch: 1, EstateAdvance::AdvanceRolledBack;
+    estate_advance_after_seat_rolled_back => EstateAdvanceAfterSeat: 2, EstateAdvance::AdvanceRolledBack;
+    estate_advance_rollback_after_intent => EstateAdvanceRollbackAfterIntent: 1, EstateAdvance::RollbackCrash;
+    estate_advance_rollback_mid => EstateAdvanceRollbackMid: 2, EstateAdvance::RollbackCrash;
+    estate_advance_switch_after_intent => EstateAdvanceAfterIntent: 1, EstateAdvance::Switch;
+    estate_advance_switch_head_branch => EstateConvergeHeadBranch: 1, EstateAdvance::Switch;
+    estate_advance_switch_after_branch => EstateAdvanceAfterBranch: 1, EstateAdvance::Switch;
+    estate_advance_switch_after_seat => EstateAdvanceAfterSeat: 3, EstateAdvance::Switch;
+    estate_advance_switch_after_index => EstateAdvanceAfterIndex: 1, EstateAdvance::Switch;
+    estate_advance_switch_after_ledger => EstateAdvanceAfterLedger: 1, EstateAdvance::Switch;
+    estate_advance_retire_after_rename_live_edited => EstateAdvanceRetireAfterRename: 1, EstateAdvance::RetireLiveEdited;
+    estate_advance_retire_after_rename_written => EstateAdvanceRetireAfterRename: 1, EstateAdvance::RetireWritten;
+    estate_advance_retire_mid_written => EstateAdvanceRetireMid: 1, EstateAdvance::RetireWritten;
+    // The verification of #289, r6: a standalone beside's two-valued key
+    // carried into the live configuration, crashed after the first value;
+    // the rerun adds the second and retires the beside.
+    estate_advance_retire_carried => EstateAdvanceRetireCarried: 1, EstateAdvance::RetireCarry;
+    // 2026-10-19 (the td01 batch): a stripped linked worktree adopted by
+    // registering it again, crashed after its administration directory
+    // and after its gitfile; finished by the rerun, no file written.
+    estate_apply_nonrepo_registered => EstateApplyNonrepoRegistered: 1, EstateAdopt::NonrepoAdopt;
+    estate_apply_nonrepo_linked_added => EstateConvergeLinkedAdded: 1, EstateAdopt::NonrepoAdopt;
+    // Review of #286: a crash past the gitfile, then a seat removed and a
+    // mode changed (finding 2); a crash before it, then a seat edited
+    // (finding 6).
+    estate_apply_nonrepo_tampered => EstateConvergeLinkedAdded: 1, EstateAdopt::NonrepoTampered;
+    estate_apply_nonrepo_abandon => EstateApplyNonrepoRegistered: 1, EstateAdopt::NonrepoAbandon;
+    // Verification of #286: the same crash, then a pass without --adopt.
+    estate_apply_nonrepo_no_adopt => EstateApplyNonrepoRegistered: 1, EstateAdopt::NonrepoNoAdopt;
     // M2r2 b: a capture-refused item carried as files, crashed after its
     // carry record and before its outcome.
     estate_carry_recorded => EstateCarryRecorded: 1, EstateCarried::Workspace;

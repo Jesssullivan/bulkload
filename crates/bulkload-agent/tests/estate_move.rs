@@ -14,7 +14,8 @@
 //!   `<path>.<label>`, the live checkout untouched;
 //! - `broken` and `broken2`: captures refused (no index): carried as files,
 //!   at the live path (absent) and beside it (occupied);
-//! - `occupied`: a non-Git tree at the live path: refused typed, untouched;
+//! - `occupied`: a non-Git tree at the live path (a standalone item's):
+//!   refused typed (`GIT_DESTINATION_NONREPO_DIFFERS`), untouched;
 //! - `bare.git`: a bare repository landed refs-only.
 //!
 //! Then: closure accounts for every item; a rerun changes no ref and keeps
@@ -373,6 +374,24 @@ fn one_pass_lands_adopts_besides_carries_and_accounts_for_every_item() {
         &["commit", "--quiet", "--allow-empty", "-m", "src topic 2"],
     );
     git(&src.join("same"), &["checkout", "--quiet", "main"]);
+    // The source re-stamps `diverged`'s file, its bytes unchanged: its stat
+    // identity moves, so this pass captures `diverged` again whatever the
+    // clock did. The mtime is set explicitly, an hour before the old one,
+    // so it differs and is never in the future; the ctime moves with it.
+    // Without this, `diverged` was recaptured only while its first capture
+    // was racy (seats stamped within the 2 s racy allowance of that pass's
+    // start), which held only when the fixture and the first pass ran
+    // inside two seconds: under load the pass below reused the capture and
+    // never reached the beside converge it is here to prove.
+    let restamped = src.join("diverged/d.txt");
+    let stamp = fs::symlink_metadata(&restamped)
+        .unwrap()
+        .modified()
+        .unwrap();
+    fs::File::open(&restamped)
+        .unwrap()
+        .set_modified(stamp - std::time::Duration::from_hours(1))
+        .unwrap();
     let resourced = agent(&os(&[
         &"estate-move-source",
         &"--map",
@@ -387,8 +406,8 @@ fn one_pass_lands_adopts_besides_carries_and_accounts_for_every_item() {
         "{}",
         converged.stdout
     );
-    // The new pass recaptured `diverged` too, and its beside landing
-    // converges to the new capture (gap C12, A-115: a beside landing used
+    // The new pass recaptured `diverged` too (re-stamped above), and its
+    // beside landing converges to the new capture (gap C12, A-115: a beside landing used
     // to refuse every later pass `GIT_DESTINATION_OCCUPIED`): the live
     // checkout and its refs as they were, the beside checkout still
     // detached at the captured head. Everything accounts as before.
@@ -401,7 +420,7 @@ fn one_pass_lands_adopts_besides_carries_and_accounts_for_every_item() {
     let mut got = closure(&converged.stdout);
     assert!(
         got.remove("refusals")
-            .is_some_and(|codes| codes.contains("GIT_DESTINATION_OCCUPIED:1")),
+            .is_some_and(|codes| codes.contains("GIT_DESTINATION_NONREPO_DIFFERS:1")),
         "{}",
         converged.stdout
     );

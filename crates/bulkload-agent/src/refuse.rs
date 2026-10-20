@@ -85,6 +85,24 @@ pub fn source_seat(error: &std::io::Error, site: &'static str) -> BulkloadRefusa
     io(error, site)
 }
 
+/// The refusal for an I/O error resolving, statting or opening the source
+/// root itself, at `site` (#232).
+///
+/// `ENOENT` is `SOURCE_ROOT_MISSING`: the root the verb was given is not
+/// there. Anything else is `SOURCE_ROOT_UNREADABLE` with its errno: an
+/// unsearchable parent (`EACCES`), a symlink loop (`ELOOP`), a component
+/// that is not a directory (`ENOTDIR`). A seat beneath a root keeps
+/// [`source_seat`]'s refusal; the root's own kind is judged by its caller
+/// (`SOURCE_ROOT_KIND_MISMATCH`), never read from an errno here.
+#[must_use]
+pub fn source_root(error: &std::io::Error, site: &'static str) -> BulkloadRefusal {
+    debug_assert!(is_site(site), "refusal site {site:?} is not a path");
+    if error.raw_os_error() == Some(libc::ENOENT) {
+        return BulkloadRefusal::SourceRootMissing;
+    }
+    BulkloadRefusal::SourceRootUnreadable(error.raw_os_error())
+}
+
 /// The refusal for an I/O error reading or writing a session's frame
 /// stream at `site` (S4, TIN-6592).
 ///
@@ -175,6 +193,28 @@ mod tests {
         ] {
             assert_eq!(at(errno), BulkloadRefusal::Io(Some(errno)));
         }
+    }
+
+    // #232: a root that is not there is typed; any other errno at the root
+    // is typed with its errno, never read as a kind.
+    #[test]
+    fn a_missing_root_is_typed_and_other_errnos_are_unreadable_with_theirs() {
+        let at = |errno| super::source_root(&std::io::Error::from_raw_os_error(errno), "t::s");
+        assert_eq!(at(libc::ENOENT), BulkloadRefusal::SourceRootMissing);
+        for errno in [libc::EACCES, libc::ELOOP, libc::ENOTDIR, libc::EIO] {
+            assert_eq!(
+                at(errno),
+                BulkloadRefusal::SourceRootUnreadable(Some(errno))
+            );
+        }
+        assert_eq!(
+            super::source_root(&std::io::Error::other("no errno"), "t::s"),
+            BulkloadRefusal::SourceRootUnreadable(None)
+        );
+        assert_eq!(
+            BulkloadRefusal::SourceRootUnreadable(Some(libc::EACCES)).to_string(),
+            "SOURCE_ROOT_UNREADABLE (errno 13)"
+        );
     }
 
     // S4 (TIN-6592): a stream that ends, or a peer that is gone, is the

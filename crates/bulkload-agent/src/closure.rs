@@ -106,7 +106,10 @@
 //! `created`, `kept`) when the item's `.refs-in` record names its current
 //! capture, so a refused beside landing whose refs went in says so, and,
 //! for `GIT_BESIDE_FOREIGN`, `refusal_detail`, the recorded refusal that
-//! names the beside path. `--advance-ancestor` (operator ruling
+//! names the beside path. 2026-10-19 adds `beside_reason` to an
+//! `applied-beside` row: the refusal code that sent the capture beside
+//! (`GIT_DESTINATION_DIVERGED`, `GIT_DESTINATION_NONREPO_DIFFERS`).
+//! `--advance-ancestor` (operator ruling
 //! 2026-10-19) adds one key to a row whose item's `.advance` record names
 //! its current capture, `advance` (`outcome`: `advanced` or the
 //! `GIT_ADVANCE_*` code; `detail`, the refusal's, such as the colliding
@@ -420,6 +423,8 @@ pub fn rerun_only(code: &str) -> Option<&'static str> {
     match code {
         "GIT_CONVERGE_INTERRUPTED" => Some("converge-interrupted"),
         "TRANSPORT_LOST" => Some("transport-lost"),
+        // #279: another run held the move state; nothing ran.
+        "MOVE_STATE_BUSY" => Some("state-busy"),
         "ITEMS_REFUSED" => Some("run-level-refusal"),
         _ => None,
     }
@@ -552,6 +557,10 @@ pub struct Row {
     /// Operator ruling 2026-10-16 21:24Z: a `workspace-refs-in` row's file
     /// count (no tree beside), printed as `files`.
     pub files: Option<crate::estate::FilesSummary>,
+    /// 2026-10-19: on an `applied-beside` row, the refusal code that sent
+    /// the capture beside (`GIT_DESTINATION_DIVERGED`,
+    /// `GIT_DESTINATION_NONREPO_DIFFERS`), printed as `beside_reason`.
+    pub beside_reason: Option<String>,
 }
 
 /// The per-item closure ledger and its totals.
@@ -720,6 +729,7 @@ impl Report {
                         )
                     })
                     .cloned(),
+                beside_reason: entry.beside_reason.clone(),
             });
         }
         report.recount();
@@ -1174,13 +1184,15 @@ impl Report {
                 }
                 let _ = write!(
                     out,
-                    ",\"advance\":{{\"outcome\":{},\"detail\":{},\"beside\":{},\"reason\":{},\"kept\":{},\"file_besides\":{}}}",
+                    ",\"advance\":{{\"outcome\":{},\"detail\":{},\"beside\":{},\"reason\":{},\"kept\":{},\"file_besides\":{},\"switched\":{},\"retire_pending\":{}}}",
                     json_string(&advance.outcome),
                     json_string(&advance.detail),
                     json_string(&advance.beside),
                     json_string(&advance.reason),
                     advance.kept,
                     advance.besides,
+                    advance.switched,
+                    advance.retiring,
                 );
             }
             // Operator ruling 2026-10-16 21:24Z: a row landed with no tree
@@ -1226,6 +1238,11 @@ impl Report {
                         refs.kept,
                     );
                 }
+            }
+            if let (Disposition::AppliedBeside, Some(reason)) =
+                (&row.disposition, &row.beside_reason)
+            {
+                let _ = write!(out, ",\"beside_reason\":{}", json_string(reason));
             }
             if let Some(proof) = &row.carried {
                 let _ = write!(
@@ -1455,6 +1472,7 @@ fn transfer_row(
         detail: None,
         advance: None,
         files: None,
+        beside_reason: None,
     }
 }
 
@@ -2497,6 +2515,7 @@ mod tests {
             refs_in: None,
             advance: None,
             files: None,
+            beside_reason: None,
         }
     }
 
@@ -4236,6 +4255,7 @@ mod tests {
                     refs_in: None,
                     advance: None,
                     files: None,
+                    beside_reason: None,
                 });
                 let Kind::Typed(code, how) = kind else {
                     continue;

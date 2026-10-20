@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, OsStr};
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
-use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
@@ -169,6 +169,10 @@ pub struct Policy<'a> {
     /// `GIT_ADVANCE_*` refusal, with nothing written. It holds the beside
     /// suffix (`--beside SUFFIX`) a file-level beside takes.
     pub advance: Option<&'a str>,
+    /// `--beside SUFFIX`, when given: a non-repo directory whose item has a
+    /// beside landing at `<path>SUFFIX` is never registered as a second
+    /// copy (review of #286, finding 1).
+    pub beside: Option<&'a str>,
 }
 
 /// Where an item lands.
@@ -1410,6 +1414,39 @@ impl Engine<'_> {
         Ok(())
     }
 
+    /// The print of a regular seat this converge just renamed into place,
+    /// from the descriptor it wrote (review of #289, finding 6: a later
+    /// `lstat` of the path took a write in between, or a file renamed over
+    /// it, as bulkload's own output). `before` is that descriptor's
+    /// metadata before the rename: the rename moves only its ctime, so a
+    /// size or mtime that moved since is a write into it, and the print
+    /// recorded is the one before (it matches nothing the seat holds now,
+    /// so the next converge proves the seat modified). The path holding
+    /// another inode is likewise never recorded as this converge's.
+    fn record_written(
+        &mut self,
+        relative: &[u8],
+        file: &fs::File,
+        before: &fs::Metadata,
+    ) -> Result<()> {
+        let now = file
+            .metadata()
+            .refuse_at("git_carry::converge::record_written")?;
+        let kept = |meta: &fs::Metadata| {
+            let (a, b) = (
+                crate::freshness::StatIdentity::from_metadata(meta),
+                crate::freshness::StatIdentity::from_metadata(before),
+            );
+            a.ino == b.ino && a.size == b.size && a.mtime_ns == b.mtime_ns
+        };
+        let chosen = if kept(&now) { &now } else { before };
+        self.written.insert(
+            relative.to_vec(),
+            SeatPrint::of(relative, chosen).ok_or_else(interrupted)?,
+        );
+        Ok(())
+    }
+
     /// The print the seat at `seat` must have before it is replaced or
     /// removed: the proof's (fresh), or its print now when its content is
     /// the old side's (settling). `Ok(None)`: not the landed seat.
@@ -1589,7 +1626,12 @@ impl Engine<'_> {
             return Err(interrupted());
         }
         self.writable(&seat.parent)?;
-        write_temp(seat, new, &mut self.objects)?;
+        let file = write_temp(seat, new, &mut self.objects)?;
+        let before = file
+            .as_ref()
+            .map(fs::File::metadata)
+            .transpose()
+            .refuse_at("git_carry::converge::add")?;
         let directory = seat.directory()?;
         if let Err(error) =
             crate::io::sys::rename_exclusive_at(&directory, &seat.temp, &directory, &seat.leaf)
@@ -1603,7 +1645,10 @@ impl Engine<'_> {
         }
         landed::sync_dir(&seat.parent)?;
         self.custody.count("seats-added");
-        self.record(seat, &op.path)
+        match (&file, &before) {
+            (Some(file), Some(before)) => self.record_written(&op.path, file, before),
+            _ => self.record(seat, &op.path),
+        }
     }
 
     fn replace(&mut self, seat: &Seat, op: &Op) -> Result<()> {
@@ -1632,7 +1677,12 @@ impl Engine<'_> {
             }
         }
         self.writable(&seat.parent)?;
-        write_temp(seat, new, &mut self.objects)?;
+        let file = write_temp(seat, new, &mut self.objects)?;
+        let before = file
+            .as_ref()
+            .map(fs::File::metadata)
+            .transpose()
+            .refuse_at("git_carry::converge::replace")?;
         fault_point!(EstateConvergeSeatBeforeExchange);
         let directory = seat.directory()?;
         if let Err(error) = crate::io::exchange(&directory, &seat.temp, &seat.leaf) {
@@ -1665,7 +1715,10 @@ impl Engine<'_> {
             fs::remove_file(&seat.temp_path).refuse_at("git_carry::converge::replace")?;
             landed::sync_dir(&seat.parent)?;
             self.custody.count("seats-replaced");
-            return self.record(seat, &op.path);
+            return match (&file, &before) {
+                (Some(file), Some(before)) => self.record_written(&op.path, file, before),
+                _ => self.record(seat, &op.path),
+            };
         }
         // Not the landed seat: it goes back, this converge's file is removed.
         crate::io::exchange(&directory, &seat.temp, &seat.leaf)
@@ -1822,13 +1875,16 @@ fn sweep_probes(worktree: &Path) -> Result<u64> {
 /// re-read, which would take an operator's `git add` since for landed).
 /// `before` names the tree the replaced index holds (a converge's old
 /// capture's staged tree; an advance's live HEAD tree), for the two-way
-/// `read-tree -m`.
+/// `read-tree -m`. `held` is the marker of an `index.lock` the caller
+/// already holds (an advance holds its own from the proof under the lock
+/// on, review of #289 finding 1): the index is published through it, and a
+/// refusal leaves it held for the caller to put back or keep.
 fn publish_index(
     worktree: &Path,
     git_dir: &Path,
     (before, after): (&str, &Meta),
     old: [u8; 32],
-    tag: &str,
+    (tag, held): (&str, Option<&[u8]>),
 ) -> Result<[u8; 32]> {
     const SITE: &str = "git_carry::converge::publish_index";
     let lock = git_dir.join("index.lock");
@@ -1856,18 +1912,28 @@ fn publish_index(
     )?;
     super::restore_intent_to_add(worktree, Some(&fresh), &after.heads())?;
     let target = index_digest(worktree, Some(&fresh))?;
-    // A lock this converge left (a crash while holding it, finding 5).
+    // The caller's own lock, or one this converge left (a crash while
+    // holding it, finding 5).
+    let mut holding = false;
     if lstat(&lock)?.is_some() {
-        let ours = fs::read(&lock).is_ok_and(|bytes| bytes == marker.as_bytes())
-            || index_digest(worktree, Some(&lock)).is_ok_and(|found| found == target);
-        if !ours {
-            cleanup();
-            return Err(interrupted());
+        let content = fs::read(&lock).ok();
+        if held.is_some_and(|held| content.as_deref() == Some(held)) {
+            holding = true;
+        } else {
+            let ours = content.is_some_and(|bytes| bytes == marker.as_bytes())
+                || index_digest(worktree, Some(&lock)).is_ok_and(|found| found == target);
+            if !ours {
+                cleanup();
+                return Err(interrupted());
+            }
+            fs::remove_file(&lock).refuse_at(SITE)?;
         }
-        fs::remove_file(&lock).refuse_at(SITE)?;
     }
     let current = index_digest(worktree, None)?;
     if current == target {
+        if let (true, Some(held)) = (holding, held) {
+            native_refs::remove_owned_lock(&lock, &[held.to_vec()])?;
+        }
         cleanup();
         return Ok(target);
     }
@@ -1875,18 +1941,20 @@ fn publish_index(
         cleanup();
         return Err(interrupted());
     }
-    // The marker exists before the lock's name (review 4: a lock created
-    // empty and left so by a power loss proved nothing, and wedged every
-    // rerun and the operator's Git).
-    if !native_refs::publish_lock(&lock, marker.as_bytes())? {
-        cleanup();
-        return Err(interrupted());
-    }
-    fault_point!(EstateConvergeIndexLocked);
-    if index_digest(worktree, None)? != old {
-        let _ = fs::remove_file(&lock);
-        cleanup();
-        return Err(interrupted());
+    if !holding {
+        // The marker exists before the lock's name (review 4: a lock
+        // created empty and left so by a power loss proved nothing, and
+        // wedged every rerun and the operator's Git).
+        if !native_refs::publish_lock(&lock, marker.as_bytes())? {
+            cleanup();
+            return Err(interrupted());
+        }
+        fault_point!(EstateConvergeIndexLocked);
+        if index_digest(worktree, None)? != old {
+            let _ = fs::remove_file(&lock);
+            cleanup();
+            return Err(interrupted());
+        }
     }
     fs::copy(&index, &merged).refuse_at(SITE)?;
     let two_way = super::read_tree(
@@ -2245,6 +2313,39 @@ pub fn apply_workspace(
             )
         };
     }
+    // 2026-10-19 (the td01 batch): a directory with no `.git` at all at a
+    // linked item's planned path, under `--adopt`, is adopted by
+    // registering it again when it proves equal to the capture, never
+    // rewriting a file in it; a standalone item's has no registration to
+    // re-create. Either refusal leaves it as it is, and `--beside` lands
+    // the capture beside it.
+    // Verification of #286: a pass that does not adopt a non-repo
+    // directory clears this item's own half-made registration of it (a
+    // crash before its gitfile), ownership-checked, then refuses as before.
+    if !standalone && !landing.beside && nonrepo(workspace) && !policy.adopt {
+        if planned(target.repository)?.is_some() {
+            super::abandon_nonrepo(target.repository, workspace, target.source, landing.item)?;
+        }
+        return Err(BulkloadRefusal::GitDestinationOccupied);
+    }
+    if policy.adopt && !landing.beside && nonrepo(workspace) {
+        if planned(target.repository)?.is_none() {
+            return Err(BulkloadRefusal::GitDestinationOccupied);
+        }
+        if standalone {
+            return Err(BulkloadRefusal::GitDestinationNonrepoDiffers);
+        }
+        let beside = policy
+            .beside
+            .map(|suffix| super::beside::path(workspace, suffix));
+        return super::adopt_nonrepo_linked(
+            staged,
+            (target.repository, target.base),
+            (workspace, beside.as_deref()),
+            target.source,
+            landing,
+        );
+    }
     let git_dir =
         landed::worktree_git_dir(workspace)?.ok_or(BulkloadRefusal::GitDestinationOccupied)?;
     let advanced = advance::read_advanced(&landed::ledger_dir(&git_dir, target.source))?;
@@ -2309,7 +2410,19 @@ pub fn apply_workspace(
         if intent.item != landing.item || intent.destination != destination.as_os_str().as_bytes() {
             return Err(BulkloadRefusal::GitDestinationOccupied);
         }
-        super::recover_linked_landing(&destination, &place.common, target.source, &intent)?;
+        // A non-repo adoption's registration (review of #286, finding 2):
+        // every seat proved again, none written.
+        let marker = nonrepo_marker(&landing_intent);
+        if landed::exists(&marker)? {
+            if !super::finish_nonrepo_adoption(&destination, &place.common, target.source, &intent)?
+            {
+                custody.count("not-convergeable");
+            }
+            custody.count("adopted-nonrepo");
+            landed::remove(&marker)?;
+        } else {
+            super::recover_linked_landing(&destination, &place.common, target.source, &intent)?;
+        }
         landed::remove(&landing_intent)?;
         custody.count("landing-recovered");
         // A beside landing (M2 round 2 item c) is finished forward; one of
@@ -2600,7 +2713,7 @@ fn converge(
             &place.git_dir,
             (&staged_tree(meta0)?, &meta1),
             ledger.index,
-            &tag,
+            (&tag, None),
         )?;
         fault_point!(EstateConvergeAfterIndex);
         set_head(worktree, &ledger.head, &plan.head, plan.branch.as_ref())
@@ -2714,7 +2827,7 @@ fn settle(place: &Place<'_>, ledger: &LandedWorkspace) -> Result<Custody> {
         &place.git_dir,
         (&staged_tree(&meta0)?, &meta1),
         intent.index_old,
-        &intent.tag,
+        (&intent.tag, None),
     )?;
     let head_old = intent.head.0.clone();
     let current = head_of(worktree)?;
@@ -3152,8 +3265,393 @@ pub(super) fn check_linked(
     source: &str,
     (observed_ns, union): (i128, bool),
 ) -> Result<LinkedChecked> {
-    const SITE: &str = "git_carry::converge::check_linked";
     let destination = first_landing_target(staged, destination)?;
+    check_linked_at(
+        staged,
+        (repository, base),
+        destination,
+        source,
+        (observed_ns, union),
+    )
+    .map(|(checked, _)| checked)
+}
+
+/// What [`check_nonrepo`] proved of an occupied non-repo directory.
+pub(super) struct NonrepoProof {
+    /// The first linked landing's checks, its destination the directory.
+    pub checked: LinkedChecked,
+    /// Every carried seat's print, as the proof read it.
+    pub prints: Vec<SeatPrint>,
+    /// The racy instant, taken before the proof's first read.
+    pub recorded_ns: i128,
+}
+
+/// Whether `path` is a directory with no `.git` entry at all: a linked
+/// worktree whose registration was stripped (the td01 batch, 2026-10-19),
+/// or any other tree no repository claims. Never follows a symlink.
+pub(super) fn nonrepo(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
+        && matches!(
+            fs::symlink_metadata(path.join(".git")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        )
+}
+
+/// The checks of adopting the non-repo directory at `destination` (no
+/// `.git` at all) as a linked worktree of `repository` (2026-10-19, the
+/// td01 batch), before any write: the path spelled canonically (else
+/// `GIT_DESTINATION_OCCUPIED`), no worktree registration of the repository
+/// naming it already unless a landing intent of this item names it (a
+/// registration this item began and a crash cut short), the first linked
+/// landing's own checks ([`check_linked`] less its absent-path rule), and
+/// the seat proof ([`adopt::prove_seats`]): every carried seat, tracked,
+/// untracked and ignored, held there with its kind, mode and bytes; extra
+/// files there are left alone. Read-only.
+///
+/// # Errors
+/// `GIT_DESTINATION_NONREPO_DIFFERS` when a seat differs or a stale
+/// registration names the path; as [`check_linked`].
+pub(super) fn check_nonrepo(
+    staged: &super::StagedBundle,
+    (repository, base): (&Path, Option<&super::StagedBundle>),
+    destination: &Path,
+    (source, item, beside): (&str, &str, Option<&Path>),
+    (observed_ns, union): (i128, bool),
+) -> Result<NonrepoProof> {
+    const SITE: &str = "git_carry::converge::check_nonrepo";
+    super::refuse_bare_capture(staged)?;
+    if !nonrepo(destination) || fs::canonicalize(destination).refuse_at(SITE)? != destination {
+        return Err(BulkloadRefusal::GitDestinationOccupied);
+    }
+    let common = super::common_repository(repository)?;
+    let intent = landed::read::<landed::LandingIntent>(&landed::landing_intent_path(
+        &landed::ledger_dir(&common, source),
+        destination,
+    ))?;
+    let ours = intent.is_some_and(|intent| intent.item == item);
+    if registration_of(&common, destination)?.is_some() && !ours {
+        return Err(BulkloadRefusal::GitDestinationNonrepoDiffers);
+    }
+    let target = super::parents::FirstTarget::of(destination)?;
+    let recorded_ns = super::pass_start_ns();
+    let (checked, scratch) = check_linked_at(
+        staged,
+        (repository, base),
+        target,
+        source,
+        (observed_ns, union),
+    )?;
+    let meta = scratch.meta(source)?;
+    let prints = adopt::prove_seats(destination, &scratch.repo, &meta, false)?
+        .map_err(|_| BulkloadRefusal::GitDestinationNonrepoDiffers)?;
+    // Review of #286, finding 1: registering it must not make a second
+    // registered copy of this worktree: the captured branch checked out by
+    // another worktree (the td01 shape: the item's beside landing holding
+    // it), or the item's beside landing there at all.
+    if let Some(branch) = meta.symbolic(&scratch.repo)? {
+        let held = checked_out_by(repository)?
+            .into_iter()
+            .any(|(path, held)| held == branch && !same_path(&path, destination));
+        if held {
+            return Err(BulkloadRefusal::GitDestinationNonrepoDuplicate);
+        }
+    }
+    if beside.is_some_and(|beside| fs::symlink_metadata(beside).is_ok()) {
+        return Err(BulkloadRefusal::GitDestinationNonrepoDuplicate);
+    }
+    if registered_copy(repository, destination, source, item)? {
+        return Err(BulkloadRefusal::GitDestinationNonrepoDuplicate);
+    }
+    Ok(NonrepoProof {
+        checked,
+        prints,
+        recorded_ns,
+    })
+}
+
+/// The worktree administration directory of the repository whose common
+/// directory is `common` that names `destination` (its `gitdir` file is
+/// `<destination>/.git`), if any. Read-only.
+///
+/// # Errors
+/// IO listing the administration directories.
+pub(super) fn registration_of(common: &Path, destination: &Path) -> Result<Option<PathBuf>> {
+    const SITE: &str = "git_carry::converge::registration_of";
+    let dir = common.join("worktrees");
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(crate::refuse::io(&error, SITE)),
+    };
+    for entry in entries {
+        let admin = entry.refuse_at(SITE)?.path();
+        let Ok(text) = fs::read_to_string(admin.join("gitdir")) else {
+            continue;
+        };
+        // Absolute, or relative to the administration directory
+        // (`worktree.useRelativePaths`), as `adopt::foreign_shape` reads it
+        // (review of #286, finding 3); the `.git` it names may not exist.
+        let named = Path::new(text.trim_end_matches(['\n', '\r']));
+        let named = if named.is_absolute() {
+            named.to_path_buf()
+        } else {
+            admin.join(named)
+        };
+        let points_here = named.file_name() == Some(OsStr::new(".git"))
+            && named
+                .parent()
+                .and_then(|parent| fs::canonicalize(parent).ok())
+                .is_some_and(|parent| same_path(&parent, destination));
+        if points_here {
+            return Ok(Some(admin));
+        }
+    }
+    Ok(None)
+}
+
+/// Register the existing directory `destination` as a linked worktree of
+/// the repository whose common directory is `common`, at `head`: the
+/// administration directory `git worktree add` writes (2026-10-19, the
+/// td01 batch). `worktrees/<id>` holds `commondir` (`../..`), `HEAD` and
+/// last `gitdir` (`<destination>/.git`, which makes it Git's); `<id>` is
+/// the directory's name, numbered when taken, as Git numbers it. One that
+/// names `destination` already is this item's registration a crash cut
+/// short ([`check_nonrepo`] refuses any other) and is reused, its files
+/// written again. Durable. Nothing in `destination` is written here.
+/// Returns the administration directory.
+///
+/// # Errors
+/// IO.
+pub(super) fn register(common: &Path, destination: &Path, head: &Head) -> Result<PathBuf> {
+    let worktrees = common.join("worktrees");
+    let admin = registration_of(common, destination)?
+        .map_or_else(|| fresh_admin(&worktrees, destination), Ok)?;
+    let head_line = head.symbolic.as_ref().map_or_else(
+        || format!("{}\n", head.oid),
+        |branch| format!("ref: {branch}\n"),
+    );
+    // Review of #286, finding 4: locked "initializing" until the `.git`
+    // gitfile is written, as `git worktree add` holds it, so a concurrent
+    // `git worktree prune` (or `gc --auto`) never removes it meanwhile.
+    landed::write_bytes_mode(&admin.join("locked"), INITIALIZING, 0o644)?;
+    landed::write_bytes_mode(&admin.join("commondir"), b"../..\n", 0o644)?;
+    landed::write_bytes_mode(&admin.join("HEAD"), head_line.as_bytes(), 0o644)?;
+    let mut gitdir = destination.join(".git").into_os_string().into_vec();
+    gitdir.push(b'\n');
+    landed::write_bytes_mode(&admin.join("gitdir"), &gitdir, 0o644)?;
+    landed::sync_dir(&admin)?;
+    landed::sync_dir(&worktrees)?;
+    Ok(admin)
+}
+
+/// What [`register`] writes in the administration directory's `locked`
+/// until the gitfile is written.
+pub(super) const INITIALIZING: &[u8] = b"initializing\n";
+
+/// Remove the `locked` "initializing" marker [`register`] left in `admin`,
+/// if it is still exactly that (an operator's lock stays). Durable.
+///
+/// # Errors
+/// IO.
+pub(super) fn unlock_registration(admin: &Path) -> Result<()> {
+    const SITE: &str = "git_carry::converge::unlock_registration";
+    let locked = admin.join("locked");
+    match fs::read(&locked) {
+        Ok(bytes) if bytes == INITIALIZING => {
+            fs::remove_file(&locked).refuse_at(SITE)?;
+            landed::sync_dir(admin)
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(crate::refuse::io(&error, SITE)),
+    }
+}
+
+/// Whether a registered worktree of `repository` other than `destination`
+/// is another copy of this item's worktree (verification of #286, the
+/// tin2835 shape), with or without `--beside` and whatever its HEAD
+/// (detached included): bulkload's landing of this item (its workspace
+/// ledger under `source` names `item`), or a `<destination>.<suffix>`
+/// sibling bulkload landed under any source (the in-place hand plans'
+/// copies; one whose ledger cannot be read counts too). Read-only.
+fn registered_copy(
+    repository: &Path,
+    destination: &Path,
+    source: &str,
+    item: &str,
+) -> Result<bool> {
+    let mut sibling = destination.as_os_str().as_bytes().to_vec();
+    sibling.push(b'.');
+    for (path, _) in worktrees(repository)? {
+        if same_path(&path, destination) {
+            continue;
+        }
+        let named = path.as_os_str().as_bytes().starts_with(&sibling);
+        let ours = match super::beside::ledger_of(&path, source) {
+            Ok(Some(ledger)) => ledger.item == item,
+            Ok(None) => false,
+            Err(_) => named,
+        };
+        if ours || (named && landed_any(&path)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether bulkload landed the worktree at `path` under any source: a
+/// workspace ledger in its git directory (or one that cannot be read).
+fn landed_any(path: &Path) -> bool {
+    let Ok(Some(git_dir)) = landed::worktree_git_dir(path) else {
+        return fs::symlink_metadata(path.join(".git")).is_ok();
+    };
+    fs::read_dir(git_dir.join(landed::LEDGER_ROOT)).is_ok_and(|mut sources| {
+        sources.any(|entry| {
+            entry.map_or(true, |entry| {
+                fs::symlink_metadata(entry.path().join(landed::WORKSPACE_LANDED)).is_ok()
+            })
+        })
+    })
+}
+
+/// Remove this item's registration of `destination` a crash or a refusal
+/// cut short before its gitfile named it (review of #286, finding 6 and
+/// its verification), when a pass does not adopt it: the administration
+/// directory [`register`] wrote (still locked "initializing" and holding
+/// only what it writes, no `.git` at `destination` naming it), then the
+/// landing intent and its marker. Anything else stays. Run under the
+/// destination lock.
+///
+/// # Errors
+/// IO.
+pub(super) fn abandon_registration(
+    common: &Path,
+    destination: &Path,
+    landing_intent: &Path,
+) -> Result<()> {
+    const SITE: &str = "git_carry::converge::abandon_registration";
+    if let Some(admin) = registration_of(common, destination)? {
+        // Registered (its gitfile names this administration directory):
+        // the recovery's to finish, never abandoned.
+        if landed::worktree_git_dir(destination)
+            .ok()
+            .flatten()
+            .is_some_and(|git_dir| same_dir(&git_dir, &admin))
+        {
+            return Ok(());
+        }
+        let ours = fs::read(admin.join("locked")).is_ok_and(|bytes| bytes == INITIALIZING);
+        let only_ours = fs::read_dir(&admin).refuse_at(SITE)?.all(|entry| {
+            entry.is_ok_and(|entry| {
+                matches!(
+                    entry.file_name().to_str(),
+                    Some("locked" | "commondir" | "HEAD" | "gitdir")
+                )
+            })
+        });
+        if !(ours && only_ours) {
+            return Ok(());
+        }
+        for name in ["gitdir", "HEAD", "commondir", "locked"] {
+            match fs::remove_file(admin.join(name)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(crate::refuse::io(&error, SITE)),
+            }
+        }
+        fs::remove_dir(&admin).refuse_at(SITE)?;
+        if let Some(parent) = admin.parent() {
+            landed::sync_dir(parent)?;
+        }
+    }
+    landed::remove(&nonrepo_marker(landing_intent))?;
+    landed::remove(landing_intent)
+}
+
+/// The marker beside a landing intent that says the landing adopts an
+/// existing non-repo directory (2026-10-19): its recovery proves every
+/// seat and writes none ([`super::finish_nonrepo_adoption`]).
+#[must_use]
+pub(super) fn nonrepo_marker(landing_intent: &Path) -> PathBuf {
+    let mut name = landing_intent.as_os_str().to_owned();
+    name.push(".nonrepo");
+    PathBuf::from(name)
+}
+
+// A new administration directory under `worktrees` for `destination`: its
+// name, numbered when taken, as Git numbers it.
+fn fresh_admin(worktrees: &Path, destination: &Path) -> Result<PathBuf> {
+    const SITE: &str = "git_carry::converge::register";
+    fs::create_dir_all(worktrees).refuse_at(SITE)?;
+    let name = destination
+        .file_name()
+        .ok_or(BulkloadRefusal::PathNotAbsolute)?;
+    for number in 0_u32..10_000 {
+        let mut id = name.to_os_string();
+        if number > 0 {
+            id.push(number.to_string());
+        }
+        let admin = worktrees.join(&id);
+        match fs::create_dir(&admin) {
+            Ok(()) => return Ok(admin),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(crate::refuse::io(&error, SITE)),
+        }
+    }
+    Err(BulkloadRefusal::GitDestinationOccupied)
+}
+
+/// The workspace ledger of a non-repo directory adopted as a linked
+/// worktree ([`super::adopt_nonrepo_linked`]): as [`record_landing`]
+/// records a first linked landing's, with the seat prints and the racy
+/// instant the adoption's proof took, never a census taken after it.
+/// `false` over the ledger cap (`not-convergeable`).
+///
+/// # Errors
+/// IO.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn record_adopted(
+    worktree: &Path,
+    (git_dir, common): (&Path, &Path),
+    source: &str,
+    landing: &Landing<'_>,
+    (instance, head, intended_branch): (&str, &Head, Option<&String>),
+    index: [u8; 32],
+    (recorded_ns, seats): (i128, Vec<SeatPrint>),
+) -> Result<bool> {
+    let ledger = LandedWorkspace {
+        item: landing.item.to_owned(),
+        capture: landing.capture,
+        observed_ns: landing.observed_ns,
+        instance: instance.to_owned(),
+        head: head.clone(),
+        intended_branch: intended_branch.cloned(),
+        index,
+        exclude: exclude_digest(&read_exclude(common)?),
+        recorded_ns,
+        fsid: landed::fsid(worktree)?,
+        seats,
+    };
+    let bytes = match landed::encode(&ledger) {
+        Ok(bytes) => bytes,
+        Err(BulkloadRefusal::BudgetExceeded) => return Ok(false),
+        Err(other) => return Err(other),
+    };
+    let directory = landed::ensure_dir(git_dir, source)?;
+    landed::write_bytes(&directory.join(landed::WORKSPACE_LANDED), &bytes)?;
+    Ok(true)
+}
+
+// [`check_linked`]'s checks for a destination already decided, and the
+// scratch repository they read the capture from.
+fn check_linked_at(
+    staged: &super::StagedBundle,
+    (repository, base): (&Path, Option<&super::StagedBundle>),
+    destination: super::parents::FirstTarget,
+    source: &str,
+    (observed_ns, union): (i128, bool),
+) -> Result<(LinkedChecked, adopt::Scratch)> {
+    const SITE: &str = "git_carry::converge::check_linked";
     let repository = fs::canonicalize(repository).refuse_at(SITE)?;
     let scratch =
         adopt::Scratch::new(staged, Some(&adopt::objects_of(&repository)?), base, source)?;
@@ -3191,16 +3689,19 @@ pub(super) fn check_linked(
         &super::carried_intent_to_add(&scratch.repo, &heads)?,
         &entries,
     )?;
-    Ok(LinkedChecked {
-        destination,
-        repository,
-        heads,
-        instance: scratch.instance,
-        exclude_path,
-        captured_exclude,
-        exclude_union,
-        entries,
-    })
+    Ok((
+        LinkedChecked {
+            destination,
+            repository,
+            heads,
+            instance: scratch.instance.clone(),
+            exclude_path,
+            captured_exclude,
+            exclude_union,
+            entries,
+        },
+        scratch,
+    ))
 }
 
 /// The common `info/exclude` (at `path`) a first linked landing keeps: the
@@ -3274,6 +3775,7 @@ pub(super) fn plan_linked(
     (bundle, base): (&Path, Option<&super::StagedBundle>),
     source: &str,
     landing: &Landing<'_>,
+    recheck: &dyn Fn() -> Result<()>,
 ) -> Result<LinkedPlan> {
     let t = landing.observed_ns;
     let repository = checked.repository.as_path();
@@ -3281,6 +3783,10 @@ pub(super) fn plan_linked(
     let lock = landed::lock(&common, source)?;
     let directory = landed::ledger_dir(&common, source);
     let mut custody = settle_repository(repository, &common, source)?;
+    // The caller's own check under the lock, before the import, the native
+    // ref step and an `--exclude-union` append (review of #286, finding 5:
+    // a non-repo adoption's directory checked again first).
+    recheck()?;
     // `--exclude-union`: under the repository-wide exclude lock, an append
     // a crash cut short is settled first.
     let exclude_path = checked.exclude_path.as_path();
@@ -3308,8 +3814,13 @@ pub(super) fn plan_linked(
     // native refs: it is the operator's, whatever its marker says.
     let mut ledger = landed::read::<RefLedger>(&directory.join(landed::REFS_LANDED))?
         .filter(|ledger| ledger.created && !landing.beside);
+    // A registration of the destination itself (a non-repo adoption a
+    // crash cut short, 2026-10-19) is this landing's own, not another
+    // worktree holding its branch.
+    let own = checked.destination.existing().map(Path::to_path_buf);
     let checked: BTreeSet<String> = checked_out_by(repository)?
         .into_iter()
+        .filter(|(path, _)| own.as_ref().is_none_or(|own| !same_path(path, own)))
         .map(|(_, branch)| branch)
         .collect();
     if let Some(current) = &ledger {
@@ -3480,6 +3991,7 @@ pub(super) fn finish_landing(
 
 mod adopt;
 pub mod advance;
+pub(super) use adopt::{prove_seats, seats_still};
 pub mod clean;
 pub mod diff;
 pub mod files;
