@@ -869,7 +869,11 @@ impl Names {
     }
 
     fn remove(&mut self, dir: NodeId, name: &[u8]) {
-        if let Some(old) = self.entries.get_mut(&dir).and_then(|entries| entries.remove(name)) {
+        if let Some(old) = self
+            .entries
+            .get_mut(&dir)
+            .and_then(|entries| entries.remove(name))
+        {
             self.drop_one(old);
         }
     }
