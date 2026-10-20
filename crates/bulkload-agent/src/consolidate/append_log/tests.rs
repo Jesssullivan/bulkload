@@ -173,6 +173,36 @@ fn each_union_answer_is_decided_before_anything_is_written() {
     );
 }
 
+/// The `--plan-only` row: keyed as the union keys it, a writer at the last
+/// line held.
+#[test]
+fn the_plan_row_keys_by_path_and_holds_a_writer_at_it() {
+    use super::plan_at;
+    let union = plan_at(
+        TRANSCRIPT.as_bytes(),
+        &cat(&[A, B, STING]),
+        &cat(&[A, B, NEO]),
+    );
+    assert_eq!(union.action, Action::Consolidated);
+    assert_eq!(
+        union.bytes.map(|bytes| bytes.len()),
+        Some(cat(&[A, B, NEO, STING]).len())
+    );
+    // A record held under the same uuid, edited: covered by identity.
+    let mut edited = cat(&[A, B]);
+    edited.extend_from_slice(b"{\"uuid\":\"b\",\"text\":\"edited\"}\n");
+    assert_eq!(
+        plan_at(TRANSCRIPT.as_bytes(), &edited, &cat(&[A, B])).action,
+        Action::Covered
+    );
+    let mut at_it = cat(&[A]);
+    at_it.extend_from_slice(b"{\"uuid\"");
+    assert_eq!(
+        plan_at(b".codex/history.jsonl", &at_it, &cat(&[A, B])).action,
+        Action::Held("append-log: ends inside a line")
+    );
+}
+
 #[test]
 fn transcripts_are_keyed_by_uuid_and_other_logs_by_line() {
     assert!(by_uuid(TRANSCRIPT.as_bytes()));

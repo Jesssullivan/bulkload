@@ -130,6 +130,23 @@ pub fn plan(live: &[u8], source: &[u8], by_uuid: bool) -> Option<Plan> {
     })
 }
 
+/// The `--plan-only` row of the append log at `rel`.
+///
+/// #297's homes listing (class, action, sizes) takes it; the #294 lane's
+/// would-write listing is this row, not a listing of its own. It is
+/// [`plan`] keyed as [`union`] keys it, and a writer at either side's last
+/// line is held `append-log: ends inside a line` (the union refuses that
+/// `HOMES_CONSOLIDATE_RACED`, retryable).
+#[must_use]
+pub fn plan_at(rel: &[u8], live: &[u8], source: &[u8]) -> Plan {
+    plan(live, source, by_uuid(rel)).unwrap_or(Plan {
+        action: Action::Held("append-log: ends inside a line"),
+        bytes: None,
+        source_records: 0,
+        live_extra: 0,
+    })
+}
+
 /// The append-log [`super::Union`]: merge `source` into `live` and trade the
 /// union in, crash-safely (see the module).
 ///
