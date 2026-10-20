@@ -937,7 +937,8 @@ fn carry_one(
                     transfer_outcome::EntryOutcome::Refused { refusal, .. } => refusal.code(),
                     transfer_outcome::EntryOutcome::SidecarCovered
                     | transfer_outcome::EntryOutcome::CarriedCorrupt { .. }
-                    | transfer_outcome::EntryOutcome::SidecarFollowsRefusedBase { .. } => "",
+                    | transfer_outcome::EntryOutcome::SidecarFollowsRefusedBase { .. }
+                    | transfer_outcome::EntryOutcome::CorruptCopyRetired { .. } => "",
                 },
                 gits.len(),
             ),

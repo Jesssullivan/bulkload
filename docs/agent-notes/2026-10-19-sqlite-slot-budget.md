@@ -147,6 +147,8 @@ Gaps left by the review:
   and prints its restart count. Holding one read transaction across the
   steps (in WAL mode it does not block writers, only checkpoints past it)
   would finish it; that changes Q16's reading and is the operator's call.
+  [2026-10-19, later: ruled, see below; this gap is closed for WAL-mode
+  sources and stays as written for rollback-journal ones.]
 - Item 2: a database refused before it was announced with a code any file
   may get (`BUDGET_EXCEEDED` at the source, `DESTINATION_OCCUPIED` at its
   decision) is not proven a database, so its sidecars stay refused by
@@ -155,3 +157,70 @@ Gaps left by the review:
 - Item 3: a store that is changed, then only touched, lands its touched
   copy under a new timed name (reuse by content looks at the dated name
   and the row's own timed name only).
+
+## 2026-10-19: operator ruling "Hold one read snapshot"
+
+Ruling (operator interview 2026-10-19, relayed by the coordinator; it
+replaces OI-1003-Q16's short-locks-only reading for this case): "Hold one
+read snapshot". For a WAL-mode source the carry backup holds one read
+transaction for the whole copy, so commits no longer restart it; the
+source's writes are never blocked; its checkpoints cannot pass the
+snapshot until the copy ends, so its `-wal` grows for the copy's duration
+and then checkpoints normally. The carry wall (1 to 1800 s, oversize
+longer) still bounds the hold: at the wall the snapshot is released and
+the store refused `BUDGET_EXCEEDED`, never held past it. Rollback-journal
+sources keep the per-step lock (a long read lock there would block
+writers).
+
+Built: `provider_sqlite::hold_read_snapshot` (journal mode read, `BEGIN`
+plus one read to take the snapshot, busy start retried inside the wall),
+used only by a carry backup (`StepBudget::Carry`); the provider verbs keep
+per-step locks, so P77's lock traces of the `snapshot` verb are unchanged.
+The wall runs from before the snapshot is taken; the snapshot is rolled
+back when the copy ends, refused or not. Reported per store on stderr
+(`sqlite-snapshot-held PATH held_ms= wal_before= wal_after= wall_s=
+outcome=`) and counted (`source_sqlite_snapshot_holds`,
+`source_sqlite_snapshot_held_ns`, `source_sqlite_held_wal_before_bytes`,
+`source_sqlite_held_wal_after_bytes`).
+
+Tests: `a_wal_store_written_continuously_is_carried_from_one_held_snapshot`
+(writer committing every 1 ms with zero busy timeout through a slowed
+copy: no restart, writer never busy and still committing, one committed
+state, `-wal` grew, hold counted); `a_held_snapshot_is_released_at_its_wall`
+(1 s wall: refused `BUDGET_EXCEEDED`, held 1 to 2 s, then the writer's
+`wal_checkpoint(TRUNCATE)` empties the `-wal`, and the next run carries
+it); `p80_a_commit_between_steps_restarts_a_rollback_backup_not_a_held_wal_one`
+(rollback: restart, commit carried, no hold; WAL: no restart, the
+snapshot's own state, one hold); `p80_a_busy_wal_store_...` now always
+carried.
+
+Residual: a held copy's `-wal` growth is bounded only by the wall and the
+source's write rate; the counters and the stderr line make it visible.
+
+## 2026-10-19: re-review of 86ca6396 and the ruling's caveats
+
+Re-review (coordinator relay, honey probes): items 1, 3, 4, 5 fixed; 2
+partial; 6 fixed except busy codes. Folded in with the ruling's caveats:
+
+| Finding | Fix | Test |
+|---|---|---|
+| A (med) `SQLITE_STATE_CHANGED` taken as proof of a SQLite seat | dropped from `sqlite_seat_refusal`: the source gives it to any header-less file beside a `-wal` with frames | `a_user_file_named_like_a_wal_beside_a_plain_file_keeps_its_own_refusal`; P83 encrypted-store leg back to by-name |
+| B (med-low) a fatal step rc is sticky on the backup object (`sqlite3.c` 3.46) | an extended busy code (`SQLITE_BUSY_RECOVERY`) is waited out on a new `Backup`; never stepped again on the old one | `an_extended_busy_step_is_waited_out_on_a_new_backup_object` (real SQLite: OFD locks on the `-shm` WRITE and RECOVER bytes give 261; the same object returns 261 after release; a new one goes on; the carry finishes) |
+| C (low-med) one full copy per change | a new timed copy, once committed, retires this store's own earlier timed copies (identity recorded by this store, untouched), recorded `corrupt-copy-retired` | `a_changing_corrupt_store_keeps_one_timed_copy_and_never_touches_others` |
+| caveat ii, `-wal` growth not counted by the floor | source floor re-checked every 250 ms while held; under it, released and `BUDGET_EXCEEDED` | `a_held_snapshot_is_released_when_the_source_floor_is_crossed` |
+| caveat iii, release on any error | a held run returns at once on any failure (busy included); the caller rolls back | `a_held_snapshot_is_released_at_once_when_its_backup_fails` |
+
+Caveat i, Codex's checkpoint modes, read at openai/codex `79a19cbb3008afe2882ccc2c5d93f02cde9a0823`:
+
+- `codex-rs/state/src/runtime/logs_maintenance.rs` L44: `PRAGMA wal_checkpoint(PASSIVE)` (startup, logs DB).
+- `codex-rs/state/src/runtime/reclamation.rs` L415-L423 `checkpoint_complete`: `PRAGMA wal_checkpoint(PASSIVE)`; its maintenance connection sets `busy_timeout(0)` and `wal_autocheckpoint=0` (L236-L241), and backs off as `Contended` when a checkpoint cannot complete (L318, L355).
+- `codex-rs/state/src/sqlite.rs` L380-L384: the read-write pools set `synchronous(Normal)` and `busy_timeout`, no `wal_autocheckpoint` override (SQLite's automatic checkpoint, PASSIVE); L503 `journal_mode = WAL` on a new DB only.
+- `codex-rs/state/src/runtime.rs` L599 `journal_mode=DELETE; BEGIN EXCLUSIVE` is inside the test `sqlite_integrity_check_can_be_interrupted_and_retried` (L549-L550), not product code.
+- Codex pins `sqlx = "=0.9.0"` (`codex-rs/Cargo.toml` L489); sqlx-sqlite 0.9.0's sources contain no `wal_checkpoint`, and `optimize_on_close` defaults to disabled (`sqlx-sqlite/src/options/mod.rs` L215), which Codex never enables.
+
+So Codex issues only PASSIVE checkpoints, which never wait for a reader:
+the held snapshot defers them (and Codex's reclamation reads that as
+contended and retries later) and blocks none of its writes. Caveats: this
+is Codex's main branch, not necessarily the build installed on neo; and
+a source that issues FULL, RESTART or TRUNCATE checkpoints is outside the
+ruling.

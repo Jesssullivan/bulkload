@@ -849,24 +849,15 @@ fn p80_a_busy_wal_store_is_carried_or_refused_for_budget() {
     writer.start_loop(2);
     let before = Counters::snapshot();
     let busy = sqlite.snapshot();
-    let restarts = Counters::snapshot()
-        .since(before)
-        .get(Counter::SourceSqliteBackupRestarts);
+    let delta = Counters::snapshot().since(before);
     writer.stop();
-    match base_refusals(&busy, b"busy.db").as_slice() {
-        [] => {
-            published(&sqlite.destination().join("busy.db"));
-        }
-        [code] => {
-            assert_eq!(code, "BUDGET_EXCEEDED");
-            assert!(restarts > 0, "a budget refusal comes from restarts");
-            assert_eq!(sqlite.remembered(), 0, "a budget refusal is not remembered");
-            let calm = sqlite.snapshot();
-            assert!(calm.refusals.is_empty(), "{:?}", calm.refusals);
-            published(&sqlite.destination().join("busy.db"));
-        }
-        other => panic!("{other:?}"),
-    }
+    // Operator ruling 2026-10-19, "Hold one read snapshot": a WAL store is
+    // read from one snapshot, so its writer's commits never restart the
+    // backup, and it is carried.
+    assert_eq!(base_refusals(&busy, b"busy.db"), Vec::<String>::new());
+    assert_eq!(delta.get(Counter::SourceSqliteBackupRestarts), 0);
+    assert_eq!(delta.get(Counter::SourceSqliteSnapshotHolds), 1);
+    published(&sqlite.destination().join("busy.db"));
     assert_eq!(writer.busy(), 0, "a WAL writer is never held up");
     writer.finish();
 }
@@ -1735,15 +1726,16 @@ fn p83_a_sidecar_of_a_base_that_is_not_a_database_is_refused() {
     std::fs::write(sqlite.source().join("quiet.db-wal"), b"").unwrap();
     std::fs::write(sqlite.source().join("notes"), b"my notes").unwrap();
     std::fs::write(sqlite.source().join("notes-journal"), b"my journal").unwrap();
-    // `signal.db-wal` follows its refused base's one refusal (plan of
-    // record 2026-10-19, C3); the sidecars of bases that were carried raw
-    // stay visible refusals by name.
+    // `signal.db` has no SQLite header: its refusal proves no database, so
+    // its `-wal` keeps its own refusal by name (re-review of #278, finding
+    // A), as do the sidecars of bases that were carried raw.
     let expected = [
         (b"notes-journal".to_vec(), "SQLITE_STATE_CHANGED".to_owned()),
         (b"quiet.db-wal".to_vec(), "SQLITE_STATE_CHANGED".to_owned()),
         (b"signal.db".to_vec(), "SQLITE_STATE_CHANGED".to_owned()),
+        (b"signal.db-wal".to_vec(), "SQLITE_STATE_CHANGED".to_owned()),
     ];
-    let follows = [(b"signal.db-wal".to_vec(), b"signal.db".to_vec())];
+    let follows: [(Vec<u8>, Vec<u8>); 0] = [];
     let stats = sqlite.snapshot();
     let mut refusals = stats.refusals.clone();
     refusals.sort();
@@ -1840,12 +1832,15 @@ fn build_large(path: &Path, journal: Journal, rows: u64, fill: u32) {
 }
 
 /// P80 pinned (review): a commit that lands between two steps of the
-/// backup, in either journal mode, restarts it from page 1 (counted), and
-/// the carried store is one committed state that includes the commit: the
-/// restart path, with the read lock released between steps (Q16), is
-/// exercised deterministically, not left to a writer's timing.
+/// backup is exercised deterministically, not left to a writer's timing.
+/// In rollback mode the read lock is released between steps (Q16): the
+/// commit restarts the backup from page 1 (counted), and the carried store
+/// is one committed state that includes it. In WAL mode the backup holds
+/// one read snapshot for the whole copy (operator ruling 2026-10-19, "Hold
+/// one read snapshot"): nothing restarts, and the carried store is the
+/// committed state the snapshot began with, the commit not in it.
 #[test]
-fn p80_a_commit_between_steps_restarts_the_backup_and_arrives_whole() {
+fn p80_a_commit_between_steps_restarts_a_rollback_backup_not_a_held_wal_one() {
     let _serial = serial();
     for journal in [Journal::Wal, Journal::Delete] {
         let sqlite = Sqlite::new();
@@ -1873,16 +1868,30 @@ fn p80_a_commit_between_steps_restarts_the_backup_and_arrives_whole() {
         );
         let acked_after = writer.lock().unwrap().acked();
         assert_eq!(acked_after, acked_before + 1, "{journal:?}");
-        assert!(
-            delta.get(Counter::SourceSqliteBackupRestarts) > 0,
-            "{journal:?}: the commit between steps restarted the backup"
-        );
         let rows = published(&sqlite.destination().join("store.db"));
-        assert_eq!(
-            rows.len() as u64,
-            acked_after,
-            "{journal:?}: the restarted backup carries the commit"
-        );
+        match journal {
+            Journal::Delete => {
+                assert!(
+                    delta.get(Counter::SourceSqliteBackupRestarts) > 0,
+                    "rollback: the commit between steps restarted the backup"
+                );
+                assert_eq!(delta.get(Counter::SourceSqliteSnapshotHolds), 0);
+                assert_eq!(
+                    rows.len() as u64,
+                    acked_after,
+                    "rollback: the restarted backup carries the commit"
+                );
+            }
+            Journal::Wal => {
+                assert_eq!(delta.get(Counter::SourceSqliteBackupRestarts), 0);
+                assert_eq!(delta.get(Counter::SourceSqliteSnapshotHolds), 1);
+                assert_eq!(
+                    rows.len() as u64,
+                    acked_before,
+                    "WAL: the held snapshot is the state it began with"
+                );
+            }
+        }
         assert_eq!(writer.lock().unwrap().busy(), 0, "{journal:?}");
         let writer = Arc::into_inner(writer).unwrap().into_inner().unwrap();
         writer.finish();
@@ -3535,4 +3544,208 @@ fn a_raw_corrupt_read_rewritten_under_it_is_refused() {
     let quiet = sqlite.snapshot();
     assert!(quiet.refusals.is_empty(), "{:?}", quiet.refusals);
     assert_eq!(quiet.sqlite_carried_corrupt.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Operator ruling 2026-10-19, "Hold one read snapshot" (replaces OI-1003-Q16's
+// short-locks-only reading for a WAL-mode carry)
+// ---------------------------------------------------------------------------
+
+/// A WAL store whose writer commits continuously through a long backup is
+/// carried from one held read snapshot: the copy completes with no
+/// restart, the writer (zero busy timeout, so any wait would show as busy)
+/// is never blocked and keeps committing, the carried store is one
+/// committed state, and the hold and the `-wal`'s growth are counted.
+/// Before the ruling the commits restarted the backup at every step and it
+/// was refused `BUDGET_EXCEEDED` after four early restarts.
+#[test]
+fn a_wal_store_written_continuously_is_carried_from_one_held_snapshot() {
+    let _serial = serial();
+    let sqlite = Sqlite::new();
+    let database = sqlite.source().join("live.db");
+    build_large(&database, Journal::Wal, 20, 150);
+    let mut writer = Writer::start(&database);
+    let acked_before = writer.commit();
+    // Two pages a step and a pause after each: the copy spans many commits.
+    let hook: crate::provider_sqlite::StepHook =
+        Arc::new(|_, _| std::thread::sleep(Duration::from_millis(3)));
+    crate::provider_sqlite::set_carry_steps(&sqlite.root, Some((2, Some(hook))));
+    writer.start_loop(1);
+    let before = Counters::snapshot();
+    let started = Instant::now();
+    let stats = sqlite.snapshot();
+    let took = started.elapsed();
+    let delta = Counters::snapshot().since(before);
+    let acked_after = writer.stop();
+    crate::provider_sqlite::set_carry_steps(&sqlite.root, None);
+    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+    assert_eq!(delta.get(Counter::SourceSqliteBackupRestarts), 0);
+    assert_eq!(delta.get(Counter::SourceSqliteSnapshotHolds), 1);
+    let held_ns = delta.get(Counter::SourceSqliteSnapshotHeldNs);
+    assert!(
+        held_ns > 0 && u128::from(held_ns) <= took.as_nanos(),
+        "held {held_ns} ns within the {took:?} the copy took"
+    );
+    assert!(
+        delta.get(Counter::SourceSqliteHeldWalAfterBytes)
+            > delta.get(Counter::SourceSqliteHeldWalBeforeBytes),
+        "the -wal grew while the snapshot was held"
+    );
+    assert_eq!(writer.busy(), 0, "the writer was never blocked");
+    assert!(
+        acked_after >= acked_before + 10,
+        "the writer kept committing through the copy: {acked_before} to {acked_after}"
+    );
+    let rows = published(&sqlite.destination().join("live.db")).len() as u64;
+    assert!(
+        (acked_before..=acked_after).contains(&rows),
+        "one committed state: {rows} rows, commits {acked_before} to {acked_after}"
+    );
+    no_sidecars(&sqlite.destination().join("live.db"));
+    writer.finish();
+}
+
+/// A held snapshot is never held past its wall: a WAL store whose copy
+/// outlasts it is released and refused `BUDGET_EXCEEDED` (not remembered),
+/// after which the writer's checkpoint truncates the `-wal` (nothing of
+/// the backup's is left on it), and the store is carried on the next run.
+#[test]
+fn a_held_snapshot_is_released_at_its_wall() {
+    let _serial = serial();
+    let sqlite = Sqlite::new();
+    let database = sqlite.source().join("slow.db");
+    build_large(&database, Journal::Wal, 5, 150);
+    let mut writer = Writer::start(&database);
+    writer.commit();
+    // One page a step and a long pause: far longer than a 1 s wall.
+    let hook: crate::provider_sqlite::StepHook =
+        Arc::new(|_, _| std::thread::sleep(Duration::from_millis(100)));
+    crate::provider_sqlite::set_carry_steps(&sqlite.root, Some((1, Some(hook))));
+    crate::provider_sqlite::set_carry_wall(Duration::from_secs(1));
+    let before = Counters::snapshot();
+    let started = Instant::now();
+    let stats = sqlite.snapshot();
+    let took = started.elapsed();
+    let delta = Counters::snapshot().since(before);
+    crate::provider_sqlite::set_carry_wall(Duration::ZERO);
+    crate::provider_sqlite::set_carry_steps(&sqlite.root, None);
+    // Refused before it was announced, with a code any file may get: its
+    // `-wal` and `-shm` keep their own refusals by name (review of #278,
+    // item 2's stated gap).
+    assert_eq!(base_refusals(&stats, b"slow.db"), ["BUDGET_EXCEEDED"]);
+    assert_eq!(sqlite.remembered(), 0, "a budget refusal is not remembered");
+    assert_eq!(delta.get(Counter::SourceSqliteSnapshotHolds), 1);
+    let held = Duration::from_nanos(delta.get(Counter::SourceSqliteSnapshotHeldNs));
+    assert!(
+        // At most one 100 ms step past the wall; a loaded host's sleeps
+        // stretch, so a second of slack.
+        held >= Duration::from_secs(1) && held < Duration::from_secs(2),
+        "released at its wall: held {held:?}, the session took {took:?}"
+    );
+    writer.commit();
+    writer.sql("PRAGMA wal_checkpoint(TRUNCATE);");
+    assert_eq!(
+        std::fs::metadata(sqlite.source().join("slow.db-wal"))
+            .unwrap()
+            .len(),
+        0,
+        "no snapshot is left holding the -wal"
+    );
+    assert_eq!(writer.busy(), 0);
+    let calm = sqlite.snapshot();
+    assert!(calm.refusals.is_empty(), "{:?}", calm.refusals);
+    published(&sqlite.destination().join("slow.db"));
+    writer.finish();
+}
+
+/// Re-review of #278, finding A: a plain file beside a user's
+/// `<name>-wal` that holds bytes is refused `SQLITE_STATE_CHANGED` (it
+/// could be an encrypted store), but that proves no database: the `-wal`
+/// keeps its own refusal, never covered by the plain file's.
+#[test]
+fn a_user_file_named_like_a_wal_beside_a_plain_file_keeps_its_own_refusal() {
+    let _serial = serial();
+    let sqlite = Sqlite::new();
+    std::fs::write(sqlite.source().join("notes"), b"my notes").unwrap();
+    std::fs::write(sqlite.source().join("notes-wal"), b"my own wal notes").unwrap();
+    let stats = sqlite.snapshot();
+    let mut refusals = stats.refusals.clone();
+    refusals.sort();
+    assert_eq!(
+        refusals,
+        [
+            (b"notes".to_vec(), "SQLITE_STATE_CHANGED".to_owned()),
+            (b"notes-wal".to_vec(), "SQLITE_STATE_CHANGED".to_owned()),
+        ]
+    );
+    assert!(stats.sqlite_sidecars_follow_refused.is_empty());
+    assert!(stats.sqlite_sidecars_covered.is_empty());
+}
+
+/// Re-review of #278, finding C: a corrupt store that keeps changing keeps
+/// its dated copy and one timed copy, its latest: each new timed copy
+/// retires this store's own earlier one once it has committed, recorded.
+/// A file named like a timed copy that this store did not write, and a
+/// timed copy it wrote that was touched since, are never removed.
+#[test]
+#[allow(clippy::too_many_lines)] // Four changes, read top to bottom.
+fn a_changing_corrupt_store_keeps_one_timed_copy_and_never_touches_others() {
+    let _serial = serial();
+    let sqlite = Sqlite::new();
+    let database = sqlite.source().join("rescue.db");
+    build_large(&database, Journal::Delete, 4, 60);
+    damage_page(&database, 5, 0xA5);
+    // 2026-10-19 10:00:00 UTC.
+    let t0 = 1_792_404_000;
+    set_mtime(&database, t0);
+    let names = || {
+        let mut names: Vec<String> = std::fs::read_dir(sqlite.destination())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".corrupt-"))
+            .collect();
+        names.sort();
+        names
+    };
+    let dated = "rescue.db.corrupt-20261019";
+    let timed = |hour: u32| format!("rescue.db.corrupt-20261019-{hour:02}0000.000000000");
+    let change = |page: usize, hour: u64| {
+        damage_page(&database, page, 0x5A);
+        set_mtime(&database, t0 + (hour - 10) * 3600);
+        let stats = sqlite.snapshot();
+        assert!(stats.refusals.is_empty(), "{hour}h: {:?}", stats.refusals);
+        stats
+    };
+    assert!(sqlite.snapshot().refusals.is_empty());
+    assert_eq!(names(), [dated]);
+    let second = change(6, 11);
+    assert!(second.sqlite_corrupt_retired.is_empty());
+    assert_eq!(names(), [dated.to_owned(), timed(11)]);
+    // A third state retires the second's copy, its own and untouched.
+    let third = change(7, 12);
+    assert_eq!(
+        third.sqlite_corrupt_retired,
+        [(timed(11).into_bytes(), b"rescue.db".to_vec())]
+    );
+    assert_eq!(names(), [dated.to_owned(), timed(12)]);
+    // A file this store did not write, named like a timed copy, and the
+    // latest copy touched by someone since: neither is ours to remove.
+    let foreign = sqlite.destination().join(timed(9));
+    std::fs::write(&foreign, b"someone else's").unwrap();
+    set_mtime(&sqlite.destination().join(timed(12)), t0 + 99);
+    let fourth = change(8, 13);
+    assert!(
+        fourth.sqlite_corrupt_retired.is_empty(),
+        "{:?}",
+        fourth.sqlite_corrupt_retired
+    );
+    assert_eq!(names(), [dated.to_owned(), timed(9), timed(12), timed(13)]);
+    assert_eq!(std::fs::read(&foreign).unwrap(), b"someone else's");
+    // And the next change retires only its own untouched predecessor.
+    let fifth = change(9, 14);
+    assert_eq!(
+        fifth.sqlite_corrupt_retired,
+        [(timed(13).into_bytes(), b"rescue.db".to_vec())]
+    );
+    assert_eq!(names(), [dated.to_owned(), timed(9), timed(12), timed(14)]);
 }

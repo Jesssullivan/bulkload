@@ -632,9 +632,20 @@ BOUNDARIES:
     connection's lock (SQLITE_BUSY_RECOVERY among them) is tried again
     with a bounded backoff inside that wall, holding no lock of its own,
     and is refused SQLITE_STATE_CHANGED only when the wall is spent. A
-    commit restarts a backup from page 1: restarts late in a pass are
-    allowed until the wall, but more than four before half a pass refuse
-    BUDGET_EXCEEDED, and a backup that restarted prints
+    WAL-mode source is read from one read snapshot held for the whole copy
+    (operator ruling 2026-10-19, hold one read snapshot): its commits do
+    not restart the backup and its writers are never blocked; its
+    checkpoints wait for the copy, so its -wal grows meanwhile; the wall
+    still bounds the hold (released and refused BUDGET_EXCEEDED at it), any
+    failure releases it at once, and while held the source filesystem's
+    --min-free-percent floor is checked every 250 ms (under it: released,
+    BUDGET_EXCEEDED); each hold prints sqlite-snapshot-held PATH held_ms=N
+    wal_before=N wal_after=N wall_s=N outcome=... on stderr. A source that
+    issues FULL, RESTART or TRUNCATE checkpoints would block its writers
+    behind the held snapshot; Codex issues only PASSIVE ones. In a rollback-journal
+    source a commit restarts the backup from page 1: restarts late in a
+    pass are allowed until the wall, but more than four before half a pass
+    refuse BUDGET_EXCEEDED, and a backup that restarted prints
     sqlite-backup-restarts PATH restarts=N wall_s=N outcome=... on stderr.
     pull forwards both flags to the remote serve when they are not at
     their defaults. A file without the SQLite
@@ -657,8 +668,10 @@ BOUNDARIES:
     read), is carried as a plain file beside its path,
     <db>.corrupt-<YYYYMMDD> (the date the source file was last modified,
     UTC), or <db>.corrupt-<YYYYMMDD>-<HHMMSS>.<ns> when the first holds
-    other bytes, a file holding the same bytes being adopted instead; never
-    installed as a database, and recorded carried-corrupt (C14, RUL-14; the
+    other bytes, a file holding the same bytes being adopted instead (a new
+    timed copy retires this store's own earlier, untouched timed copy of
+    the same store once it has committed: corrupt-copy-retired PATH
+    base=DB); never installed as a database, and recorded carried-corrupt (C14, RUL-14; the
     former abandon default of OI-1003-Q148 is withdrawn); an unchanged
     rerun finds it held and reads nothing. Only SQLite's own verdict
     (SQLITE_CORRUPT, SQLITE_NOTADB, integrity_check not ok) marks a store
@@ -2713,6 +2726,13 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
             "carried-corrupt {} beside={}",
             path.escape_ascii(),
             beside.escape_ascii()
+        );
+    }
+    for (path, database) in &stats.sqlite_corrupt_retired {
+        eprintln!(
+            "corrupt-copy-retired {} base={}",
+            path.escape_ascii(),
+            database.escape_ascii()
         );
     }
     for (path, database) in &stats.sqlite_sidecars_follow_refused {

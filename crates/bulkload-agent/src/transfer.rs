@@ -406,6 +406,17 @@ fn corrupt_beside_path(row: &RowSchema) -> Vec<u8> {
     dated
 }
 
+/// Whether `stamp` is a timed copy's `YYYYMMDD-HHMMSS.NNNNNNNNN`, as
+/// [`corrupt_beside_paths`] writes it.
+fn timed_stamp(stamp: &[u8]) -> bool {
+    stamp.len() == 25
+        && stamp.iter().enumerate().all(|(at, byte)| match at {
+            8 => *byte == b'-',
+            15 => *byte == b'.',
+            _ => byte.is_ascii_digit(),
+        })
+}
+
 /// `HHMMSS.NNNNNNNNN` (UTC) of a time in nanoseconds since the Unix epoch.
 fn hhmmss_ns(unix_ns: i128) -> String {
     let in_day = unix_ns.rem_euclid(86_400 * 1_000_000_000);
@@ -542,6 +553,12 @@ pub struct TransferStats {
     /// session, or found held by it from an earlier one. Accounted as
     /// carried; its sidecars are covered by it.
     pub sqlite_carried_corrupt: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Earlier timed copies of a corrupt store that this store wrote and a
+    /// newer copy of the same store superseded this session (review of
+    /// #278, finding C): the retired copy's relative path and its
+    /// database's. Removed only after the newer copy's group commit, and
+    /// only while still exactly as this store recorded it.
+    pub sqlite_corrupt_retired: Vec<(Vec<u8>, Vec<u8>)>,
     /// Sidecars the source reported beside a database that was refused:
     /// the sidecar's relative path and its database's. Their outcome is
     /// that one refusal's (plan of record 2026-10-19, C3), so closure
@@ -4080,6 +4097,23 @@ fn take_snapshot(
     }
     let post_main = stat_main();
     let post_wal = WalStat::of(parent, leaf);
+    // Operator ruling 2026-10-19: a held read snapshot is reported with how
+    // long it was held and the source `-wal` it kept from checkpointing.
+    if let Some(held) = read.held {
+        counters::add(Counter::SourceSqliteHeldWalBeforeBytes, pre_wal.size());
+        counters::add(Counter::SourceSqliteHeldWalAfterBytes, post_wal.size());
+        eprintln!(
+            "sqlite-snapshot-held {} held_ms={} wal_before={} wal_after={} wall_s={} outcome={}",
+            row.rel_path.escape_ascii(),
+            held.as_millis(),
+            pre_wal.size(),
+            post_wal.size(),
+            wall.as_secs(),
+            report
+                .as_ref()
+                .map_or_else(BulkloadRefusal::code, |_| "snapshot")
+        );
+    }
     // No `SQLite` connection is open now: the sniff closes under the lock.
     opened.close_locked();
     let now_ns = capture_clock(work.root);
@@ -4387,6 +4421,29 @@ fn finish_receive(
             true
         }
     });
+    // Review of #278, finding C: a corrupt store whose newer copy committed
+    // retires this store's own earlier timed copy, so a store that keeps
+    // changing keeps one timed copy beside its dated one. Never a copy this
+    // store did not write, or one touched since.
+    for (database, old, identity) in std::mem::take(&mut sqlite.retire) {
+        if refused.contains(&database) {
+            continue;
+        }
+        match target.retire_own(&old, &identity) {
+            Ok(true) => {
+                counters::bump(Counter::DestSqliteCorruptRetired);
+                stats.sqlite_corrupt_retired.push((old, database));
+            }
+            Ok(false) => {}
+            // Best effort: an earlier copy left in place costs room, never
+            // a byte of the store.
+            Err(refusal) => eprintln!(
+                "corrupt-copy-retire-failed {}: {}",
+                old.escape_ascii(),
+                refusal.code()
+            ),
+        }
+    }
     resolve_sidecars(stats, sidecars, sqlite);
     let keep = salvage_to_keep(target, stats, salvage_staged);
     target.retire_salvaged(&keep)?;
@@ -4431,21 +4488,23 @@ struct SqliteOutcomes {
     bases: HashSet<Vec<u8>>,
     seats: HashSet<Vec<u8>>,
     besides: HashMap<Vec<u8>, Vec<u8>>,
+    retire: Vec<(Vec<u8>, Vec<u8>, StatIdentity)>,
 }
 
-/// Whether a refusal `code` of a base is one the source gives only a
-/// `SQLite` seat (review of #278, item 2): its backup failed, its snapshot
-/// failed integrity, another user owns it, the session reads as root, or
-/// (in `snapshot` mode, for a path not itself named like a sidecar) it is
-/// a database busy past its wall, a stray WAL, or a store without the
-/// magic beside a `-wal` with frames (`SQLITE_STATE_CHANGED`).
+/// Whether a refusal `code` of a base is one the source gives only a seat
+/// whose header it sniffed as a `SQLite` database (review of #278, item 2,
+/// and its re-review, finding A): its backup failed, its snapshot failed
+/// integrity, another user owns it, or the session reads as root.
+/// `SQLITE_STATE_CHANGED` is no proof: the source gives it to a file of any
+/// content beside a `<name>-wal` that holds frames (a plain `notes` beside
+/// a user's `notes-wal` as much as an encrypted store), so such a base's
+/// sidecars keep their own refusals.
 fn sqlite_seat_refusal(code: &str) -> bool {
     [
         BulkloadRefusal::SqliteBackupFailed(None).code(),
         BulkloadRefusal::SqliteIntegrityCheckFailed.code(),
         BulkloadRefusal::SqliteSourceNotOwner.code(),
         BulkloadRefusal::SqliteSourceAsRoot.code(),
-        BulkloadRefusal::SqliteStateChanged.code(),
     ]
     .contains(&code)
 }
@@ -4468,8 +4527,9 @@ fn sqlite_seat_refusal(code: &str) -> bool {
 /// snapshot ([`SqliteOutcomes::seats`]), or when its refusal is one the
 /// source gives only a database seat ([`sqlite_seat_refusal`]). A database
 /// refused before it was announced with a code any file may get
-/// (`BUDGET_EXCEEDED`, or `DESTINATION_OCCUPIED` at its decision) is not
-/// proven one, and its sidecars stay refused by name.
+/// (`BUDGET_EXCEEDED`, `SQLITE_STATE_CHANGED`, or `DESTINATION_OCCUPIED`
+/// at its decision) is not proven one, and its sidecars stay refused by
+/// name.
 fn resolve_sidecars(
     stats: &mut TransferStats,
     sidecars: &[SidecarReport],
@@ -5334,6 +5394,10 @@ struct Inbound<'a, W> {
     /// group-commit outcome of the beside file is the database's (review of
     /// #278, item 3).
     corrupt_besides: HashMap<Vec<u8>, Vec<u8>>,
+    /// This store's own earlier timed copies a new timed copy supersedes
+    /// (finding C): the database, the old copy's path and the identity it
+    /// was recorded with; retired once the new copy has committed.
+    corrupt_retire: Vec<(Vec<u8>, Vec<u8>, StatIdentity)>,
 }
 
 /// A walk frame: what a batch of new directories holds back.
@@ -5613,6 +5677,7 @@ fn receive_session<R: Read, W: Write>(
             snapshot_bases: HashSet::new(),
             sqlite_seats: HashSet::new(),
             corrupt_besides: HashMap::new(),
+            corrupt_retire: Vec::new(),
         };
         drop(setup_timer);
         let source_bytes_read = {
@@ -5628,6 +5693,7 @@ fn receive_session<R: Read, W: Write>(
             snapshot_bases,
             sqlite_seats,
             corrupt_besides,
+            corrupt_retire,
             ..
         } = receiver;
         drop(pool);
@@ -5641,6 +5707,7 @@ fn receive_session<R: Read, W: Write>(
                 bases: snapshot_bases,
                 seats: sqlite_seats,
                 besides: corrupt_besides,
+                retire: corrupt_retire,
             },
         ))
     });
@@ -7038,7 +7105,7 @@ impl<W: Write> Inbound<'_, W> {
         (key, record, racy, root): (Vec<u8>, [u8; 32], bool, [u8; 32]),
         hints: Vec<ChunkHint>,
     ) -> Result<()> {
-        for beside in corrupt_beside_paths(row) {
+        for (at, beside) in corrupt_beside_paths(row).into_iter().enumerate() {
             let mut beside_row = row.clone();
             beside_row.rel_path.clone_from(&beside);
             // A directory, a link or anything else not a file: not these
@@ -7054,6 +7121,16 @@ impl<W: Write> Inbound<'_, W> {
                 if let Err(refusal) = staged.rename_leaf(leaf) {
                     let _ = staged.discard();
                     return Err(refusal);
+                }
+                // A new timed copy supersedes this store's own earlier ones
+                // (finding C), retired once it has committed.
+                if at == 1 {
+                    let earlier = self.own_timed_copies(row, &beside)?;
+                    self.corrupt_retire.extend(
+                        earlier
+                            .into_iter()
+                            .map(|(old, identity)| (row.rel_path.clone(), old, identity)),
+                    );
                 }
                 self.corrupt_landed(&row.rel_path, beside);
                 return self.publish(staged, &beside_row, (key, record, racy, root), hints, None);
@@ -7086,6 +7163,68 @@ impl<W: Write> Inbound<'_, W> {
         }
         let _ = staged.discard();
         Err(BulkloadRefusal::DestinationOccupied)
+    }
+
+    /// This store's own timed copies of `row`'s corrupt store other than
+    /// `keep` (review of #278, finding C): files beside the database named
+    /// `<db>.corrupt-<YYYYMMDD>-<HHMMSS>.<ns>` whose identity is one this
+    /// store recorded for the database, so a copy it did not write, or one
+    /// touched since, is never one of them. The dated copies are not
+    /// timed, and stay. Read only when a new timed copy lands, which is
+    /// rare.
+    ///
+    /// # Errors
+    /// A failed listing of the database's directory, stat or store read.
+    fn own_timed_copies(
+        &self,
+        row: &RowSchema,
+        keep: &[u8],
+    ) -> Result<Vec<(Vec<u8>, StatIdentity)>> {
+        let mut prefix = row.rel_path.clone();
+        prefix.extend_from_slice(b".corrupt-");
+        let (directory, leaf_prefix) = prefix.iter().rposition(|byte| *byte == b'/').map_or(
+            (&b""[..], prefix.as_slice()),
+            |at| {
+                (
+                    prefix.get(..at).unwrap_or_default(),
+                    prefix.get(at + 1..).unwrap_or_default(),
+                )
+            },
+        );
+        let ours: HashSet<Vec<u8>> = self
+            .store
+            .output_rows(&self.authority, &row.rel_path)?
+            .into_iter()
+            .map(|(_, identity)| identity)
+            .collect();
+        let listed = std::fs::read_dir(self.target.path().join(crate::walk::rel_path(directory)))
+            .refuse_at("transfer::own_timed_copies")?;
+        let mut found = Vec::new();
+        for entry in listed {
+            let name = entry.refuse_at("transfer::own_timed_copies")?.file_name();
+            let Some(stamp) = name.as_bytes().strip_prefix(leaf_prefix) else {
+                continue;
+            };
+            if !timed_stamp(stamp) {
+                continue;
+            }
+            let mut old = directory.to_vec();
+            if !old.is_empty() {
+                old.push(b'/');
+            }
+            old.extend_from_slice(name.as_bytes());
+            if old == keep {
+                continue;
+            }
+            let mut old_row = row.clone();
+            old_row.rel_path.clone_from(&old);
+            if let Some(identity) = self.target.identity(&old_row)? {
+                if ours.contains(&crate::transfer_store::identity_bytes(&identity)?) {
+                    found.push((old, identity));
+                }
+            }
+        }
+        Ok(found)
     }
 
     /// A corrupt carry of `rel_path` is queued at `beside`, published or

@@ -167,6 +167,29 @@ fn reader_uid() -> u32 {
         .unwrap_or_else(crate::io::sys::effective_uid)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Unit tests: this thread's carry backups hold no read snapshot, so a
+    /// WAL-mode source is stepped with per-step locks (finding B's test).
+    static NO_HOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Unit tests: this thread's held snapshots find the source floor
+    /// crossed from this step on (caveat ii's test).
+    static FLOOR_CROSSED_FROM: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    /// Unit tests: this thread's backups fail `SQLITE_IOERR` before this
+    /// step (caveat iii's test).
+    static FAIL_AT_STEP: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Unit tests: whether this thread's carry backups may hold a snapshot,
+/// from which step its source floor is crossed, and before which step its
+/// backups fail.
+#[cfg(test)]
+pub(crate) fn set_carry_seams(no_hold: bool, floor_from: Option<u64>, fail_at: Option<u64>) {
+    NO_HOLD.set(no_hold);
+    FLOOR_CROSSED_FROM.set(floor_from);
+    FAIL_AT_STEP.set(fail_at);
+}
+
 /// Unit tests: this thread's provider calls see `uid` as the effective uid.
 #[cfg(test)]
 pub(crate) fn assume_uid(uid: u32) {
@@ -183,7 +206,10 @@ pub(crate) fn assume_unprivileged() {
 }
 
 /// Pages one backup step copies (OI-1003-Q16's bounded step): the read
-/// lock is taken and released inside each step.
+/// lock is taken and released inside each step, except under a carry
+/// backup of a WAL-mode source, which holds one read snapshot for the whole
+/// copy (operator ruling 2026-10-19, "Hold one read snapshot";
+/// [`hold_read_snapshot`]).
 const STEP_PAGES: i32 = 128;
 
 /// A test hook run after each step of a carry backup, with the step's
@@ -255,6 +281,72 @@ struct BackupStats {
     /// committed between steps (each also counted as it happens,
     /// `source_sqlite_backup_restarts`).
     restarts: u64,
+    /// How long one read snapshot was held across the whole copy, when it
+    /// was (a carry backup of a WAL-mode source, operator ruling
+    /// 2026-10-19).
+    held: Option<Duration>,
+}
+
+/// Open one read transaction on a WAL-mode `source` for a carry backup
+/// (operator ruling 2026-10-19, "Hold one read snapshot", which replaces
+/// OI-1003-Q16's short-locks-only reading for this case). Every step then
+/// reads that one snapshot, so a commit by another connection no longer
+/// restarts the backup from page 1. In WAL mode a read transaction blocks
+/// no writer; it only keeps checkpoints from passing it, so the source's
+/// `-wal` grows while the copy runs and checkpoints normally once it ends.
+/// A rollback-journal source is not held (a read lock held there would
+/// block writers): `Ok(false)`.
+///
+/// A busy start (a writer's recovery, a checkpoint that holds the
+/// wal-index) is tried again with the step's backoff, until `wall` from
+/// `started` is spent.
+///
+/// # Errors
+/// `SQLITE_STATE_CHANGED` when still busy at the wall, and the `SQLite`
+/// failure (`SQLITE_BACKUP_FAILED`) of the journal-mode read or the start.
+fn hold_read_snapshot(
+    source: &Connection,
+    started: std::time::Instant,
+    wall: Duration,
+) -> Result<bool> {
+    #[cfg(test)]
+    if NO_HOLD.get() {
+        return Ok(false);
+    }
+    let mut backoff = BUSY_BACKOFF;
+    loop {
+        let attempt = source
+            .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+            .and_then(|mode| {
+                if !mode.eq_ignore_ascii_case("wal") {
+                    return Ok(false);
+                }
+                source.execute_batch("BEGIN")?;
+                // A deferred transaction reads nothing until asked: this
+                // read takes the snapshot every step then reads.
+                let started = source
+                    .query_row("SELECT count(*) FROM sqlite_schema", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .map(|_| true);
+                if started.is_err() {
+                    let _ = source.execute_batch("ROLLBACK");
+                }
+                started
+            });
+        match attempt {
+            Ok(held) => return Ok(held),
+            Err(error) if busy_failure(&error) => {
+                if started.elapsed().saturating_add(backoff) > wall {
+                    return Err(BulkloadRefusal::SqliteStateChanged);
+                }
+                counters::bump(Counter::SourceSqliteBusyRetries);
+                std::thread::sleep(backoff);
+                backoff = backoff.saturating_mul(2).min(BUSY_BACKOFF_MAX);
+            }
+            Err(error) => return Err(backup_refusal(error)),
+        }
+    }
 }
 
 /// Counts the source connection's lifetime as `source_sqlite_lock_ns` when
@@ -289,6 +381,12 @@ fn copy_source(source: &Path, output: &Path, max_steps: u32) -> Result<(fs::File
 /// budget is tried again with a bounded backoff inside the wall
 /// ([`BUSY_BACKOFF`]); a backup past its budget refuses `BUDGET_EXCEEDED`.
 /// `stats` says what was read, refused or not.
+///
+/// A carry backup of a WAL-mode source holds one read snapshot for the
+/// whole copy instead ([`hold_read_snapshot`], operator ruling
+/// 2026-10-19): its wall runs from before the snapshot is taken, and the
+/// snapshot is released when the copy ends, refused or not, so it is never
+/// held past the wall (`stats.held` says how long it was).
 fn backup_into(
     source: &Path,
     flags: OpenFlags,
@@ -303,6 +401,7 @@ fn backup_into(
     };
     #[cfg(not(test))]
     let pages = STEP_PAGES;
+    let source_path = source;
     let _span = LockSpan(std::time::Instant::now());
     let source = Connection::open_with_flags(source, flags).map_err(backup_refusal)?;
     stats.opened = true;
@@ -321,15 +420,36 @@ fn backup_into(
     destination
         .busy_timeout(Duration::ZERO)
         .map_err(backup_refusal)?;
+    let started = std::time::Instant::now();
+    let held = match budget {
+        StepBudget::Carry { wall } => hold_read_snapshot(&source, started, wall)?,
+        StepBudget::Fixed(_) => false,
+    };
     let stepped = step_all(
         &source,
         &mut destination,
-        budget,
+        Run {
+            budget,
+            started,
+            held,
+            source_dir: source_path.parent().unwrap_or_else(|| Path::new(".")),
+        },
         pages,
         stats,
         #[cfg(test)]
         hook.as_deref(),
     );
+    if held {
+        // Released whatever the copy did: never held past it, or the wall.
+        let _ = source.execute_batch("ROLLBACK");
+        let duration = started.elapsed();
+        stats.held = Some(duration);
+        counters::bump(Counter::SourceSqliteSnapshotHolds);
+        counters::add(
+            Counter::SourceSqliteSnapshotHeldNs,
+            u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX),
+        );
+    }
     stats.page_size = destination
         .query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))
         .ok()
@@ -372,7 +492,57 @@ const fn busy_failure(error: &rusqlite::Error) -> bool {
     )
 }
 
-/// Step one backup to its end within `budget`, `pages` pages a step
+/// How often a held read snapshot re-checks the source filesystem's
+/// free-space floor while it is held (review of #278, caveat ii): the
+/// source's `-wal` grows meanwhile, which the slot's own floor check before
+/// the backup did not count. Engineering default, unruled.
+const HELD_FLOOR_PROBE: Duration = Duration::from_millis(250);
+
+/// One backup's run: its budget, the clock its wall runs from, whether it
+/// holds one read snapshot ([`hold_read_snapshot`]), and the directory of
+/// its source (whose filesystem a held snapshot's `-wal` grows on).
+#[derive(Clone, Copy)]
+struct Run<'p> {
+    budget: StepBudget,
+    started: std::time::Instant,
+    held: bool,
+    source_dir: &'p Path,
+}
+
+/// Whether the source filesystem is under the free-space floor
+/// (`--min-free-percent`) now, its project quota included. A probe that
+/// fails counts as under it: a held snapshot is never kept on a guess.
+fn source_floor_crossed(source_dir: &Path, steps: u64) -> bool {
+    #[cfg(test)]
+    if let Some(from) = FLOOR_CROSSED_FROM.get() {
+        return steps >= from;
+    }
+    let _ = steps;
+    crate::space::probe_limits(source_dir).map_or(true, |limits| {
+        crate::space::bound(0, 0, limits, crate::space::min_free_percent()).is_some()
+    })
+}
+
+/// Wait out another connection's lock before the next try, while the wall
+/// has room: [`BUSY_BACKOFF`], doubling to [`BUSY_BACKOFF_MAX`]. A fixed
+/// budget refuses at once.
+///
+/// # Errors
+/// `SQLITE_STATE_CHANGED` under a fixed budget, or when the wall is spent.
+fn wait_busy(run: Run<'_>, backoff: &mut Duration) -> Result<()> {
+    let StepBudget::Carry { wall } = run.budget else {
+        return Err(BulkloadRefusal::SqliteStateChanged);
+    };
+    if run.started.elapsed().saturating_add(*backoff) > wall {
+        return Err(BulkloadRefusal::SqliteStateChanged);
+    }
+    counters::bump(Counter::SourceSqliteBusyRetries);
+    std::thread::sleep(*backoff);
+    *backoff = backoff.saturating_mul(2).min(BUSY_BACKOFF_MAX);
+    Ok(())
+}
+
+/// Step one backup to its end within its budget, `pages` pages a step
 /// ([`STEP_PAGES`] outside unit tests), counting what it copies.
 ///
 /// A step that meets another connection's lock ([`busy_failure`]) copies
@@ -382,86 +552,109 @@ const fn busy_failure(error: &rusqlite::Error) -> bool {
 /// as the wall has room for the wait (`source_sqlite_busy_retries`); the
 /// wall exhausted, it refuses `SQLITE_STATE_CHANGED`. A busy step counts
 /// against the wall, never against the step budget, and runs no step hook.
+///
+/// `SQLite` keeps a step's fatal result on the backup object and returns it
+/// from every later step; only plain `SQLITE_BUSY` and `SQLITE_LOCKED` are
+/// exempt (review of #278, finding B, `sqlite3.c` 3.46). So an extended
+/// busy code (`SQLITE_BUSY_RECOVERY`) is waited out on a new backup object,
+/// never stepped again on the old one, which would return it until the
+/// wall.
+///
+/// A run that holds one read snapshot never waits while holding it (review
+/// of #278, caveat iii): any failure, busy included, returns at once, and
+/// the caller releases the snapshot. Every [`HELD_FLOOR_PROBE`] it checks
+/// the source filesystem's floor, and refuses `BUDGET_EXCEEDED` (counted
+/// `source_sqlite_held_floor_refusals`) when the growing `-wal` has taken
+/// it under (caveat ii).
 fn step_all(
     source: &Connection,
     destination: &mut Connection,
-    budget: StepBudget,
+    run: Run<'_>,
     pages: i32,
     stats: &mut BackupStats,
     #[cfg(test)] hook: Option<&(dyn Fn(u64, bool) + Send + Sync)>,
 ) -> Result<()> {
-    let started = std::time::Instant::now();
-    let backup = Backup::new(source, destination).map_err(backup_refusal)?;
     let mut steps = 0_u64;
-    let mut before: Option<u64> = None;
     let mut backoff = BUSY_BACKOFF;
     let mut early_restarts = 0_u64;
+    let mut probed: Option<std::time::Instant> = None;
     loop {
-        let step = match backup.step(pages) {
-            Ok(step) => step,
-            Err(error) if busy_failure(&error) => StepResult::Busy,
-            Err(error) => return Err(backup_refusal(error)),
-        };
-        if matches!(step, StepResult::Busy | StepResult::Locked) {
-            // Do not spin while another process holds a lock: wait with a
-            // bounded backoff, holding no lock of this backup's own, while
-            // the wall has room; a fixed budget refuses at once.
-            let StepBudget::Carry { wall } = budget else {
-                return Err(BulkloadRefusal::SqliteStateChanged);
+        let backup = Backup::new(source, &mut *destination).map_err(backup_refusal)?;
+        let mut before: Option<u64> = None;
+        loop {
+            #[cfg(test)]
+            if FAIL_AT_STEP.get() == Some(steps) {
+                return Err(BulkloadRefusal::SqliteBackupFailed(Some(10)));
+            }
+            let step = match backup.step(pages) {
+                Ok(step) => step,
+                Err(error) if busy_failure(&error) && !run.held => break,
+                Err(error) => return Err(backup_refusal(error)),
             };
-            if started.elapsed().saturating_add(backoff) > wall {
-                return Err(BulkloadRefusal::SqliteStateChanged);
-            }
-            counters::bump(Counter::SourceSqliteBusyRetries);
-            std::thread::sleep(backoff);
-            backoff = backoff.saturating_mul(2).min(BUSY_BACKOFF_MAX);
-            continue;
-        }
-        backoff = BUSY_BACKOFF;
-        steps += 1;
-        let progress = backup.progress();
-        let (remaining, total) = (
-            u64::try_from(progress.remaining).unwrap_or(0),
-            u64::try_from(progress.pagecount).unwrap_or(0),
-        );
-        let copied = match before {
-            Some(before) if remaining < before => before - remaining,
-            // A step that copied pages and left as many to go, or more,
-            // began from page 1 again: another connection committed since
-            // the last one.
-            Some(before) if remaining > 0 => {
-                stats.restarts += 1;
-                counters::bump(Counter::SourceSqliteBackupRestarts);
-                // The pass it ended had copied `total - before` pages.
-                if total.saturating_sub(before).saturating_mul(2) < total {
-                    early_restarts += 1;
+            if matches!(step, StepResult::Busy | StepResult::Locked) {
+                if run.held {
+                    return Err(BulkloadRefusal::SqliteStateChanged);
                 }
-                total.saturating_sub(remaining)
+                wait_busy(run, &mut backoff)?;
+                continue;
             }
-            Some(_) => 0,
-            None => total.saturating_sub(remaining),
-        };
-        stats.pages = stats.pages.saturating_add(copied);
-        before = Some(remaining);
-        #[cfg(test)]
-        if let Some(hook) = hook {
-            hook(steps, matches!(step, StepResult::Done));
-        }
-        match step {
-            StepResult::Done => return Ok(()),
-            StepResult::More => {}
-            // Busy and Locked were handled above; nothing else is stepped.
-            _ => return Err(BulkloadRefusal::SqliteStateChanged),
-        }
-        let over = match budget {
-            StepBudget::Fixed(max) => steps >= u64::from(max),
-            StepBudget::Carry { wall } => {
-                early_restarts > MAX_EARLY_RESTARTS || started.elapsed() > wall
+            backoff = BUSY_BACKOFF;
+            steps += 1;
+            let progress = backup.progress();
+            let (remaining, total) = (
+                u64::try_from(progress.remaining).unwrap_or(0),
+                u64::try_from(progress.pagecount).unwrap_or(0),
+            );
+            let copied = match before {
+                Some(before) if remaining < before => before - remaining,
+                // A step that copied pages and left as many to go, or more,
+                // began from page 1 again: another connection committed
+                // since the last one.
+                Some(before) if remaining > 0 => {
+                    stats.restarts += 1;
+                    counters::bump(Counter::SourceSqliteBackupRestarts);
+                    // The pass it ended had copied `total - before` pages.
+                    if total.saturating_sub(before).saturating_mul(2) < total {
+                        early_restarts += 1;
+                    }
+                    total.saturating_sub(remaining)
+                }
+                Some(_) => 0,
+                None => total.saturating_sub(remaining),
+            };
+            stats.pages = stats.pages.saturating_add(copied);
+            before = Some(remaining);
+            #[cfg(test)]
+            if let Some(hook) = hook {
+                hook(steps, matches!(step, StepResult::Done));
             }
-        };
-        if over {
-            return Err(BulkloadRefusal::BudgetExceeded);
+            match step {
+                StepResult::Done => return Ok(()),
+                StepResult::More => {}
+                // Busy and Locked were handled above; nothing else is stepped.
+                _ => return Err(BulkloadRefusal::SqliteStateChanged),
+            }
+            if run.held && probed.is_none_or(|at| at.elapsed() >= HELD_FLOOR_PROBE) {
+                probed = Some(std::time::Instant::now());
+                if source_floor_crossed(run.source_dir, steps) {
+                    counters::bump(Counter::SourceSqliteHeldFloorRefusals);
+                    return Err(BulkloadRefusal::BudgetExceeded);
+                }
+            }
+            let over = match run.budget {
+                StepBudget::Fixed(max) => steps >= u64::from(max),
+                StepBudget::Carry { wall } => {
+                    early_restarts > MAX_EARLY_RESTARTS || run.started.elapsed() > wall
+                }
+            };
+            if over {
+                return Err(BulkloadRefusal::BudgetExceeded);
+            }
         }
+        // The old backup object is gone, its fatal result with it; the next
+        // try is a new one.
+        drop(backup);
+        wait_busy(run, &mut backoff)?;
     }
 }
 
@@ -571,10 +764,12 @@ pub(crate) struct CarryReport {
 }
 
 /// Snapshot the live database at `source` into a new private `output` for a
-/// `--sqlite=snapshot` transfer (#218). The source read is exactly the
-/// `snapshot` verb's: the stepped backup from a read-only, WAL-aware
-/// connection (OI-1003-Q16, never `immutable=1`), with its counted wal-index
-/// and empty `-wal` (OI-1003-Q36, Q72). The connection is opened
+/// `--sqlite=snapshot` transfer (#218). The source read is the `snapshot`
+/// verb's: the stepped backup from a read-only, WAL-aware connection
+/// (OI-1003-Q16, never `immutable=1`), with its counted wal-index and empty
+/// `-wal` (OI-1003-Q36, Q72), except that a WAL-mode source is read from one
+/// read snapshot held for the whole copy, within `wall` (operator ruling
+/// 2026-10-19, "Hold one read snapshot"; [`hold_read_snapshot`]). The connection is opened
 /// `SQLITE_OPEN_NOFOLLOW`, so a symlink at the leaf is refused; the caller
 /// passes a path under its canonical root and checks the walked inode
 /// (review R9). `as_root` refuses `SQLITE_SOURCE_AS_ROOT` before any open
@@ -649,6 +844,7 @@ pub(crate) fn snapshot_for_carry(
         CarryRead {
             source_bytes,
             restarts: stats.restarts,
+            held: stats.held,
         },
     )
 }
@@ -660,6 +856,9 @@ pub(crate) struct CarryRead {
     pub source_bytes: u64,
     /// Restarts from page 1 (`source_sqlite_backup_restarts`).
     pub restarts: u64,
+    /// How long one read snapshot was held across the copy, when it was
+    /// (a WAL-mode source, operator ruling 2026-10-19).
+    pub held: Option<Duration>,
 }
 
 /// A carry snapshot's own checks, on the private copy only: journal mode
@@ -2039,6 +2238,204 @@ mod tests {
             verify_received(&held, &long, size),
             Err(BulkloadRefusal::SqliteIntegrityCheckFailed),
             "a path SQLite cannot open is no verdict on the bytes"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A WAL store of `rows` 500-byte rows in `dir`, and a writer connection
+    /// on it that never checkpoints by itself.
+    #[allow(clippy::unwrap_used)]
+    fn wal_store(dir: &Path, rows: u32) -> (PathBuf, Connection) {
+        let database = dir.join("store.sqlite");
+        let writer = Connection::open(&database).unwrap();
+        writer
+            .execute_batch(&format!(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB);
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {rows})
+                 INSERT INTO t SELECT i, randomblob(500) FROM n;"
+            ))
+            .unwrap();
+        (database, writer)
+    }
+
+    /// The `-wal` beside `database`, in bytes (0 when absent).
+    fn wal_bytes(database: &Path) -> u64 {
+        fs::metadata(sidecar(database, "-wal")).map_or(0, |meta| meta.len())
+    }
+
+    /// Operator ruling 2026-10-19 with the review's caveat iii: a held
+    /// snapshot is released the moment its backup fails, not at its wall.
+    /// The backup fails `SQLITE_IOERR` at its third step under a 30 s wall;
+    /// it returns within a second, and the writer's TRUNCATE checkpoint
+    /// then empties the `-wal`: no snapshot is left pinning it.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_held_snapshot_is_released_at_once_when_its_backup_fails() {
+        assume_unprivileged();
+        let dir = carry_fixture("held-fails");
+        let (database, writer) = wal_store(&dir, 400);
+        writer
+            .execute_batch("INSERT INTO t(v) VALUES (x'01');")
+            .unwrap();
+        set_carry_steps(&dir, Some((2, None)));
+        set_carry_seams(false, None, Some(3));
+        let started = std::time::Instant::now();
+        let (report, read) =
+            snapshot_for_carry(&database, &dir.join("slot.sqlite"), false, 0, CARRY_WALL);
+        let took = started.elapsed();
+        set_carry_seams(false, None, None);
+        set_carry_steps(&dir, None);
+        assert_eq!(
+            report.unwrap_err(),
+            BulkloadRefusal::SqliteBackupFailed(Some(10))
+        );
+        let held = read.held.unwrap();
+        assert!(
+            took < Duration::from_secs(1) && held <= took,
+            "released at once: held {held:?}, took {took:?}"
+        );
+        writer
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        assert_eq!(wal_bytes(&database), 0, "no snapshot left pinning the -wal");
+        drop(writer);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The review's caveat ii: while a snapshot is held the source's `-wal`
+    /// grows, so the source filesystem's floor is checked again during the
+    /// hold. Crossed (here from the second step), the snapshot is released
+    /// and the store refused `BUDGET_EXCEEDED`, counted.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_held_snapshot_is_released_when_the_source_floor_is_crossed() {
+        assume_unprivileged();
+        let dir = carry_fixture("held-floor");
+        let (database, writer) = wal_store(&dir, 400);
+        set_carry_steps(&dir, Some((2, None)));
+        // Crossed from the first step: the copy is shorter than one probe
+        // interval, so the probe at its first step is the one that sees it.
+        set_carry_seams(false, Some(1), None);
+        let before = counters::Counters::snapshot();
+        let (report, read) =
+            snapshot_for_carry(&database, &dir.join("slot.sqlite"), false, 0, CARRY_WALL);
+        let delta = counters::Counters::snapshot().since(before);
+        set_carry_seams(false, None, None);
+        set_carry_steps(&dir, None);
+        assert_eq!(report.unwrap_err(), BulkloadRefusal::BudgetExceeded);
+        assert!(read.held.unwrap() < Duration::from_secs(1));
+        assert_eq!(delta.get(Counter::SourceSqliteHeldFloorRefusals), 1);
+        writer
+            .execute_batch("INSERT INTO t(v) VALUES (x'02'); PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        assert_eq!(wal_bytes(&database), 0, "no snapshot left pinning the -wal");
+        drop(writer);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A one-byte OFD lock on `file` at `offset` (`kind` is `F_WRLCK` or
+    /// `F_RDLCK`), without blocking. OFD locks conflict with `SQLite`'s
+    /// POSIX locks even inside this process.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::unwrap_used)]
+    fn ofd_lock_byte(file: &fs::File, offset: i64, kind: libc::c_int) {
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: an all-zero `flock` is a valid value of the plain C struct.
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = libc::c_short::try_from(kind).unwrap();
+        lock.l_whence = libc::c_short::try_from(libc::SEEK_SET).unwrap();
+        lock.l_start = offset;
+        lock.l_len = 1;
+        // SAFETY: the descriptor is live and `lock` outlives the call; OFD
+        // locks require `l_pid` 0, which `zeroed` set.
+        let held = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &raw mut lock) };
+        assert_eq!(held, 0, "F_OFD_SETLK: {}", std::io::Error::last_os_error());
+    }
+
+    /// The review's finding B, against the bundled `SQLite` itself. A reader
+    /// that finds the wal-index mapped but its header invalid must recover
+    /// it; while another holder has the wal-index's WRITE (byte 120) and
+    /// RECOVER (byte 122) locks, its step fails `SQLITE_BUSY_RECOVERY`
+    /// (261). (The holder keeps a shared lock on the DMS byte, 128, so the
+    /// reader does not take the wal-index as stale and truncate it, and the
+    /// `-shm` is one zeroed 32 KiB page, so it maps.) `SQLite` keeps that
+    /// result on the backup object: the same object returns 261 again after
+    /// the locks are gone, and only a new one goes on. A carry backup (its
+    /// held snapshot set aside, so its steps take the locks) therefore waits
+    /// the busy out on new backup objects and finishes once the locks go,
+    /// long before its wall.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::panic)]
+    fn an_extended_busy_step_is_waited_out_on_a_new_backup_object() {
+        assume_unprivileged();
+        let dir = carry_fixture("busy-recovery");
+        let (database, writer) = wal_store(&dir, 200);
+        writer.close().map_err(|(_, error)| error).unwrap();
+        assert!(!sidecar(&database, "-shm").exists(), "closed clean");
+        let lock_wal_index = || {
+            let path = sidecar(&database, "-shm");
+            fs::write(&path, vec![0_u8; 32 * 1024]).unwrap();
+            let shm = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            ofd_lock_byte(&shm, 128, libc::F_RDLCK);
+            ofd_lock_byte(&shm, 120, libc::F_WRLCK);
+            ofd_lock_byte(&shm, 122, libc::F_WRLCK);
+            shm
+        };
+        let extended = |result: rusqlite::Result<StepResult>| match result {
+            Err(rusqlite::Error::SqliteFailure(failure, _)) => failure.extended_code,
+            other => panic!("not an extended failure: {other:?}"),
+        };
+        // What SQLite does.
+        let held = lock_wal_index();
+        let source =
+            Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        source.busy_timeout(Duration::ZERO).unwrap();
+        let mut probe = Connection::open(dir.join("probe.sqlite")).unwrap();
+        {
+            let backup = Backup::new(&source, &mut probe).unwrap();
+            assert_eq!(extended(backup.step(5)), 261, "SQLITE_BUSY_RECOVERY");
+            drop(held);
+            assert_eq!(
+                extended(backup.step(5)),
+                261,
+                "the same backup object keeps its fatal result"
+            );
+        }
+        let fresh = Backup::new(&source, &mut probe).unwrap();
+        assert!(
+            matches!(fresh.step(-1), Ok(StepResult::Done)),
+            "a new one goes on"
+        );
+        drop(fresh);
+        drop(source);
+        // A carry backup waits it out on new objects, and finishes.
+        let held = lock_wal_index();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        set_carry_seams(true, None, None);
+        let before = counters::Counters::snapshot();
+        let started = std::time::Instant::now();
+        let (report, _) =
+            snapshot_for_carry(&database, &dir.join("slot.sqlite"), false, 0, CARRY_WALL);
+        let took = started.elapsed();
+        let retries = counters::Counters::snapshot()
+            .since(before)
+            .get(Counter::SourceSqliteBusyRetries);
+        set_carry_seams(false, None, None);
+        release.join().unwrap();
+        assert!(report.unwrap().size > 0);
+        assert!(retries > 0, "it met the busy and waited it out");
+        assert!(
+            took < Duration::from_secs(10),
+            "long before its wall: {took:?}"
         );
         fs::remove_dir_all(dir).unwrap();
     }

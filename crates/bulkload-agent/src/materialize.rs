@@ -1458,6 +1458,36 @@ impl Destination {
         sqlite_sidecar_beside(&parent, &leaf)
     }
 
+    /// Remove this store's own earlier output at `rel_path`, a corrupt
+    /// store's superseded copy (review of #278, finding C), only while it
+    /// is a regular file with exactly `identity`, the identity this store
+    /// recorded for it: a file anyone touched since, or that this store did
+    /// not write, is never removed. The directory is sealed after the
+    /// unlink. `false` when the file is gone or not the one recorded.
+    ///
+    /// # Errors
+    /// An unsafe ancestor, a failed stat, unlink or directory seal.
+    pub(crate) fn retire_own(&self, rel_path: &[u8], identity: &StatIdentity) -> Result<bool> {
+        let (parent, leaf) = self.parent(rel_path)?;
+        let file = match open_regular(&parent, &leaf) {
+            Ok(file) => file,
+            Err(BulkloadRefusal::Io(Some(libc::ENOENT)) | BulkloadRefusal::DestinationOccupied) => {
+                return Ok(false)
+            }
+            Err(refusal) => return Err(refusal),
+        };
+        let found =
+            StatIdentity::from_metadata(&file.metadata().refuse_at("materialize::retire_own")?);
+        if found != *identity {
+            return Ok(false);
+        }
+        // A residual stands, as for every check-then-act here: a write
+        // between this stat and the unlink is not seen.
+        unlink(&parent, &leaf)?;
+        crate::io::durable::seal_dir(&parent).refuse_at("materialize::retire_own")?;
+        Ok(true)
+    }
+
     /// The path of a staged file under this destination's root, for a
     /// reader that opens by path (#218: `SQLite`'s verification of a
     /// received snapshot, `SQLITE_OPEN_NOFOLLOW`).

@@ -128,6 +128,10 @@ pub enum EntryOutcome {
     /// refused: its outcome is its base's one refusal (plan of record
     /// 2026-10-19, C3), so closure counts that refusal once. Never carried.
     SidecarFollowsRefusedBase { database: Vec<u8> },
+    /// This store's own earlier timed copy of a corrupt store, retired once
+    /// a newer copy of `database` committed (review of #278, finding C):
+    /// accounted for by that newer copy.
+    CorruptCopyRetired { database: Vec<u8> },
 }
 
 /// One path row of a session.
@@ -222,6 +226,14 @@ impl TransferRecord {
                         },
                     });
                 }
+                for (path, database) in &stats.sqlite_corrupt_retired {
+                    record.entries.push(Entry {
+                        rel_path: path.clone(),
+                        outcome: EntryOutcome::CorruptCopyRetired {
+                            database: database.clone(),
+                        },
+                    });
+                }
                 for (path, database) in &stats.sqlite_sidecars_follow_refused {
                     record.entries.push(Entry {
                         rel_path: path.clone(),
@@ -285,6 +297,7 @@ fn entry_key(outcome: &EntryOutcome) -> String {
         EntryOutcome::SidecarCovered => "covered".to_owned(),
         EntryOutcome::CarriedCorrupt { .. } => "carried-corrupt".to_owned(),
         EntryOutcome::SidecarFollowsRefusedBase { .. } => "follows-refused".to_owned(),
+        EntryOutcome::CorruptCopyRetired { .. } => "corrupt-retired".to_owned(),
     }
 }
 

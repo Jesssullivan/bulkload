@@ -1407,6 +1407,15 @@ fn record_rows(
                 None,
                 Some(beside.clone()),
             ),
+            // Superseded by a newer copy of the same store (finding C).
+            EntryOutcome::CorruptCopyRetired { database } => (
+                "corrupt-copy-retired",
+                None,
+                None,
+                Disposition::Covered,
+                None,
+                Some(database.clone()),
+            ),
             // Its base's one refusal is the row that is dispositioned.
             EntryOutcome::SidecarFollowsRefusedBase { database } => (
                 "sidecar-follows-refused-base",

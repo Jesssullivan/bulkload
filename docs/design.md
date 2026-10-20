@@ -2008,9 +2008,41 @@ miss (#87).
     default, and at most four restarts that came before half a pass was
     copied: `BUDGET_EXCEEDED`, not remembered; restarts later in a pass are
     allowed until the wall, and a backup that restarted prints
-    `sqlite-backup-restarts` with its count; a step that meets another
+    `sqlite-backup-restarts` with its count. **Operator ruling 2026-10-19,
+    "Hold one read snapshot"**, which replaces OI-1003-Q16's
+    short-locks-only reading for this case: for a WAL-mode source the
+    backup holds one read transaction for the whole copy, so a commit no
+    longer restarts it; the source's writers are never blocked, and its
+    checkpoints cannot pass the snapshot until the copy ends, so its `-wal`
+    grows for the copy's duration and then checkpoints normally. The wall
+    still bounds the hold: it runs from before the snapshot is taken, and
+    at the wall the snapshot is released and the store refused
+    `BUDGET_EXCEEDED`, never held past it. Any failure while it is held,
+    busy included, releases it at once, never waiting it out (re-review of
+    #278, caveat iii). Every 250 ms of the hold the source filesystem's
+    floor (`--min-free-percent`, its quota included) is checked again,
+    since the growing `-wal` is not counted by the slot's check before the
+    backup; under it, the snapshot is released and the store refused
+    `BUDGET_EXCEEDED` (`source_sqlite_held_floor_refusals`; caveat ii). The
+    ruling was checked against Codex's own checkpoints (caveat i): at
+    openai/codex `79a19cbb` it issues only `wal_checkpoint(PASSIVE)` and
+    SQLite's automatic checkpoint, which is PASSIVE, and its sqlx 0.9.0
+    issues none; a PASSIVE checkpoint never waits for a reader, so the held
+    snapshot defers Codex's checkpoints (its reclamation pass reads that as
+    contended and backs off) and blocks none of its writes. A FULL,
+    RESTART or TRUNCATE checkpoint would block new writers while it waited
+    for the snapshot; a source that issues those is outside this ruling. Each held copy prints
+    `sqlite-snapshot-held PATH held_ms= wal_before= wal_after= wall_s=
+    outcome=` and is counted (`source_sqlite_snapshot_holds`,
+    `source_sqlite_snapshot_held_ns`, `source_sqlite_held_wal_before_bytes`,
+    `source_sqlite_held_wal_after_bytes`). A rollback-journal (DELETE-mode)
+    source keeps the per-step lock (a read lock held there would block
+    writers), and so do the provider verbs. A step that meets another
     connection's lock, extended busy codes such as `SQLITE_BUSY_RECOVERY`
-    included, is tried again with a bounded backoff inside that wall,
+    included, is tried again with a bounded backoff inside that wall (an
+    extended code on a new backup object: `SQLite` keeps a fatal step result
+    on the old one and returns it from every later step, re-review finding
+    B),
     holding no lock of its own, and refuses `SQLITE_STATE_CHANGED` only
     when the wall is spent; plan of record 2026-10-19, C3, and review of
     #278, items 4 and 6) from
@@ -2071,14 +2103,16 @@ miss (#87).
     ignored. A sidecar of a refused database follows that one refusal
     (`sqlite_sidecars_follow_refused`), never a second one by name, when the
     database is proven a `SQLite` seat: the source announced it as a
-    snapshot, or refused it with a code only a database gets
-    (`SQLITE_BACKUP_FAILED`, `SQLITE_INTEGRITY_CHECK_FAILED`,
-    `SQLITE_SOURCE_NOT_OWNER`, `SQLITE_SOURCE_AS_ROOT`,
-    `SQLITE_STATE_CHANGED`). A base refused before it was announced with a
-    code any file may get (`BUDGET_EXCEEDED`, `DESTINATION_OCCUPIED` at
-    its decision) is not proven one: its sidecars stay refused by name, so
-    a user's `notes-journal` beside a refused plain `notes` keeps its own
-    refusal (review of #278, item 2).
+    snapshot, or refused it with a code only a database whose header it
+    sniffed gets (`SQLITE_BACKUP_FAILED`, `SQLITE_INTEGRITY_CHECK_FAILED`,
+    `SQLITE_SOURCE_NOT_OWNER`, `SQLITE_SOURCE_AS_ROOT`). A base refused
+    before it was announced with a code any file may get
+    (`BUDGET_EXCEEDED`, `DESTINATION_OCCUPIED` at its decision, or
+    `SQLITE_STATE_CHANGED`, which a file of any content beside a `-wal`
+    with frames gets) is not proven one: its sidecars stay refused by name,
+    so a user's `notes-journal` or `notes-wal` beside a refused plain
+    `notes` keeps its own refusal (review of #278, item 2, and re-review
+    finding A).
   - *Destination.* Admission reserves the main file's and the `-wal`'s
     sizes at Decide and the snapshot's exact size when it is announced. A
     path with a `-wal`, `-journal` or `-shm` beside it is refused
@@ -2098,7 +2132,13 @@ miss (#87).
     (the store was touched, not changed), and when both hold other bytes
     the database is refused `DESTINATION_OCCUPIED` under its own path
     (item 3). Both names are functions of the row, so a store lands at one
-    name on every run. It is a plain file, never installed as a database,
+    name on every run. A new timed copy, once its group commit returns,
+    retires this store's own earlier timed copies of the same store, only
+    those whose identity is still one this store recorded for the database
+    (a file it did not write, or one touched since, is never removed),
+    each recorded as a `corrupt-copy-retired` entry (closure `covered`,
+    `related` the database; re-review finding C): a store that keeps
+    changing keeps its dated copy of each day and one timed copy. It is a plain file, never installed as a database,
     with no superseding exchange (whatever is at the database's path
     stays), recorded `carried-corrupt` (C14, RUL-14; closure disposition
     `carried`, outcome `carried-corrupt`, `related` the beside path). Its

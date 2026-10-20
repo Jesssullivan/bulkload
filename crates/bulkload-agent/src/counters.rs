@@ -329,6 +329,20 @@ counters! {
     // again after a bounded backoff inside the carry wall (plan of record
     // 2026-10-19, C3), instead of refusing on the first lock.
     SourceSqliteBusyRetries => "source_sqlite_busy_retries",
+    // Operator ruling 2026-10-19, "Hold one read snapshot": carry backups of
+    // a WAL-mode source that held one read transaction for the whole copy,
+    // so a commit did not restart them; the nanoseconds those snapshots
+    // were held (each ends with its copy, never past its wall); and the
+    // source `-wal`'s bytes just before and just after each held copy (the
+    // checkpoints it kept from passing it grow the `-wal` meanwhile).
+    SourceSqliteSnapshotHolds => "source_sqlite_snapshot_holds",
+    SourceSqliteSnapshotHeldNs => "source_sqlite_snapshot_held_ns",
+    SourceSqliteHeldWalBeforeBytes => "source_sqlite_held_wal_before_bytes",
+    SourceSqliteHeldWalAfterBytes => "source_sqlite_held_wal_after_bytes",
+    // Held snapshots released and refused `BUDGET_EXCEEDED` because the
+    // source filesystem fell under the free-space floor while they were
+    // held (review of #278, caveat ii: the `-wal` grows meanwhile).
+    SourceSqliteHeldFloorRefusals => "source_sqlite_held_floor_refusals",
     // Stores whose main file and `-wal` exceed the slot budget
     // (`--sqlite-slot-bytes`), carried from an oversize slot of their own
     // under the free-space floor (A-115, "Chunked snapshot").
@@ -364,6 +378,9 @@ counters! {
     // `<db>.corrupt-<YYYYMMDD>` and recorded `carried-corrupt` (C14,
     // RUL-14), and the rerun skips that found such a copy held.
     DestSqliteCorruptBeside => "dest_sqlite_corrupt_beside",
+    // This store's own earlier timed copies of a corrupt store retired once
+    // a newer copy of the same store committed (review of #278, finding C).
+    DestSqliteCorruptRetired => "dest_sqlite_corrupt_retired",
     // Snapshots the destination verified (`integrity_check`) before publish,
     // and the bytes of those files.
     DestSqliteVerified => "dest_sqlite_verified",
