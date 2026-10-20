@@ -90,6 +90,16 @@ source-side capture, untouched here) and its reseat change (free-space
 drift) stay necessary. #290 is not touched until it merges; the revert
 of the two re-stamps is a follow-up then.
 
+2026-10-20: #290 merged (main `86353ba`), then #283 (`912907c`); both
+were merged into this branch with signed merge commits (`bb2631b`,
+`a6a78c3`). `e040678` drops #290's p90 and h14 re-stamps (both tests back
+to main's form before #290, p90's comment saying why its landed seats are
+racy; the #290 note carries a dated label). On honey at `e040678`: clippy
+`-D warnings` and fmt clean; the four C03 tests 4 of 4; p90 10 of 10 (22.4
+to 39.4 s, load1 29 to 80) and h14 10 of 10 (7.1 to 15.4 s, load1 36 to
+48), both without the re-stamps; `--test estate_adopt` 40 and `--test
+estate_handoff` 53 passed.
+
 ## Open
 
 - Transfer outputs, reseat placements and the capture side were read, not
