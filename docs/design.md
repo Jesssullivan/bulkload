@@ -396,6 +396,34 @@ same report, totals and gate:
   `estate-move key-map-unused` line. Under `--beside` an append-only live
   file written within the racy window is refused `DESTINATION_UNSETTLED`,
   typed and not remembered (the next pass decides), never landed beside.
+- one **consolidated** row per append log (`.jsonl`) a homes pass merged
+  in place. This follows the operator ruling of 2026-10-20 ("neither WIN.
+  they must be consolidated"; "no dupes, no duplicated besides, no stage
+  dupes") and SPEC #298. Under `estate-move`'s consolidation, a seat whose
+  live file is not its bytes, not a prefix of them and not holding them is
+  never landed beside. It is merged into one file at the path: the
+  source's bytes whole, then the live file's records the source lacks, in
+  the live file's order. A Claude transcript record is identified by its
+  `uuid`; any other line by its exact bytes, counted. Both branches of a
+  session continued on both hosts are kept.
+  - **Write.** The union replaces the live file through the superseding
+    exchange and is checked against the live file as it was read. A file
+    that a process holds open, that ends inside a line, or that a writer
+    changed since the read is refused `DESTINATION_UNSETTLED` and rerun
+    only.
+  - **Ledger.** The row records the seat's, the live file's and the
+    output's BLAKE3 and the record counts.
+  - **Other kinds.** A `.jsonl` whose live path is another kind is
+    refused `DESTINATION_KIND_MISMATCH`, except a link to a regular file
+    under a `--replace-archived-dest` root. That link's target is the live
+    file, and the re-seat's A-106 replacement takes the union of the two.
+  - **Held copies.** A re-seat sets nothing aside. A swap-back copy that a
+    writer appended to is held typed (`held-written`) under its private
+    `.<name>.<token>.bulkload-held`, never beside the live name, and
+    `reseat_kept_aside` is always 0.
+  - **Homes dispatch.** The same union is the `AppendLog` class's
+    `consolidate::Union` (`consolidate::append_log`), and
+    `append_log::plan_at` is its row in #297's `--plan-only` listing.
 
 A transfer row's identity (`item`, 64 hex) is a digest of the transfer's
 source (`SOURCE`, or `HOST:SOURCE` for `pull`), its destination, the path

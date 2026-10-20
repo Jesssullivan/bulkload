@@ -366,6 +366,43 @@ one defect and two hardenings in `place::judge_beside`:
 - Still owed: the whole suite, `just rust-check`, the merge gate, and pzm
   `darwin-check`.
 
+## Consolidation, not beside (operator ruling 2026-10-20; SPEC #298)
+
+The ruling: "neither WIN. they must be consolidated"; "no dupes, no
+duplicated besides, no stage dupes"; "a duplicate is inherently not path
+for path / byte for byte". This lane owns the consolidation of append logs.
+
+| Commit | What |
+| --- | --- |
+| `b8456c9` | Receive path: a `.jsonl` seat whose live file differs is merged into one file in place, never landed beside (`transfer::consolidate::merge_jsonl`). The result is the source's bytes, then the live file's records it lacks (Claude by `uuid`, other logs by exact line, counted). It replaces the live file through the superseding exchange; a file held open, mid-line or changed is refused `DESTINATION_UNSETTLED`, rerun only. The row ledgers its seat, live and output BLAKE3 and record counts. |
+| `dc6f3f9` | An archive-link transcript is replaced by the union (A-106). The Codex index copy is retired after registration, or kept typed. `move_state_bytes` and `pull_payload_bytes` are on the closure line. No beside of content already present, for any class. |
+| `1587da0`, `700ab6e` | A re-seat sets nothing aside. A swap-back copy that a writer appended to is held typed: `held-written`, `DESTINATION_OCCUPIED`, under its private `.<name>.<token>.bulkload-held`. Later passes are held the same way with nothing written. `reseat_kept_aside` is asserted to be 0. Before this round it counted only the A-106 hook test's copy, and no real pass ever reached it. |
+| `5300494` | Merged #297 at `7db6b11` (clean). Merge order is #280, then #297, then #294; #297's later heads are merged in, never rebased. |
+| `ea656d9` | `consolidate::append_log::union` is #297's `Union` for `Class::AppendLog`, and `union_of` returns it. Adopt, cover (byte prefix or every record), extend, or consolidate. Written through `config::swap_in`. Held open or mid-line is `HOMES_CONSOLIDATE_RACED`. The `append_log_union` ledger table records input and output BLAKE3 and counts. |
+| `2e5fa2b` | A `.jsonl` whose live path is a directory, or a link outside the archive roots, is refused `DESTINATION_KIND_MISMATCH` with nothing beside it. A link into a `--replace-archived-dest` root lands for the A-106 union. |
+| `e96eea0` | `append_log::plan_at` is the append-log row of #297's `--plan-only` listing. The would-write listing is that row, with no separate listing. |
+
+Tests added: a diverged same-ID transcript (both branches, rerun covered,
+growth on either host unioned again); `history.jsonl` by line; a
+concurrent append mid-union, never lost; held open or mid-line, untouched;
+a link never followed; other kinds refused; held-written on two passes
+with the counter at 0.
+
+### Receipt (2026-10-20, honey, at `e96eea0` plus the docs)
+
+- Same environment and limits as the first receipt. Another lane's full
+  workspace run shared honey, so only targeted filters ran, one at a time.
+- `cargo fmt --all -- --check`: ok. `cargo clippy -p bulkload-agent -p
+  bulkload-proto --all-targets --locked -- -D warnings`: ok.
+- Lib: `consolidate` 35/35 (#297's, `append_log` 8 and
+  `transfer::consolidate`), `transfer::tests::consolidate` 5/5,
+  `a106` 9/9, `reseat::` 84/84, `beside` 27/27.
+- Integration: `estate_move` 7/7.
+- Also: `closure` 39/39, `map_prefix` 8/8, `transfer::tests::prefix`
+  6/6, `keymap` 4/4, `bulkload-proto` 18/18, `estate_reseat` 7/7,
+  `single_file_copy` 17/17, fault `reseat` 23/23, fault `beside` 10/10.
+- Still owed: the whole suite, the merge gate, and pzm `darwin-check`.
+
 ## Open
 
 - Source-key directories already on sting stay (removing a transcript is
@@ -387,4 +424,14 @@ one defect and two hardenings in `place::judge_beside`:
   residual), now for every small transcript too.
 - A beside output the pull left in an earlier pass (a racy destination, or
   before this lane) is not converged back into the live path (#280's C12).
+- The would-write listing is #297's `--plan-only` (its item 3, not built
+  yet). This lane supplies its append-log row (`append_log::plan_at`).
+- The receive path and the `Union` disagree on one case. When the live
+  file holds every source record in another order, the `Union` reports
+  covered, but the receive path rewrites the file with the source's bytes
+  first. Neither loses a record.
+- A held-written copy waits for the operator. No command resolves it yet.
+- `regularize`'s Q198 staged copies are still kept under private
+  `.kept-<inode>.bulkload-reseat` names. That is #280's path, and those
+  names are private holds, not besides.
 - `just darwin-check` on pzm is owed before merge.
