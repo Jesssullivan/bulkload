@@ -297,7 +297,7 @@ pub fn workspace(
     target: &Target<'_>,
     landing: &Landing<'_>,
     since: Option<i128>,
-    (origins, items, beside, advance): (&[String], &[String], Option<&str>, bool),
+    (origins, items, beside, advance, refs_in): (&[String], &[String], Option<&str>, bool, bool),
 ) -> Result<ItemRow> {
     let workspace = target
         .workspace
@@ -428,7 +428,23 @@ pub fn workspace(
                     "advance"
                 };
             }
-            if let (false, Some(suffix)) = (advances, beside) {
+            // `--refs-in` (operator ruling 2026-10-16 21:24Z): a capture
+            // with no tracked change whose HEAD its refs bring in lands no
+            // tree beside, so the plan never reports one (the apply's own
+            // assessment, read-only; it lands beside after all only when
+            // the refs-in it runs first leaves that HEAD unreached).
+            let clean = !advances
+                && refs_in
+                && beside.is_some()
+                && super::clean::assess(staged, target)
+                    .ok()
+                    .flatten()
+                    .is_some();
+            if clean {
+                row.adopt = "refs-in";
+                row.components.push("beside=none".to_owned());
+            }
+            if let (false, false, Some(suffix)) = (advances, clean, beside) {
                 row.components.push(beside_component(
                     (staged, target, items),
                     (&common, &meta.exclude(&scratch.repo)?),

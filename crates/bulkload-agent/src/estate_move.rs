@@ -876,6 +876,8 @@ fn preview(run: &Move, (plan, corpus, private): (&Path, &Path, &Path)) -> Result
             activate_origin: run.origins.clone(),
             beside: Some(run.suffix()),
             advance_ancestor: run.advance_ancestor,
+            // The apply's `--refs-in` lands no tree beside a clean capture.
+            refs_in: true,
             side_roots: run.side_roots.clone(),
         },
         &mut |line| writeln!(file, "{line}").refuse_at("estate_move::diff"),

@@ -78,7 +78,9 @@ use serde::{Deserialize, Serialize};
 use super::super::converge::files::{self, Tally, Want};
 use super::super::converge::handoff::TARGETS;
 use super::super::converge::{advance, clean, head_of, same_dir};
-use super::super::{git, landed, native_refs, output, REBUILDABLE_DIRECTORIES};
+use super::super::{
+    durable, git, input, landed, native_refs, oid, output, REBUILDABLE_DIRECTORIES,
+};
 use super::retire::{self, Retired};
 use crate::{BulkloadRefusal, Result};
 
@@ -139,6 +141,17 @@ pub struct Proof {
     /// Worktrees a standalone tree's `.git` registers that are gone on
     /// this host (prunable: a copy's, naming another host's paths).
     pub prunable: u64,
+    /// The commits its reflogs (and a gone worktree's) name that no live
+    /// ref reaches: carried into the live repository under
+    /// `refs/<ns>/reflog/<tree>/<oid>` before it goes (operator ruling
+    /// 2026-10-16, "full history. drop nothing. ever.").
+    pub reflogs: Vec<String>,
+    /// Those of them the live repository's object store lacks (their
+    /// objects are carried too).
+    pub reflogs_absent: u64,
+    /// Every commit its refs and stash name (all reachable in the live
+    /// repository): what a carry of its reflog commits leaves out.
+    tips: Vec<String>,
     /// The prints of the tree and a linked tree's administration directory
     /// (its HEAD, index and reflogs live there), taken before the proof.
     prints: [u8; 32],
@@ -250,12 +263,6 @@ fn standalone_refs(
         free += 1;
     }
     Ok(Ok((commits, wanted)))
-}
-
-fn labelled(label: &str, commits: Vec<String>) -> impl Iterator<Item = (String, String)> + '_ {
-    commits
-        .into_iter()
-        .map(move |commit| (label.to_owned(), commit))
 }
 
 // Why some of `commits` (each with the name it is reported under) is not
@@ -485,12 +492,17 @@ fn owns_admin(beside: &Path, admin: &Path) -> bool {
 // administration names (its HEAD, its reflogs), to be proved reachable;
 // `Err` with the refusal word for one that is here, or holds a
 // per-worktree ref of its own.
-fn registered(beside: &Path, git_dir: &Path) -> Result<std::result::Result<(u64, Named), String>> {
+#[allow(clippy::type_complexity)]
+fn registered(
+    beside: &Path,
+    git_dir: &Path,
+) -> Result<std::result::Result<(u64, Named, Vec<String>), String>> {
     let census = super::super::converge::worktree_census(beside)?;
     if census.iter().skip(1).any(|listed| !listed.prunable) {
         return Ok(Err("worktrees".to_owned()));
     }
     let mut named = Vec::new();
+    let mut reflogged = Vec::new();
     let admins = git_dir.join("worktrees");
     if retire::lstat(&admins)?.is_some_and(|meta| meta.is_dir()) {
         for entry in fs::read_dir(&admins).refuse_at(SITE)? {
@@ -506,11 +518,11 @@ fn registered(beside: &Path, git_dir: &Path) -> Result<std::result::Result<(u64,
             if super::super::oid(&head) {
                 named.push(("worktree-head".to_owned(), head));
             }
-            named.extend(labelled("logged", retire::reflogs(&admin.join("logs"))?));
+            reflogged.extend(retire::reflogs(&admin.join("logs"))?);
         }
     }
     let gone = u64::try_from(census.len().saturating_sub(1)).unwrap_or(u64::MAX);
-    Ok(Ok((gone, named)))
+    Ok(Ok((gone, named, reflogged)))
 }
 
 // A standalone bulkload landing's `.git/carry-config` receipts (the
@@ -539,6 +551,139 @@ fn receipts(git_dir: &Path) -> Result<Option<Receipts>> {
         read.push((entry.relative, bytes));
     }
     Ok(Some(read))
+}
+
+// Of the commits `logged` (a beside tree's reflogs name them), those no
+// ref of the live repository at `live` reaches, sorted, and how many of
+// them its object store lacks; `Err` with the refusal word for one the
+// beside tree's own store lacks too (nothing left to carry).
+#[allow(clippy::type_complexity)]
+fn unreached(
+    beside: &Path,
+    live: &Path,
+    mut logged: Vec<String>,
+) -> Result<std::result::Result<(Vec<String>, u64), String>> {
+    logged.retain(|commit| oid(commit));
+    logged.sort();
+    logged.dedup();
+    if logged.is_empty() {
+        return Ok(Ok((Vec::new(), 0)));
+    }
+    let present = |repo: &Path, commits: &[String]| -> Result<BTreeSet<String>> {
+        let mut request = String::new();
+        for commit in commits {
+            request.push_str(commit);
+            request.push('\n');
+        }
+        let listed = input(
+            git(repo).args(["cat-file", "--batch-check"]),
+            request.as_bytes(),
+        )?;
+        // `<oid> <type> <size>`, or `<oid> missing`.
+        Ok(String::from_utf8_lossy(&listed)
+            .lines()
+            .filter(|line| !line.ends_with(" missing"))
+            .filter_map(|line| line.split(' ').next())
+            .map(str::to_owned)
+            .collect())
+    };
+    let in_live = present(live, &logged)?;
+    let mut absent = 0;
+    let mut unreached = Vec::new();
+    let missing: Vec<String> = logged
+        .iter()
+        .filter(|commit| !in_live.contains(*commit))
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        let in_beside = present(beside, &missing)?;
+        if let Some(lost) = missing.iter().find(|commit| !in_beside.contains(*commit)) {
+            return Ok(Err(format!("logged-missing:{lost}")));
+        }
+        absent = u64::try_from(missing.len()).unwrap_or(u64::MAX);
+        unreached.extend(missing);
+    }
+    for commit in logged.iter().filter(|commit| in_live.contains(*commit)) {
+        if !retire::reachable(live, std::slice::from_ref(commit)) {
+            unreached.push(commit.clone());
+        }
+    }
+    unreached.sort();
+    Ok(Ok((unreached, absent)))
+}
+
+/// The namespace directory a beside tree's reflog commits go under:
+/// `refs/<ns>/reflog/<name>-<tag>/`, `<name>` its live checkout's name made
+/// one plain ref component.
+fn reflog_dir(beside: &Path, live: &Path, ns: &str) -> String {
+    let name: String = live
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let tag = tag(beside);
+    format!(
+        "refs/{ns}/reflog/{name}-{}/",
+        tag.get(..8).unwrap_or_default()
+    )
+}
+
+// Carry the commits `reflogs` (a beside tree's reflog commits no live ref
+// reaches) into the live repository at `live`: their objects first, when
+// its store lacks some (a pack of what they reach and none of `tips`
+// does, read from the beside tree and indexed into the live store), then
+// one ref each under [`reflog_dir`], create-only. The refs it wrote (or
+// found at their value), or why it carried none.
+fn carry_reflogs(
+    (beside, live): (&Path, &Path),
+    ns: &str,
+    proof: &Proof,
+) -> Result<std::result::Result<Vec<(String, String)>, String>> {
+    if proof.reflogs.is_empty() {
+        return Ok(Ok(Vec::new()));
+    }
+    if proof.reflogs_absent > 0 {
+        let mut request = String::new();
+        for commit in &proof.reflogs {
+            request.push_str(commit);
+            request.push('\n');
+        }
+        for commit in &proof.tips {
+            request.push('^');
+            request.push_str(commit);
+            request.push('\n');
+        }
+        let pack = input(
+            git(beside).args(["pack-objects", "--revs", "--stdout", "--quiet"]),
+            request.as_bytes(),
+        )?;
+        if pack.len() > 1 << 30 {
+            return Ok(Err("reflog-pack-large".to_owned()));
+        }
+        let mut command = git(live);
+        durable(&mut command);
+        input(command.args(["index-pack", "--stdin"]), &pack)?;
+    }
+    let dir = reflog_dir(beside, live, ns);
+    let wanted: BTreeMap<String, String> = proof
+        .reflogs
+        .iter()
+        .map(|commit| (format!("{dir}{commit}"), commit.clone()))
+        .collect();
+    let planned = super::plan(live, &wanted)?;
+    if let Some((name, _, _)) = planned.kept.first() {
+        return Ok(Err(format!("refs:{name}")));
+    }
+    super::create(live, &planned.create)?;
+    Ok(Ok(wanted.into_iter().collect()))
 }
 
 /// Prove the beside tree at `beside` a subset of the live checkout at
@@ -570,6 +715,9 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
             exclude: Vec::new(),
             carried: Vec::new(),
             prunable: 0,
+            reflogs: Vec::new(),
+            reflogs_absent: 0,
+            tips: Vec::new(),
             prints: empty_prints,
             wants: Vec::new(),
         })));
@@ -634,6 +782,7 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
     // 4. Its Git: every commit it names, with the name it is reported
     // under.
     let mut commits: Vec<(String, String)> = Vec::new();
+    let mut logged: Vec<String> = Vec::new();
     let mut refs = Vec::new();
     let (mut config, mut exclude, mut carried) = (Vec::new(), Vec::new(), Vec::new());
     let mut prunable = 0;
@@ -646,14 +795,15 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
             if retire::worktree_refs(&git_dir)? {
                 return Ok(refused("worktree-refs"));
             }
-            commits.extend(labelled("logged", retire::reflogs(&git_dir.join("logs"))?));
+            logged.extend(retire::reflogs(&git_dir.join("logs"))?);
             bytes += allocated(&git_dir)?;
         }
         Shape::Standalone => {
             match registered(beside, &git_dir)? {
-                Ok((gone, named)) => {
+                Ok((gone, named, reflogged)) => {
                     prunable = gone;
                     commits.extend(named);
+                    logged.extend(reflogged);
                 }
                 Err(why) => return Ok(refused(why)),
             }
@@ -698,13 +848,19 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
                 }
                 Err(why) => return Ok(refused(why)),
             }
-            commits.extend(labelled("logged", retire::reflogs(&git_dir.join("logs"))?));
+            logged.extend(retire::reflogs(&git_dir.join("logs"))?);
         }
         Shape::Empty => {}
     }
+    let tips: Vec<String> = commits.iter().map(|(_, commit)| commit.clone()).collect();
     if let Some(why) = unreachable(live, commits) {
         return Ok(refused(why));
     }
+    // The commits only its reflogs name: carried in, never dropped.
+    let (reflogs, reflogs_absent) = match unreached(beside, live, logged)? {
+        Ok(found) => found,
+        Err(why) => return Ok(refused(why)),
+    };
     // 5. Its untracked and ignored entries.
     let tracked = files::index_paths(beside)?;
     let mut dirs = BTreeSet::new();
@@ -783,6 +939,9 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
         exclude,
         carried,
         prunable,
+        reflogs,
+        reflogs_absent,
+        tips,
         prints: before,
         wants,
     })))
@@ -809,6 +968,8 @@ pub struct RetiredRecord {
     pub carried: Receipts,
     /// Prunable worktrees its `.git` registered.
     pub prunable: u64,
+    /// The refs its reflog commits went in under, `(name, commit)`.
+    pub reflogs: Vec<(String, String)>,
     /// Unix nanoseconds at the proof.
     pub at_ns: i128,
     /// The removal began (the tree is renamed aside or gone).
@@ -1032,12 +1193,22 @@ pub fn retire(
         }
         super::create(live, &planned.create)?;
     }
+    // Its reflog commits, carried in (full history, nothing dropped).
+    match carry_reflogs((beside, live), rules.ns, proof)? {
+        Ok(written) => record.reflogs = written,
+        Err(why) => return Ok(Retired::Kept(why)),
+    }
+    landed::write(&ledger, &record)?;
     // Proved again: every entry is now in the live checkout.
     let started = retire::proof_start_ns();
     let Verdict::Retirable(again) = prove(beside, live, rules)? else {
         return Ok(Retired::Kept("raced".to_owned()));
     };
-    if again.tally.placed != 0 || again.tally.beside != 0 || again.tally.dirs_placed != 0 {
+    if again.tally.placed != 0
+        || again.tally.beside != 0
+        || again.tally.dirs_placed != 0
+        || !again.reflogs.is_empty()
+    {
         return Ok(Retired::Kept("raced".to_owned()));
     }
     // The last look before the rename (its prints again inside the

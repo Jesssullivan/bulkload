@@ -1052,3 +1052,140 @@ fn r4_unaccounted_git_entries_and_rebuildable_roots_refuse() {
     );
     assert!(!world.beside().exists());
 }
+
+/// R5 (operator ruling 2026-10-16, "full history. drop nothing. ever."): a
+/// commit only a beside tree's reflog names is never dropped: the proof
+/// counts it (`reflog-to-carry`), and the retirement carries it into the
+/// live repository under `refs/<ns>/reflog/<tree>/<oid>` before the tree
+/// goes, its objects too when the live store lacks them (a standalone
+/// copy), only the ref when it shares the store (a linked tree).
+#[test]
+fn r5_reflog_only_commits_are_carried_never_dropped() {
+    for shape in ["standalone", "linked"] {
+        let world = World::new();
+        world.capture();
+        let state = world.path("retire-state");
+        if shape == "standalone" {
+            let ran = world.apply(&FLAGS);
+            assert_eq!(receipt(&ran.stdout).0, "workspace-refs-in");
+            let copied = Command::new("cp")
+                .arg("-a")
+                .arg(world.neo())
+                .arg(world.beside())
+                .status()
+                .unwrap();
+            assert!(copied.success());
+            git(
+                &world.beside(),
+                &[
+                    "commit",
+                    "--quiet",
+                    "--allow-empty",
+                    "-m",
+                    "only in a reflog",
+                ],
+            );
+            git(&world.beside(), &["reset", "--quiet", "--hard", "HEAD~1"]);
+        } else {
+            let ran = world.apply(&["--adopt", "--beside", SUFFIX]);
+            assert_eq!(receipt(&ran.stdout).0, "workspace-beside");
+            git(
+                &world.beside(),
+                &[
+                    "commit",
+                    "--quiet",
+                    "--allow-empty",
+                    "-m",
+                    "only in a reflog",
+                ],
+            );
+            git(
+                &world.beside(),
+                &["checkout", "--quiet", "--detach", "HEAD~1"],
+            );
+        }
+        let lost = git(&world.beside(), &["rev-parse", "HEAD@{1}"])
+            .trim()
+            .to_owned();
+        let in_live = |commit: &str| {
+            git_command(&world.sting())
+                .args(["cat-file", "-e", commit])
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert_eq!(in_live(&lost), shape == "linked", "{shape}");
+        let report = retire(&[], &state, &[world.beside().as_path()]);
+        let line = line_of(&report.stdout, &world.beside()).to_owned();
+        let objects = if shape == "linked" { "0" } else { "1" };
+        for held in [
+            "verdict=retirable".to_owned(),
+            "reflog-to-carry=1".to_owned(),
+            format!("reflog-objects-to-carry={objects}"),
+        ] {
+            assert!(
+                line.split_whitespace().any(|w| w == held),
+                "{shape} {held}: {line}"
+            );
+        }
+        let done = retire(&["--delete"], &state, &[world.beside().as_path()]);
+        assert!(
+            line_of(&done.stdout, &world.beside()).contains("outcome=retired"),
+            "{shape}: {}",
+            done.stdout
+        );
+        assert!(!world.beside().exists());
+        assert!(in_live(&lost), "{shape}: the commit was dropped");
+        let carried: Vec<String> = named_refs(&world.sting())
+            .into_iter()
+            .filter(|(name, value)| name.starts_with("refs/neo-20261016/reflog/") && *value == lost)
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(carried.len(), 1, "{shape}: {carried:?}");
+        assert!(carried[0].ends_with(&format!("/{lost}")), "{carried:?}");
+    }
+}
+
+/// C10: `estate-diff --beside SUFFIX --refs-in` (and so `estate-move
+/// --plan-only`) previews what the apply does: a clean source reads
+/// `adopt:"refs-in"` with `beside=none`, never a beside landing; one with
+/// a tracked change still previews its beside landing.
+#[test]
+fn c10_the_plan_previews_no_tree_beside_for_a_clean_source() {
+    for dirty in [false, true] {
+        let world = World::new();
+        if dirty {
+            fs::write(world.neo().join("README"), b"v1, edited on neo\n").unwrap();
+        }
+        world.capture();
+        let ran = agent(&os(&[
+            &"estate-diff",
+            &"--beside",
+            &SUFFIX,
+            &"--refs-in",
+            &world.plan(),
+            &world.corpus(),
+            &SOURCE,
+            &world.state(),
+        ]));
+        assert!(ran.ok, "{dirty}: {}\n{}", ran.stdout, ran.stderr);
+        let line = ran
+            .stdout
+            .lines()
+            .find(|line| line.contains("\"kind\":\"item\""))
+            .unwrap()
+            .to_owned();
+        if dirty {
+            assert!(
+                line.contains("\"adopt\":\"diverged\"") && line.contains("beside=landing:"),
+                "{line}"
+            );
+        } else {
+            assert!(
+                line.contains("\"adopt\":\"refs-in\"") && line.contains("\"beside=none\""),
+                "{line}"
+            );
+        }
+        assert!(!world.beside().exists(), "{dirty}: the preview wrote");
+    }
+}

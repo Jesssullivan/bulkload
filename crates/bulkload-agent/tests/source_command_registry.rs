@@ -488,7 +488,13 @@ const WRITERS: &[(&str, usize, &str)] = &[
         4,
         "The capture's private write store and a bundle's envelope repository.",
     ),
-    ("index-pack", 1, "shallow::unpack: the destination's store."),
+    (
+        "index-pack",
+        2,
+        "shallow::unpack: the destination's store; and a beside retirement's \
+         reflog carry (operator ruling 2026-10-16, full history): the live \
+         repository's store, from a pack read from the beside tree.",
+    ),
     (
         "init",
         5,
@@ -3024,7 +3030,7 @@ fn an_entry_that_outlives_its_code_is_refused() {
     for (module, expected) in [
         (
             "agent::git_carry::shallow",
-            &["WRITERS \"index-pack\": registered as 1, the tree holds 0"][..],
+            &["WRITERS \"index-pack\": registered as 2, the tree holds 1"][..],
         ),
         (
             "agent::git_carry::estimate",

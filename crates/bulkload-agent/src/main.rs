@@ -331,7 +331,7 @@ SUBCOMMANDS:
                 interrupted undo is finished, never re-seated). Refuses
                 RECEIPT_BINDING_INVALID, changing no path, when either path no
                 longer holds what the seat left.
-    estate-diff [--since NS] [--scan DIR]... [--activate-origin PREFIX]... [--side-root ROOT]... [--beside SUFFIX] [--advance-ancestor] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
+    estate-diff [--since NS] [--scan DIR]... [--activate-origin PREFIX]... [--side-root ROOT]... [--beside SUFFIX] [--refs-in] [--advance-ancestor] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
                 Read-only: classify each plan item against the destination now
                 (identical, source-only, source-ahead, dest-ahead, diverged with a
                 ledger; differs with a hint without one), with what estate-apply
@@ -344,7 +344,11 @@ SUBCOMMANDS:
                 estate-apply --advance-ancestor would advance reads
                 adopt:advance, one it would refuse keeps diverged with the
                 component advance-refused=CODE (estate-move --plan-only with
-                the flag passes it). One bulkload.estate-diff.v1 JSON line per row
+                the flag passes it). With --beside SUFFIX --refs-in, a diverged
+                item whose capture has no tracked change and whose HEAD its refs
+                bring in reads adopt:refs-in with beside=none, as estate-apply
+                --refs-in lands no tree beside it (estate-move --plan-only
+                passes it). One bulkload.estate-diff.v1 JSON line per row
     estate-handoff [--check | --clear [--clear-carried] | --dry-run] [--item ID]...
                 [--workspace PATH]... [--sibling LANDED_PREFIX=LIVE_PREFIX]...
                 [--readme] [--renew] [--as-of NS] PLAN CORPUS PRIVATE_STATE SOURCE
@@ -1873,7 +1877,11 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
         }
         "estate-diff" => {
             let (options, rest) = estate_options(args)?;
-            if rest.len() < 4 || options.adopt || options.exclude_union || options.refs_in {
+            if rest.len() < 4
+                || options.adopt
+                || options.exclude_union
+                || (options.refs_in && options.beside.is_none())
+            {
                 return Err(BulkloadRefusal::RequiredFieldMissing);
             }
             let source = rest
@@ -1893,6 +1901,7 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
                     activate_origin: options.activate_origin,
                     beside: options.beside,
                     advance_ancestor: options.advance_ancestor,
+                    refs_in: options.refs_in,
                     side_roots: options.side_roots,
                 },
                 &mut |line| writeln!(output, "{line}").refuse_at("main::estate_command"),
