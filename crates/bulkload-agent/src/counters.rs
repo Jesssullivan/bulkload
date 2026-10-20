@@ -329,6 +329,36 @@ counters! {
     // mode it holds `SHARED` on the main file that long (OI-1003-Q16's lock,
     // for the transfer and the `snapshot` verb alike).
     SourceSqliteLockNs => "source_sqlite_lock_ns",
+    // The source's held read snapshot (operator ruling 2026-10-19): busy
+    // tries waited out before it was taken, snapshots held, nanoseconds
+    // held, and snapshots released because the free-space floor was crossed.
+    SourceSqliteBusyRetries => "source_sqlite_busy_retries",
+    SourceSqliteSnapshotHolds => "source_sqlite_snapshot_holds",
+    SourceSqliteSnapshotHeldNs => "source_sqlite_snapshot_held_ns",
+    SourceSqliteHeldFloorRefusals => "source_sqlite_held_floor_refusals",
+    // `sqlite-union` (operator ruling 2026-10-20): source rows streamed from
+    // the held snapshot, and passes that read nothing because the store's
+    // identity was the one the destination recorded.
+    SourceSqliteRowsRead => "source_sqlite_rows_read",
+    SourceSqliteRowsUnchanged => "source_sqlite_rows_unchanged",
+    // Destination rows of a union by outcome: inserted, adopted (equal,
+    // nothing written), replaced by a later version (the old row ledgered
+    // first), kept over the source's (the source's ledgered), refused by a
+    // constraint (ledgered), and path values re-spelled through --map.
+    DestSqliteRowsInserted => "dest_sqlite_rows_inserted",
+    DestSqliteRowsAdopted => "dest_sqlite_rows_adopted",
+    DestSqliteRowsReplaced => "dest_sqlite_rows_replaced",
+    DestSqliteRowsKept => "dest_sqlite_rows_kept",
+    DestSqliteRowsRefused => "dest_sqlite_rows_refused",
+    DestSqliteRowsRespelled => "dest_sqlite_rows_respelled",
+    // Union write transactions committed on the live store, the time they
+    // held its write lock, tries that met a live writer's lock, integrity
+    // checks run after a pass, and stores created by the union.
+    DestSqliteUnionBatches => "dest_sqlite_union_batches",
+    DestSqliteUnionWriteNs => "dest_sqlite_union_write_ns",
+    DestSqliteUnionBusy => "dest_sqlite_union_busy",
+    DestSqliteUnionChecked => "dest_sqlite_union_checked",
+    DestSqliteUnionCreated => "dest_sqlite_union_created",
     // Snapshot captures whose main file or `-wal` moved, or was stamped
     // within the racy allowance, across the backup: sent, never recorded.
     SourceSqliteUnsettled => "source_sqlite_unsettled",

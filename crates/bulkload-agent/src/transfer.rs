@@ -1516,6 +1516,40 @@ fn local_new_path_stream(root: &Path) -> bool {
         .unwrap_or_else(|| std::env::var(LOCAL_NEW_PATH_STREAM_ENV).is_ok_and(|value| value == "1"))
 }
 
+/// Whether `serve` streams one `SQLite` store's rows (`--sqlite-rows`,
+/// [`crate::sqlite_union::serve_rows`]) instead of serving a tree.
+static ROWS_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set `--sqlite-rows` for this process: `serve` serves rows, and a
+/// `sqlite-union` passes the flag to the remote `serve`.
+pub fn set_rows_mode(on: bool) {
+    ROWS_MODE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether `--sqlite-rows` is set ([`set_rows_mode`]).
+#[must_use]
+pub fn rows_mode() -> bool {
+    ROWS_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The flags `pull` forwards to its remote `serve`.
+///
+/// Each is a fixed literal or digits rendered from a parsed integer:
+/// `--sqlite-rows` for a `sqlite-union` (operator ruling 2026-10-20), and
+/// `--sqlite-carry-wall` when it is not the default.
+#[must_use]
+pub fn serve_flags() -> Vec<String> {
+    let mut flags = Vec::new();
+    if rows_mode() {
+        flags.push("--sqlite-rows".to_owned());
+    }
+    let wall = crate::sqlite_union::hold::carry_wall_base();
+    if wall != crate::sqlite_union::hold::CARRY_WALL {
+        flags.push(format!("--sqlite-carry-wall={}", wall.as_secs()));
+    }
+    flags
+}
+
 /// Raise one transfer stream's kernel buffers, best effort. A stream that
 /// cannot be tuned still carries the protocol, only slower.
 pub fn tune_stream(stream: &impl std::os::fd::AsFd) {

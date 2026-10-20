@@ -161,6 +161,7 @@ const BYPASSES: &[Bypass] = &[
              ifbulkload_agent::durable::ledger_sync()==\
              bulkload_agent::durable::LedgerSync::Full{\
              ssh.arg(\"--source-ledger-sync=full\");}\
+             forflaginbulkload_agent::transfer::serve_flags(){ssh.arg(flag);}\
              ssh.arg(\"serve\");\
              ifkind==bulkload_agent::transfer::RootKind::File{\
              ssh.arg(\"--file\");}\
@@ -175,7 +176,13 @@ const BYPASSES: &[Bypass] = &[
               and the ssh child touches no local source. The three mode flags \
               it may pass (`--durability=strict`, WP0(g)'s \
               `--source-ledger-sync=full`, OI-1003-Q109, and `serve --file` \
-              for a single-file root, #232) are fixed literals.",
+              for a single-file root, #232) are fixed literals. \
+              `transfer::serve_flags` adds only `--sqlite-rows` (a fixed \
+              literal; operator ruling 2026-10-20: the remote serve then \
+              streams one store's rows from a held read snapshot, the \
+              database named in the request on stdin, never on the command \
+              line) and `--sqlite-carry-wall=N` (digits rendered from the \
+              parsed integer, only away from its default).",
     },
     Bypass {
         id: "agent::provider_sqlite::hydrate::hydrate_one(program)",

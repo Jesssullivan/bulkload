@@ -111,6 +111,7 @@ pub mod provider_sqlite;
 pub mod refuse;
 pub mod reseat;
 pub mod space;
+pub mod sqlite_union;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod transfer;
