@@ -121,7 +121,10 @@ fn jobs(value: Option<&OsString>) -> Result<usize> {
 /// under the roots ([`moving::inventory`]), append the new items to
 /// `MOVE_STATE/carry/plan.postcard` (`estate-add-batch`), and capture the
 /// plan into `MOVE_STATE/carry/corpus` (`estate-capture`, private state in
-/// `MOVE_STATE/private`). A capture refusal is an item's (its line says
+/// `MOVE_STATE/private`), and make `MOVE_STATE/serve` and
+/// `MOVE_STATE/serve/carry`, where the destination half's `pull`s and its
+/// carry phase keep their `serve` states (#276). A capture
+/// refusal is an item's (its line says
 /// why; the destination carries it as files); only a refusal of the whole
 /// capture fails the verb.
 #[allow(clippy::too_many_lines)] // Arguments, then the inventory and capture.
@@ -163,6 +166,16 @@ fn source_command(args: &[OsString]) -> Result<()> {
     let _lock = moving::lock(&state)?;
     let carry = state.join("carry");
     moving::private_dir(&carry)?;
+    // #276: the destination half's `pull`s name their source states under
+    // `MOVE_STATE/serve/NAME` (the corpus, the sessions) and its carry
+    // phase under `MOVE_STATE/serve/carry/ITEM` (`estate-carry-files
+    // --source-state-root`), on this host, over the transport it chose. The
+    // directories are this verb's, like `carry/` and `private/`, so they are
+    // here before the first `serve` is asked to open a state in them
+    // (`serve` makes every missing parent too, for a state handed to it by
+    // anything else).
+    moving::private_dir(&state.join("serve"))?;
+    moving::private_dir(&state.join("serve/carry"))?;
     // The pass's mark: `estate-move` refuses a corpus pulled while a pass
     // was still writing it (its `done` mark is another pass's, or none).
     let pass = now_ns().to_string();
@@ -188,7 +201,8 @@ fn source_command(args: &[OsString]) -> Result<()> {
             note.code.unwrap_or("none"),
         ))?;
     }
-    let existing = if plan.try_exists().refuse_at("estate_move::source")? {
+    let plan_existed = plan.try_exists().refuse_at("estate_move::source")?;
+    let existing = if plan_existed {
         estate::inspect(&plan)?
     } else {
         Vec::new()
@@ -208,7 +222,10 @@ fn source_command(args: &[OsString]) -> Result<()> {
         .map(|planned| planned.item.clone())
         .filter(|item| !existing.contains(item))
         .collect();
-    if !new.is_empty() {
+    // A first pass whose roots hold no repository still writes its (empty)
+    // plan, so the pass completes and the destination half reads a plan,
+    // never `IO (errno 2)` (#283 review 5).
+    if !new.is_empty() || !plan_existed {
         estate::add_batch(&plan, &new)?;
     }
     let planned = estate::inspect(&plan)?.len();
@@ -221,13 +238,14 @@ fn source_command(args: &[OsString]) -> Result<()> {
             .sum()
     };
     out(&format!(
-        "estate-move-source phase=inventory outcome=ok items={} new={} planned={planned} symlinks={} not_git_files={} prunable={} unreadable={} not_in_census={}",
+        "estate-move-source phase=inventory outcome=ok items={} new={} planned={planned} symlinks={} not_git_files={} prunable={} unreadable={} source_vanished={} not_in_census={}",
         found.items.len(),
         new.len(),
         noted("symlink"),
         noted("not-git"),
         noted("prunable"),
         noted("unreadable"),
+        noted("source-vanished"),
         noted("not-in-census"),
     ))?;
     let policy = if rebuildable {
