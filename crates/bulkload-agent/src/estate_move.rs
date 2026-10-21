@@ -937,7 +937,11 @@ fn move_pass(run: &Move) -> Result<()> {
             continue;
         };
         let place = row.item.workspace.as_ref().unwrap_or(&row.item.repository);
-        let ours = estate::streamed::landed_before(&private, &row.id, &run.source)?;
+        // Ours to land again: a landing of this item, never a
+        // consolidation of the destination's own repository.
+        let consolidated = estate::streamed::converged_path(&private, &row.id).is_file();
+        let ours =
+            !consolidated && estate::streamed::landed_before(&private, &row.id, &run.source)?;
         let clear = matches!(
             moving::presence(place),
             moving::Presence::Absent | moving::Presence::Empty
@@ -1015,6 +1019,7 @@ fn move_pass(run: &Move) -> Result<()> {
                             .filter(|(_, action)| action.word() == word)
                             .count()
                     };
+                    estate::streamed::mark_converged(&private, &row.id)?;
                     let (outcome, refusal) = if done.seats_held {
                         (
                             "refused",

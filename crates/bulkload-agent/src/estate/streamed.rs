@@ -539,6 +539,26 @@ pub fn converge(
     Ok(done)
 }
 
+/// `private/ITEM.converged`: the item's live path holds the destination's
+/// own repository, consolidated (never replaced) on every pass.
+#[must_use]
+pub fn converged_path(state: &Path, identity: &str) -> PathBuf {
+    state.join(format!("{identity}.converged"))
+}
+
+/// Record that the item is consolidated into the destination's own
+/// repository.
+///
+/// # Errors
+/// IO.
+pub fn mark_converged(state: &Path, identity: &str) -> Result<()> {
+    let path = converged_path(state, identity);
+    if path.is_file() {
+        return Ok(());
+    }
+    write_bytes(&path, b"consolidated\n")
+}
+
 /// `private/ITEM.index`: the entries digest of the index a landing last
 /// wrote at the item's live index.
 fn index_mark(state: &Path, identity: &str) -> PathBuf {

@@ -161,6 +161,8 @@ const PRIVATE_SUFFIXES: &[&str] = &[
     ".exclude-union",
     // The entries digest of the index a landing last wrote (rule 8).
     ".index",
+    // An item consolidated into the destination's own repository (B2).
+    ".converged",
     ".done",
     ".carried",
     // A streamed fetch's resume marks (B1).
