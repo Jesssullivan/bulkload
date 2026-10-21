@@ -8760,6 +8760,18 @@ fn plan_consolidating(
         Err(BulkloadRefusal::DestinationOccupied) => {}
         Err(refusal) => return done(Plan::Refuse(refusal)),
     }
+    // A Git worktree (B2): every differing file is gathered for Git's
+    // three-way merge, whatever its class; a file too large to gather is
+    // held.
+    if settings.git.is_some() {
+        return if row.size > crate::consolidate::IN_MEMORY_LIMIT {
+            held(settled, live_size, OVER_MEMORY)
+        } else if plan {
+            dry("consolidate", live_size, None)
+        } else {
+            Consolidating::Stage(class, parent)
+        };
+    }
     match class {
         Class::AppendLog => {
             match crate::materialize::covers(&file, manifest) {

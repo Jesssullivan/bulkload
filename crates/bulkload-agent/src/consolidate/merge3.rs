@@ -1,5 +1,6 @@
-//! Git's three-way merge as a union (B2 part 2): a file of a Git worktree
-//! both sides hold differently is merged against its version at the merge
+//! Git's three-way merge as a union (B2 part 2).
+//!
+//! A file of a Git worktree both sides hold differently is merged against its version at the merge
 //! base of the two sides' HEADs, with `git merge-file`'s semantics. The
 //! result replaces the live file only when no hunk conflicts and the live
 //! file is still the one read (no live holder changed it); a conflicting
