@@ -466,7 +466,11 @@ fn a_live_path_holding_another_version_is_held_and_untouched() {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
     }
     let moved = world.moved();
-    assert!(moved.stdout.contains("estate-move swept="), "{}", moved.stdout);
+    assert!(
+        moved.stdout.contains("estate-move swept="),
+        "{}",
+        moved.stdout
+    );
     assert!(!left.exists());
     let both = format!("{}\n{}", moved.stdout, moved.stderr);
     let line = item_line(&moved.stdout, &mine);

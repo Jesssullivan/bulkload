@@ -483,8 +483,9 @@ impl Drop for Scratch {
 /// Where a fetch's scratch repositories are made ([`set_scratch_root`]).
 static SCRATCH_ROOT: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
-/// Make every fetch's scratch repository under `root` (a move's own
-/// `MOVE_STATE/scratch`, swept at its startup and counted by its state
+/// Make every fetch's scratch repository under `root`.
+///
+/// A move's own `MOVE_STATE/scratch` is swept at its startup and counted by its state
 /// guard, so one a crash left shows as payload); `None`: the temporary
 /// directory.
 pub fn set_scratch_root(root: Option<PathBuf>) {
