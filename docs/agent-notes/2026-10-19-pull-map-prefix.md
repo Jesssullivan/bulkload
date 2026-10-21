@@ -439,6 +439,31 @@ with the counter at 0.
   `single_file_copy` 17/17, fault `reseat` 23/23, fault `beside` 10/10.
 - Still owed: the whole suite, the merge gate, and pzm `darwin-check`.
 
+## Merge of #297 at `b833705` (`ba16ab2`)
+
+#297 removed `--beside` (SPEC rule 3) and added the `pull --consolidate`
+dispatch. #294 now lands through that dispatch, and the dispatch calls
+#294's `consolidate::append_log::union` for every append log, streamed
+entries included (#297 held those). This is the single union path
+correction (3): a covered file is never rewritten. #294's own `--beside`
+pieces are dropped (dest-ahead, the beside consolidation,
+`set_consolidate_archives`, the Codex index retirement). `--map-prefix`
+(maps, `DESTINATION_MAP_CONFLICT`, the `mapped` rows) is put back on top of
+#297's `transfer.rs`, and estate-move keeps the key-map phase. Tests:
+`map_prefix` runs under `--consolidate`, and #297's append-log and
+estate-move expectations now see the union and the mapped keys. Targeted
+on honey: clippy ok, `transfer::` 147/147, `consolidate` 35/35,
+`reseat::` 84/84, `estate_move` 9/9.
+
+Whole suite on honey after the merge: `cargo test --workspace --locked
+--no-fail-fast` (lane limits). 47 binaries ran: 1382 passed, 1 failed, 9
+ignored; fmt and clippy ok. The one failure was `refusal_taxonomy`
+`every_refusal_variant_has_a_non_test_constructor`: `DESTINATION_UNSETTLED`
+lost its last producer with `--beside`, so the code is removed (it never
+shipped). After that, `bulkload-proto` 18/18, `refusal_taxonomy` 5/5,
+`closure` 38/38, `transfer::tests::consolidate` 4/4, and fmt and clippy are
+ok.
+
 ## Open
 
 - Source-key directories already on sting stay (removing a transcript is
@@ -464,4 +489,11 @@ with the counter at 0.
   yet). This lane supplies its append-log row (`append_log::plan_at`).
 - A copy whose union keeps refusing (a process never closes the file)
   stays kept and held until it can be unioned.
+- An archive-link transcript at the pull is held by #297's dispatch
+  (`the live path is a link or another kind`, and A-106 is not forwarded
+  after #297). It is not yet unioned into the link's target at the pull;
+  the re-seat's fold unions only race copies.
+- A transcript the destination holds under another key is held
+  (#297's `held_elsewhere`), and that includes neo-key directories that
+  earlier passes left.
 - `just darwin-check` on pzm is owed before merge.

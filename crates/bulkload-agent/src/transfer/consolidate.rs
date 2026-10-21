@@ -5,11 +5,11 @@
 //! inherently not path for path / byte for byte"; SPEC RUL-10, lossless
 //! union.
 //!
-//! Under `--beside` with consolidation on ([`super::set_consolidate`]), an
-//! append-only JSON Lines file (`.jsonl`: Claude transcripts and their
-//! subagents, Codex rollouts, `history.jsonl`, any other) whose live copy is
-//! neither the seat's bytes, nor a prefix of them (extended), nor holds them
-//! (covered, `dest-ahead`) is never landed beside. It is consolidated in
+//! The record merge behind [`crate::consolidate::append_log`], the union
+//! `--consolidate` and the re-seat's fold use for an append-only JSON Lines
+//! file (`.jsonl`: Claude transcripts and their subagents, Codex rollouts,
+//! `history.jsonl`, any other) whose live copy is neither the seat's bytes,
+//! nor a prefix of them, nor holds them. It is consolidated in
 //! place: one file at the path, the seat's bytes whole as its prefix (so
 //! where the histories are shared the source's bytes stand, and a later pass
 //! finds the file covering the seat), then every record of the live file
@@ -31,7 +31,7 @@
 //! level; not checked against a live `claude --resume` here).
 //!
 //! Either input ending inside a line (a writer at it) is not merged: the
-//! caller refuses the entry `DESTINATION_UNSETTLED`, and the next pass
+//! caller refuses the entry (`HOMES_CONSOLIDATE_RACED`), and the next pass
 //! decides it.
 
 use std::collections::{HashMap, HashSet};

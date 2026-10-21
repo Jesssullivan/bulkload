@@ -786,32 +786,3 @@ fn a_mapped_entry_is_accounted_like_applied_and_names_both_paths() {
         "{json}"
     );
 }
-
-/// #294 verification: a path refused `DESTINATION_UNSETTLED` (a writer may
-/// be at the live file) is typed but rerun-only: unaccounted, never closed
-/// by a review row or a standing policy; only a later pass that decides it
-/// closes it.
-#[test]
-fn an_unsettled_destination_is_rerun_only() {
-    let mut stats = TransferStats::default();
-    refused(
-        &mut stats,
-        "projects/k/s.jsonl",
-        "DESTINATION_UNSETTLED",
-        None,
-    );
-    stats.completed = 1;
-    let dest = state_with(&ended(stats));
-    let report = report_of(&[dest.path()]);
-    let row = row(&report, "projects/k/s.jsonl");
-    assert_eq!(
-        row.disposition,
-        Disposition::Unaccounted("destination-unsettled")
-    );
-    assert_eq!(report.refused_pending_review, 0);
-    assert!(!report.passes());
-    assert_eq!(
-        crate::closure::rerun_only("DESTINATION_UNSETTLED"),
-        Some("destination-unsettled")
-    );
-}
