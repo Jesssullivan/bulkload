@@ -156,10 +156,11 @@ pub struct Live<'a> {
     pub rel: &'a [u8],
 }
 
-/// The source's version of the file, as the receive gathered it: its bytes
-/// in memory, never staged on disk on either machine (SPEC rule 2), and
-/// dropped once the union returns. A file over [`IN_MEMORY_LIMIT`] is
-/// never gathered: it is held.
+/// The source's version of the file, as the receive gathered it.
+///
+/// Its bytes are in memory, never staged on disk on either machine (SPEC
+/// rule 2), and dropped once the union returns. A file over
+/// [`IN_MEMORY_LIMIT`] is never gathered: it is held.
 #[derive(Clone, Copy)]
 pub struct Source<'a> {
     pub bytes: &'a [u8],

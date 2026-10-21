@@ -282,3 +282,15 @@ Items 1 and 3 with `--beside` removed, after the merge of main `c2da575`
 | `cargo clippy -p bulkload-agent --all-targets --locked -- -D warnings` | ok |
 | `cargo test -p bulkload-agent --locked` (full suite) | 1306 passed, 0 failed |
 | `cargo test -p bulkload-proto --locked` | 18 passed |
+
+Configs gathered in a `Vec<u8>` (memfd dropped), after the merge of main
+`6f2d33f`. Targeted tests only, per the coordinator's honey-load rule; the
+whole suite runs in the coordinator's merge gate:
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all -- --check` | ok |
+| `cargo clippy -p bulkload-agent --all-targets --locked -- -D warnings` | ok |
+| `--lib -- transfer:: consolidate:: closure:: materialize:: transfer_store::` | 255 passed |
+| `--test estate_move` | 7 passed |
+| `--test refusal_taxonomy`, `bulkload-proto` | 5, 18 passed |

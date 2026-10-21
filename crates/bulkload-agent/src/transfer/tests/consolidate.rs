@@ -164,7 +164,12 @@ fn a_differing_config_is_merged_in_place_and_nothing_lands_beside() {
     run.settle();
 
     let stats = run.run();
-    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+    assert!(
+        stats.refusals.is_empty(),
+        "{:?} {:?}",
+        stats.refusals,
+        stats.held
+    );
     assert_eq!(
         consolidated(&stats),
         [

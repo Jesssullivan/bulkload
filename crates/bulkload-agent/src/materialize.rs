@@ -1448,7 +1448,6 @@ impl Destination {
         })
     }
 
-
     /// Whether a `-wal`, `-journal` or `-shm` of any kind sits beside the
     /// path `rel_path` names (#218, review R5). `SQLite` would apply a stale
     /// `-wal`, or roll a stale hot `-journal` back, into a database

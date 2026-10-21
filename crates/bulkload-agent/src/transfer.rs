@@ -4825,16 +4825,17 @@ impl Sink {
         match self {
             Self::File(file) => place(file, data, offsets),
             Self::Memory(buffer) => {
-                let mut buffer = buffer.lock().map_err(|_| BulkloadRefusal::WorkerLost)?;
-                for offset in offsets {
+                let mut held = buffer.lock().map_err(|_| BulkloadRefusal::WorkerLost)?;
+                let placed = offsets.iter().try_for_each(|offset| {
                     let start =
                         usize::try_from(*offset).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
-                    buffer
-                        .get_mut(start..start.saturating_add(data.len()))
+                    held.get_mut(start..start.saturating_add(data.len()))
                         .ok_or(BulkloadRefusal::DigestMismatch)?
                         .copy_from_slice(data);
-                }
-                Ok(())
+                    Ok(())
+                });
+                drop(held);
+                placed
             }
         }
     }
@@ -6825,9 +6826,13 @@ impl<W: Write> Inbound<'_, W> {
             }
             Incoming::AwaitManifest(seat) => seat.row,
             Incoming::Filling(Filling { row, plan, .. }) => {
-                if let Plan::Write(staging) = plan {
-                    self.open -= 1;
-                    let _ = staging.staged.discard();
+                match plan {
+                    Plan::Write(staging) => {
+                        self.open -= 1;
+                        let _ = staging.staged.discard();
+                    }
+                    Plan::Gather(_) => self.open -= 1,
+                    _ => {}
                 }
                 row
             }
@@ -7011,6 +7016,10 @@ impl<W: Write> Inbound<'_, W> {
                 }
                 let write = match (&filling.failure, &filling.plan, &filling.target) {
                     (None, Plan::Write(staging), Some(target)) => staging
+                        .placements
+                        .get(&header.digest)
+                        .map(|(_, offsets)| (Arc::clone(target), offsets.clone())),
+                    (None, Plan::Gather(gather), Some(target)) => gather
                         .placements
                         .get(&header.digest)
                         .map(|(_, offsets)| (Arc::clone(target), offsets.clone())),
@@ -8249,6 +8258,8 @@ struct Gather {
     class: crate::consolidate::Class,
     /// Chunk indices to request.
     missing: Vec<u32>,
+    /// Every offset each distinct chunk occupies, with its size.
+    placements: Placements,
     /// Bytes filled locally.
     placed: u64,
 }
@@ -8396,7 +8407,6 @@ struct Planned<'p> {
     snapshot: bool,
 }
 
-
 /// Validate a manifest against its row, adopt an existing output, or stage a
 /// new one and fill every chunk this destination already holds. Every
 /// salvaged temporary a chunk was staged from is added to `salvaged_from`.
@@ -8456,7 +8466,13 @@ fn plan_file(
         match plan_consolidating(context, planned, manifest, settings, salvaged_from) {
             Consolidating::Done(plan) => return *plan,
             Consolidating::Stage(class, parent) => {
-                return gather(context, (row, &placements, order), class, parent, salvaged_from)
+                return gather(
+                    context,
+                    (row, &placements, order),
+                    class,
+                    parent,
+                    salvaged_from,
+                )
             }
             Consolidating::Land => {}
         }
@@ -8553,15 +8569,14 @@ fn plan_file(
     })
 }
 
+/// Every offset each distinct chunk of a manifest occupies, with its size.
+type Placements = HashMap<[u8; 32], (u64, Vec<u64>)>;
+
 /// `--consolidate`: gather the seat's bytes in memory ([`Plan::Gather`]),
 /// filled from every chunk this destination holds, the rest asked for.
 fn gather(
     context: &ReceiveContext<'_>,
-    (row, placements, order): (
-        &RowSchema,
-        &HashMap<[u8; 32], (u64, Vec<u64>)>,
-        Vec<([u8; 32], u32)>,
-    ),
+    (row, placements, order): (&RowSchema, &Placements, Vec<([u8; 32], u32)>),
     class: crate::consolidate::Class,
     parent: Arc<std::fs::File>,
     salvaged_from: &mut Vec<usize>,
@@ -8581,7 +8596,9 @@ fn gather(
         let filled = local_chunk(context, &mut outputs, &digest, *chunk, salvaged_from)
             .and_then(|data| data.map(|data| sink.place(&data, offsets)).transpose());
         match filled {
-            Ok(Some(())) => placed = placed.saturating_add(chunk.saturating_mul(offsets.len() as u64)),
+            Ok(Some(())) => {
+                placed = placed.saturating_add(chunk.saturating_mul(offsets.len() as u64));
+            }
             Ok(None) => missing.push(index),
             Err(refusal) => return Plan::Refuse(refusal),
         }
@@ -8591,6 +8608,7 @@ fn gather(
         parent,
         class,
         missing,
+        placements: placements.clone(),
         placed,
     }))
 }
