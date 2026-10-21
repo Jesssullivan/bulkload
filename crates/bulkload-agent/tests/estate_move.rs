@@ -369,8 +369,11 @@ fn a_streamed_pass_lands_every_absent_item_with_no_payload_anywhere() {
     let landed_status: String = out(&dst.join("land"), &["status", "--porcelain", "--ignored"])
         .lines()
         .filter(|line| *line != "?? AGENTS.md" && *line != "?? CLAUDE.md")
-        .map(|line| format!("{line}\n"))
-        .collect();
+        .fold(String::new(), |mut all, line| {
+            all.push_str(line);
+            all.push('\n');
+            all
+        });
     assert_eq!(
         landed_status,
         out(&src.join("land"), &["status", "--porcelain", "--ignored"])
