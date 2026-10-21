@@ -58,6 +58,9 @@ const STARTED: &str = "move-source.started";
 const DONE: &str = "move-source.done";
 const REFUSALS: &str = "move-source.refusals";
 const NOTES: &str = "move-source.notes";
+// The source's `$HOME`: the destination places what no `--map` covers
+// under its own home (the default home map, 2026-10-21).
+const SOURCE_HOME: &str = "move-source.home";
 
 // Whether the pulled corpus is a finished source pass's: its `done` mark
 // names the pass its `started` mark names.
@@ -224,6 +227,13 @@ fn source_pass(
     // was still writing it (its `done` mark is another pass's, or none).
     let pass = now_ns().to_string();
     moving::write_report(&carry.join(STARTED), pass.as_bytes())?;
+    if let Some(home) = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        moving::write_report(&carry.join(SOURCE_HOME), home.as_os_str().as_bytes())?;
+    }
     let plan = carry.join("plan.postcard");
     let found = moving::inventory(roots, maps)?;
     for planned in &found.items {
@@ -638,7 +648,6 @@ impl Move {
         // The session options act only with --sessions.
         if parsed.sessions.is_none()
             && (parsed.codex_root.is_some()
-                || parsed.dest_home.is_some()
                 || !parsed.maps.is_empty()
                 || !parsed.reseat_args.is_empty()
                 || !parsed.archived.is_empty()
@@ -919,20 +928,30 @@ fn move_pass(run: &Move) -> Result<()> {
     // 2. Decide every item against the destination now. Under --plan-only
     // the decisions are shown, never recorded.
     let items = estate::inspect(&plan)?;
+    // The default home map (2026-10-21): what the source half left at its
+    // own path is placed under this host's home, or held typed.
+    let homes = home_map(run, &carry);
+    let remap = |item: &estate::Item| remap_item(item, homes.as_ref(), run.local());
     let inputs = moving::Inputs {
         corpus: &corpus,
         refusals: &refusals,
         state: &private,
         source: &run.source,
         seats: !run.side_roots.is_empty(),
+        remap: Some(&remap),
     };
     let mut decided = ledger.clone();
-    let mut rows = moving::decide(&items, &inputs, &mut decided, now_ns())?;
+    let rows = moving::decide(&items, &inputs, &mut decided, now_ns())?;
     let suffix = run.suffix();
-    print_plan(&rows, &suffix, &notes)?;
     if run.mode == Mode::PlanOnly {
-        return preview(run, (&plan, &corpus, &private));
+        return preview(
+            run,
+            &rows,
+            (&plan, &carry, &refusals, &notes),
+            homes.as_ref(),
+        );
     }
+    print_plan(&rows, &notes)?;
     ledger.items = decided.items;
     reached(&mut ledger, &ledger_path, "plan", "ok".to_owned())?;
 
@@ -943,7 +962,8 @@ fn move_pass(run: &Move) -> Result<()> {
     // engine into the live path. A live path holding anything else is held,
     // typed, for the consolidate path (B2): nothing is written there.
     moving::private_dir(&private)?;
-    let map = estate::streamed::path_map(&items);
+    let placed: Vec<estate::Item> = rows.iter().map(|row| row.item.clone()).collect();
+    let map = estate::streamed::path_map(&placed);
     let upload_pack = upload_pack_program(run);
     let transfer = |from: &Path, to: &Path| -> Result<()> {
         let name = format!(
@@ -983,9 +1003,16 @@ fn move_pass(run: &Move) -> Result<()> {
     // Which items land: a held one is recorded and left untouched.
     let mut landing = Vec::new();
     for row in order {
-        let Some(snapshot) = estate::streamed::recorded(&carry, &row.id)? else {
+        // An item that maps nowhere is held (phase 4), never landed at the
+        // source's raw path.
+        if row.decision.reason == UNMAPPED {
+            continue;
+        }
+        let Some(mut snapshot) = estate::streamed::recorded(&carry, &row.id)? else {
             continue;
         };
+        // Placed where the plan placed it (the default home map included).
+        snapshot.item = row.item.clone();
         let place = row.item.workspace.as_ref().unwrap_or(&row.item.repository);
         // Ours to land again: a landing of this item, never a
         // consolidation of the destination's own repository.
@@ -996,6 +1023,31 @@ fn move_pass(run: &Move) -> Result<()> {
             moving::presence(place),
             moving::Presence::Absent | moving::Presence::Empty
         );
+        // Absent parents under the destination home are made here, 0700 and
+        // owner-checked (the default home map); anything else keeps the
+        // landing's own parent policy.
+        if let (true, Some((_, home))) = (clear, homes.as_ref()) {
+            if place.starts_with(home) {
+                if let Err(refusal) =
+                    bulkload_agent::git_carry::parents::make_home_parents(home, place)
+                {
+                    estate::streamed::record_outcome(
+                        &private,
+                        &row.item,
+                        "refused",
+                        Some(&refusal),
+                        None,
+                    )?;
+                    out(&format!(
+                        "estate-move item={} outcome=held code={} live={place:?}",
+                        row.id,
+                        refusal.code()
+                    ))?;
+                    first_refusal.get_or_insert(refusal);
+                    continue;
+                }
+            }
+        }
         // A related repository of the destination's own: consolidated (B2).
         let related = !clear
             && !ours
@@ -1221,29 +1273,40 @@ fn move_pass(run: &Move) -> Result<()> {
     reached(&mut ledger, &ledger_path, "apply", outcome)?;
     let _ = (&suffix, &corpus);
 
-    // 4. What the capture refused for good, carried as files: at the live
-    // path when it is still absent or empty, else beside it. A carry is
-    // recorded as started before it runs, and stays where it went.
-    for row in &mut rows {
-        if row.decision.action == moving::Action::CarryLive && !row.kept {
-            let place = row.item.workspace.as_ref().unwrap_or(&row.item.repository);
-            if !matches!(
-                moving::presence(place),
-                moving::Presence::Absent | moving::Presence::Empty
-            ) {
-                row.decision.action = moving::Action::CarryBeside;
-                "capture-refused-occupied".clone_into(&mut row.decision.reason);
-            }
-        }
-        if row.decision.action.carries() {
-            row.decision.attempted = true;
-            ledger.items.insert(row.id.clone(), row.decision.clone());
-        }
+    // 4. What the capture refused (SPEC rules 3 and 4): a typed hold with
+    // nothing written, at the live path or beside it. Never carried as
+    // files (2026-10-21: the carry-beside fallback is deleted).
+    for row in &rows {
+        let (refusal, why) = if row.decision.reason == UNMAPPED {
+            (
+                BulkloadRefusal::DestinationUnmapped,
+                "held: no map places it on this host".to_owned(),
+            )
+        } else if row.decision.action.holds() && row.decision.capture != moving::Capture::Held {
+            let code = refusals.get(&row.id).map_or("none", String::as_str);
+            (
+                BulkloadRefusal::CaptureAbsent,
+                format!("held: the source refused the capture ({code})"),
+            )
+        } else {
+            continue;
+        };
+        estate::streamed::record_outcome(
+            &private,
+            &row.item,
+            "refused",
+            Some(&refusal),
+            Some(why),
+        )?;
+        out(&format!(
+            "estate-move item={} outcome=held code={} capture_code={}",
+            row.id,
+            refusal.code(),
+            refusals.get(&row.id).map_or("none", String::as_str)
+        ))?;
     }
     ledger.save(&ledger_path)?;
-    let carried = carry_files(run, &rows, (&plan, &corpus, &private));
-    note(&carried);
-    reached(&mut ledger, &ledger_path, "carry", word(&carried))?;
+    reached(&mut ledger, &ledger_path, "carry", "retired".to_owned())?;
 
     // 5. The hand-off block in each landed workspace (OI-1003-Q183).
     if run.handoff && !landed.is_empty() {
@@ -1413,23 +1476,11 @@ fn move_pass(run: &Move) -> Result<()> {
 }
 
 // The plan's per-item lines, its histogram and the source notes' counts.
-fn print_plan(
-    rows: &[moving::Row],
-    suffix: &str,
-    notes: &std::collections::BTreeMap<String, u64>,
-) -> Result<()> {
+fn print_plan(rows: &[moving::Row], notes: &std::collections::BTreeMap<String, u64>) -> Result<()> {
     for row in rows {
         let place = row.item.workspace.as_ref().unwrap_or(&row.item.repository);
-        let beside = if row.decision.action == moving::Action::CarryBeside {
-            format!(
-                " beside={:?}",
-                bulkload_agent::git_carry::beside::path(place, suffix)
-            )
-        } else {
-            String::new()
-        };
         out(&format!(
-            "estate-move item={} action={} reason={} presence={} capture={:?} kept={} source={:?} live={place:?}{beside}",
+            "estate-move item={} action={} reason={} presence={} capture={:?} kept={} source={:?} live={place:?}",
             row.id,
             row.decision.action.word(),
             row.decision.reason,
@@ -1447,8 +1498,6 @@ fn print_plan(
             moving::Action::Land,
             moving::Action::Adopt,
             moving::Action::RefsOnly,
-            moving::Action::CarryLive,
-            moving::Action::CarryBeside,
             moving::Action::Refuse,
         ]
         .iter()
@@ -1469,101 +1518,555 @@ fn print_plan(
 
 // `--plan-only`: estate-diff's preview of what the apply will do
 // (read-only at the destination), one row per line in MOVE_STATE/diff.jsonl.
-fn preview(run: &Move, (plan, corpus, private): (&Path, &Path, &Path)) -> Result<()> {
+/// The reason a plan row gives an item no map places on this host.
+const UNMAPPED: &str = "unmapped";
+
+/// The default home map (2026-10-21): the source's home (its half's
+/// `move-source.home`) and this host's home, resolved to its real
+/// directory and owner-checked. `None` when either is not known.
+fn home_map(run: &Move, carry: &Path) -> Option<(PathBuf, PathBuf)> {
+    let source = std::fs::read(carry.join(SOURCE_HOME)).ok()?;
+    let source = PathBuf::from(std::ffi::OsString::from(
+        std::str::from_utf8(&source).ok()?.trim().to_owned(),
+    ));
+    if !source.is_absolute() {
+        return None;
+    }
+    let dest = owned_real(&dest_home(run).ok()?).ok()?;
+    Some((source, dest))
+}
+
+/// `item` at its destination paths: a path under the source's home is
+/// placed under this host's (the default home map); an item whose own path
+/// no `--map` moved and no home covers maps nowhere (`None`) when the
+/// source is another host. On this host (`-`) the plan's paths are this
+/// host's already.
+fn remap_item(
+    item: &estate::Item,
+    homes: Option<&(PathBuf, PathBuf)>,
+    local: bool,
+) -> Option<estate::Item> {
+    let swap = |path: &Path| -> PathBuf {
+        match homes {
+            Some((from, to)) => path
+                .strip_prefix(from)
+                .map_or_else(|_| path.to_path_buf(), |rest| to.join(rest)),
+            None => path.to_path_buf(),
+        }
+    };
+    let place = item.workspace.as_ref().unwrap_or(&item.repository);
+    if !local && *place == item.source && !homes.is_some_and(|(from, _)| place.starts_with(from)) {
+        return None;
+    }
+    Some(estate::Item {
+        source: item.source.clone(),
+        repository: swap(&item.repository),
+        workspace: item.workspace.as_deref().map(swap),
+    })
+}
+
+/// One item's B2 decision in the plan (2026-10-21): what the pass would do,
+/// read from its snapshot, the live path and the source's answers.
+#[derive(Default)]
+struct B2 {
+    action: &'static str,
+    code: Option<String>,
+    refs: std::collections::BTreeMap<&'static str, u64>,
+    status: std::collections::BTreeMap<&'static str, u64>,
+    verdicts: std::collections::BTreeMap<&'static str, u64>,
+    tree_known: bool,
+    worktree: &'static str,
+    asides: Vec<PathBuf>,
+    parents: usize,
+}
+
+// The B2 decision before the source is asked: create, consolidate, or held
+// with its code.
+fn first_decision(
+    row: &moving::Row,
+    snapshot: Option<&estate::streamed::ItemSnapshot>,
+    refusals: &std::collections::BTreeMap<String, String>,
+) -> (&'static str, Option<String>) {
+    let held = |code: &str| ("held", Some(code.to_owned()));
+    if row.decision.reason == UNMAPPED {
+        return held(BulkloadRefusal::DestinationUnmapped.code());
+    }
+    if row.decision.action.holds() {
+        return match row.decision.capture {
+            moving::Capture::Held => held(BulkloadRefusal::GitDestinationOccupied.code()),
+            _ => held(
+                refusals
+                    .get(&row.id)
+                    .map_or(BulkloadRefusal::CaptureAbsent.code(), String::as_str),
+            ),
+        };
+    }
+    let Some(snapshot) = snapshot else {
+        return held(BulkloadRefusal::CaptureAbsent.code());
+    };
+    let place = row.item.workspace.as_ref().unwrap_or(&row.item.repository);
+    match moving::presence(place) {
+        moving::Presence::Absent | moving::Presence::Empty => ("create", None),
+        moving::Presence::Git
+            if bulkload_agent::git_carry::union::related(place, &snapshot.history.roots)
+                .unwrap_or(false) =>
+        {
+            ("consolidate", None)
+        }
+        _ => held(BulkloadRefusal::GitDestinationOccupied.code()),
+    }
+}
+
+// An item that owns its repository's store (a main or bare item).
+fn owns_store(item: &estate::Item) -> bool {
+    item.workspace
+        .as_ref()
+        .is_none_or(|workspace| *workspace == item.repository)
+}
+
+/// `--plan-only` (2026-10-21): every item's B2 decision, from the B1
+/// ledgers (each item's snapshot), the live paths and one read-only
+/// negotiation with the source: the action (create, consolidate, switch,
+/// held with its code), the ref union, the files to land with their
+/// three-way merges and conflicts, the worktree to register, the
+/// duplicates rule 3 retires, and the bytes to fetch. One `estate-move
+/// item=` line each, one `estate-move repository=` line per repository,
+/// the per-file rows in `MOVE_STATE/diff.jsonl` and an `estate-move plan`
+/// summary. Nothing is recorded, fetched or landed.
+#[allow(clippy::too_many_lines)]
+fn preview(
+    run: &Move,
+    rows: &[moving::Row],
+    (plan, carry, refusals, notes): (
+        &Path,
+        &Path,
+        &std::collections::BTreeMap<String, String>,
+        &std::collections::BTreeMap<String, u64>,
+    ),
+    homes: Option<&(PathBuf, PathBuf)>,
+) -> Result<()> {
+    use bulkload_agent::git_carry::preview as p;
+    use std::collections::BTreeMap;
     if let Some(home) = &run.sessions {
         homes_plan(run, home, plan)?;
     }
+    let scratch = run.state.join("scratch");
+    let snapshots = rows
+        .iter()
+        .map(|row| estate::streamed::recorded(carry, &row.id))
+        .collect::<Result<Vec<_>>>()?;
+    let mut b2: Vec<B2> = rows
+        .iter()
+        .zip(&snapshots)
+        .map(|(row, snapshot)| {
+            let (action, code) = first_decision(row, snapshot.as_ref(), refusals);
+            B2 {
+                action,
+                code,
+                tree_known: true,
+                worktree: "-",
+                ..B2::default()
+            }
+        })
+        .collect();
+
+    // The refs and the bytes, one question per live repository.
+    let mut repos: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
+    for (at, row) in rows.iter().enumerate() {
+        if snapshots.get(at).is_some_and(Option::is_some)
+            && b2.get(at).is_some_and(|b| b.action != "held")
+        {
+            repos
+                .entry(row.item.repository.clone())
+                .or_default()
+                .push(at);
+        }
+    }
+    let mut asks = Vec::new();
+    let mut live_values: Vec<BTreeMap<String, String>> = Vec::new();
+    for (repository, members) in &repos {
+        let live = if moving::presence(repository) == moving::Presence::Git {
+            p::live_refs(repository).unwrap_or_default()
+        } else {
+            BTreeMap::new()
+        };
+        let mut wants: Vec<String> = members
+            .iter()
+            .filter_map(|at| snapshots.get(*at).and_then(Option::as_ref))
+            .flat_map(|snapshot| snapshot.snapshot.wants.iter().cloned())
+            .collect();
+        wants.sort();
+        wants.dedup();
+        if !live.is_empty() {
+            let held = p::held(repository, &wants).unwrap_or_default();
+            wants.retain(|want| !held.contains(want));
+        }
+        let main = members
+            .iter()
+            .copied()
+            .find(|at| rows.get(*at).is_some_and(|row| owns_store(&row.item)));
+        let mut pairs = Vec::new();
+        if let Some(snapshot) = main.and_then(|at| snapshots.get(at).and_then(Option::as_ref)) {
+            for (name, value) in &snapshot.snapshot.refs {
+                if let Some(ours) = live.get(name).filter(|ours| *ours != value) {
+                    pairs.push((ours.clone(), value.clone()));
+                }
+            }
+        }
+        let source = members
+            .iter()
+            .copied()
+            .find(|at| Some(*at) == main)
+            .or_else(|| members.first().copied())
+            .and_then(|at| rows.get(at))
+            .map_or_else(PathBuf::new, |row| row.item.source.clone());
+        asks.push(p::RefsAsk {
+            repo: source,
+            pairs,
+            wants,
+            haves: live.values().cloned().collect(),
+        });
+        live_values.push(live);
+    }
+    let answers = match super::negotiate(
+        &run.host,
+        run.remote.as_deref(),
+        run.config.as_deref(),
+        &p::Ask::Refs(asks.clone()),
+    )? {
+        p::Answer::Refs(answers) if answers.len() == asks.len() => answers,
+        _ => return Err(BulkloadRefusal::ProtocolStateViolation),
+    };
+    let mut after: BTreeMap<PathBuf, Vec<p::RefPreview>> = BTreeMap::new();
+    let mut fetch_total = 0u64;
+    for (((repository, members), (ask, answer)), live) in repos
+        .iter()
+        .zip(asks.iter().zip(&answers))
+        .zip(&live_values)
+    {
+        fetch_total += answer.fetch_bytes.unwrap_or(0);
+        out(&format!(
+            "estate-move repository={repository:?} items={} wants_missing={} fetch_bytes={}",
+            members.len(),
+            ask.wants.len(),
+            answer
+                .fetch_bytes
+                .map_or_else(|| "unknown".to_owned(), |bytes| bytes.to_string()),
+        ))?;
+        let Some(main) = members
+            .iter()
+            .copied()
+            .find(|at| rows.get(*at).is_some_and(|row| owns_store(&row.item)))
+        else {
+            continue;
+        };
+        let (Some(row), Some(Some(snapshot)), Some(decision)) =
+            (rows.get(main), snapshots.get(main), b2.get_mut(main))
+        else {
+            continue;
+        };
+        let refs: Vec<p::RefPreview> = if decision.action == "consolidate" {
+            let answered: BTreeMap<(&str, &str), Option<bool>> = ask
+                .pairs
+                .iter()
+                .map(|(ours, theirs)| (ours.as_str(), theirs.as_str()))
+                .zip(answer.ancestry.iter().copied())
+                .collect();
+            let forwards =
+                |ours: &str, theirs: &str| answered.get(&(ours, theirs)).copied().flatten();
+            p::refs_preview(repository, &snapshot.snapshot.refs, &forwards)?
+        } else {
+            snapshot
+                .snapshot
+                .refs
+                .iter()
+                .filter(|(name, _)| name != "refs/stash" && !name.starts_with("refs/remotes/"))
+                .map(|(name, value)| p::RefPreview {
+                    name: name.clone(),
+                    word: "created",
+                    after: value.clone(),
+                })
+                .collect()
+        };
+        for preview in &refs {
+            *decision.refs.entry(preview.word).or_default() += 1;
+            if preview.word == "tracked" {
+                out(&format!(
+                    "estate-move item={} ref={} union=tracked at={} live={}",
+                    row.id,
+                    preview.name,
+                    bulkload_agent::git_carry::union::tracking_name(&preview.name, &run.source),
+                    live.get(&preview.name).map_or("-", String::as_str),
+                ))?;
+            }
+        }
+        after.insert(repository.clone(), refs);
+    }
+
+    // The files, one question per worktree.
+    let mut file_asks = Vec::new();
+    let mut asked = Vec::new();
+    for (at, (row, snapshot)) in rows.iter().zip(&snapshots).enumerate() {
+        let (Some(snapshot), Some(_), Some(decision)) = (
+            snapshot.as_ref(),
+            row.item.workspace.as_ref(),
+            b2.get_mut(at),
+        ) else {
+            continue;
+        };
+        let place = row.item.workspace.as_ref().unwrap_or(&row.item.repository);
+        match decision.action {
+            "create" => {
+                file_asks.push(p::FilesAsk {
+                    worktree: row.item.source.clone(),
+                    head: None,
+                    dirty: Vec::new(),
+                    bytes: false,
+                });
+                asked.push(at);
+            }
+            "consolidate" => {
+                let (branch, live_head) = bulkload_agent::git_carry::union::head(place)?;
+                let refs = after.get(&row.item.repository);
+                let value_after = |name: &str| {
+                    refs.and_then(|refs| refs.iter().find(|preview| preview.name == name))
+                        .map(|preview| preview.after.clone())
+                        .or_else(|| {
+                            p::live_refs(&row.item.repository)
+                                .ok()
+                                .and_then(|live| live.get(name).cloned())
+                        })
+                };
+                let mut head = live_head;
+                if let Some(theirs) = &snapshot.head_branch {
+                    if branch.as_deref() != Some(theirs.as_str()) {
+                        if bulkload_agent::git_carry::union::is_clean(place)?
+                            && value_after(theirs).as_deref() == Some(snapshot.head.as_str())
+                        {
+                            decision.action = "switch";
+                            head.clone_from(&snapshot.head);
+                        } else {
+                            decision.action = "held";
+                            decision.code =
+                                Some(BulkloadRefusal::GitDestinationDiverged.code().to_owned());
+                            out(&format!(
+                                "estate-move item={} branches=held destination={} source={theirs}",
+                                row.id,
+                                branch.as_deref().unwrap_or("HEAD (detached)"),
+                            ))?;
+                            continue;
+                        }
+                    } else if refs.is_some_and(|refs| {
+                        refs.iter()
+                            .any(|preview| preview.name == *theirs && preview.word == "switched")
+                    }) {
+                        head.clone_from(&snapshot.head);
+                    }
+                }
+                let dirty = p::status(place, false)?
+                    .into_iter()
+                    .map(|(_, path)| path)
+                    .collect();
+                file_asks.push(p::FilesAsk {
+                    worktree: row.item.source.clone(),
+                    head: Some(head),
+                    dirty,
+                    bytes: true,
+                });
+                asked.push(at);
+            }
+            _ => {}
+        }
+    }
+    let file_answers = match super::negotiate(
+        &run.host,
+        run.remote.as_deref(),
+        run.config.as_deref(),
+        &p::Ask::Files(file_asks.clone()),
+    )? {
+        p::Answer::Files(answers) if answers.len() == file_asks.len() => answers,
+        _ => return Err(BulkloadRefusal::ProtocolStateViolation),
+    };
     let rows_path = run.state.join("diff.jsonl");
-    let mut file = std::fs::OpenOptions::new()
+    let mut diff = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .open(&rows_path)
         .refuse_at("estate_move::diff")?;
-    let summary = estate::diff(
-        plan,
-        corpus,
-        &run.source,
-        &[private.to_path_buf()],
-        &estate::DiffOptions {
-            since: None,
-            scan: Vec::new(),
-            activate_origin: run.origins.clone(),
-            beside: Some(run.suffix()),
-            side_roots: run.side_roots.clone(),
-        },
-        &mut |line| writeln!(file, "{line}").refuse_at("estate_move::diff"),
-    )?;
-    let show = |map: &std::collections::BTreeMap<String, u64>| {
-        map.iter()
-            .map(|(key, count)| format!("{key}:{count}"))
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-    out(&format!(
-        "estate-move diff classes={} adopt={} rows={rows_path:?} (plan only: nothing recorded or landed)",
-        show(&summary.classes),
-        show(&summary.adopt),
-    ))
-}
-
-// Phase 4: `estate-carry-files` for the carry rows, live then beside.
-fn carry_files(
-    run: &Move,
-    rows: &[moving::Row],
-    (plan, corpus, private): (&Path, &Path, &Path),
-) -> Result<()> {
-    let carry_state = run.state.join("carry-files");
-    let mut carried = Ok(());
-    for beside in [false, true] {
-        let wanted = if beside {
-            moving::Action::CarryBeside
-        } else {
-            moving::Action::CarryLive
+    let json = |bytes: &[u8]| bulkload_agent::closure::json_string(&String::from_utf8_lossy(bytes));
+    for (at, answer) in asked.iter().zip(&file_answers) {
+        let (Some(row), Some(decision)) = (rows.get(*at), b2.get_mut(*at)) else {
+            continue;
         };
-        let ids: Vec<&String> = rows
-            .iter()
-            .filter(|row| row.decision.action == wanted)
-            .map(|row| &row.id)
-            .collect();
-        if ids.is_empty() {
+        let place = row.item.workspace.as_ref().unwrap_or(&row.item.repository);
+        if answer.unreadable {
+            decision.action = "held";
+            decision.code = Some(
+                BulkloadRefusal::SourceRootUnreadable(None)
+                    .code()
+                    .to_owned(),
+            );
             continue;
         }
-        moving::private_dir(&carry_state)?;
-        let mut args: Vec<OsString> = Vec::new();
-        if beside {
-            args.extend(["--beside".into(), run.suffix().into()]);
-        }
-        for id in ids {
-            args.extend(["--item".into(), id.into()]);
-        }
-        if !run.local() {
-            args.extend([
-                "--host".into(),
-                run.host.clone(),
-                "--source-state-root".into(),
-                run.source_state.join("serve/carry").into_os_string(),
-            ]);
-            if let Some(remote) = &run.remote {
-                args.extend(["--remote-executable".into(), remote.clone()]);
-            }
-            if let Some(config) = &run.config {
-                args.extend(["--ssh-config".into(), config.clone()]);
+        decision.tree_known = answer.diff_known;
+        let classes: BTreeMap<&[u8], p::Class> = answer
+            .status
+            .iter()
+            .map(|(class, path)| (path.as_slice(), *class))
+            .collect();
+        for (class, path) in &answer.status {
+            *decision.status.entry(class.word()).or_default() += 1;
+            if decision.action == "create" {
+                *decision.verdicts.entry("land").or_default() += 1;
+                writeln!(
+                    diff,
+                    "{{\"item\":{},\"path\":{},\"class\":\"{}\",\"verdict\":\"land\"}}",
+                    json(row.id.as_bytes()),
+                    json(path),
+                    class.word()
+                )
+                .refuse_at("estate_move::diff")?;
             }
         }
-        args.extend([
-            plan.as_os_str().to_owned(),
-            corpus.as_os_str().to_owned(),
-            private.as_os_str().to_owned(),
-            run.source.clone().into(),
-            carry_state.clone().into_os_string(),
-        ]);
-        let result = super::carry_files_command(&args);
-        if carried.is_ok() {
-            carried = result;
+        for file in &answer.files {
+            let verdict = p::verdict(place, file, &scratch)?;
+            *decision.verdicts.entry(verdict.word()).or_default() += 1;
+            if verdict != p::Verdict::Same {
+                writeln!(
+                    diff,
+                    "{{\"item\":{},\"path\":{},\"class\":\"{}\",\"verdict\":\"{}\"}}",
+                    json(row.id.as_bytes()),
+                    json(&file.path),
+                    classes
+                        .get(file.path.as_slice())
+                        .map_or("destination-or-tree", |class| class.word()),
+                    verdict.word()
+                )
+                .refuse_at("estate_move::diff")?;
+            }
         }
     }
-    carried
+    match std::fs::remove_dir_all(&scratch) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).refuse_at("estate_move::scratch"),
+    }
+
+    // The worktree to register, the duplicates, the parents; the lines.
+    let mut totals: BTreeMap<String, u64> = BTreeMap::new();
+    let mut held_codes: BTreeMap<String, u64> = BTreeMap::new();
+    for (row, decision) in rows.iter().zip(b2.iter_mut()) {
+        let place = row.item.workspace.as_ref().unwrap_or(&row.item.repository);
+        if !owns_store(&row.item) && decision.action != "held" {
+            let registered = moving::presence(&row.item.repository) == moving::Presence::Git
+                && p::worktrees(&row.item.repository)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|(path, _)| path == place);
+            decision.worktree = if registered { "registered" } else { "new" };
+        } else if owns_store(&row.item) {
+            decision.worktree = "main";
+        }
+        decision.asides = p::asides(place, &run.label)?;
+        if moving::presence(place) == moving::Presence::Absent {
+            decision.parents = bulkload_agent::git_carry::parents::absent_parents(place)
+                .map_or(0, |absent| absent.len());
+        }
+        for aside in &decision.asides {
+            out(&format!(
+                "estate-move item={} aside={aside:?} action=retire-beside",
+                row.id
+            ))?;
+        }
+        let count =
+            |map: &BTreeMap<&'static str, u64>, key: &str| map.get(key).copied().unwrap_or(0);
+        out(&format!(
+            "estate-move item={} action={}{} reason={} presence={} refs_created={} refs_forwarded={} refs_switched={} refs_tracked={} refs_kept={} refs_same={} changed={} untracked={} ignored={} land={} merges={} conflicts={} same={} unknown={} tree={} worktree={} asides={} parents={} under_home={} source={:?} live={place:?}",
+            row.id,
+            decision.action,
+            decision
+                .code
+                .as_ref()
+                .map_or_else(String::new, |code| format!(" code={code}")),
+            row.decision.reason,
+            row.decision.presence.word(),
+            count(&decision.refs, "created"),
+            count(&decision.refs, "forwarded"),
+            count(&decision.refs, "switched"),
+            count(&decision.refs, "tracked"),
+            count(&decision.refs, "kept"),
+            count(&decision.refs, "same"),
+            count(&decision.status, "changed"),
+            count(&decision.status, "untracked"),
+            count(&decision.status, "ignored"),
+            count(&decision.verdicts, "land"),
+            count(&decision.verdicts, "merged"),
+            count(&decision.verdicts, "conflict"),
+            count(&decision.verdicts, "same"),
+            count(&decision.verdicts, "unknown"),
+            if decision.tree_known { "known" } else { "unknown" },
+            decision.worktree,
+            decision.asides.len(),
+            decision.parents,
+            homes.is_some_and(|(_, home)| place.starts_with(home)),
+            row.item.source,
+        ))?;
+        *totals.entry(decision.action.to_owned()).or_default() += 1;
+        if let Some(code) = &decision.code {
+            *held_codes.entry(code.clone()).or_default() += 1;
+        }
+        for (key, map) in [
+            ("refs_", &decision.refs),
+            ("", &decision.status),
+            ("", &decision.verdicts),
+        ] {
+            for (word, n) in map {
+                *totals.entry(format!("{key}{word}")).or_default() += n;
+            }
+        }
+        if decision.worktree == "new" {
+            *totals.entry("register".to_owned()).or_default() += 1;
+        }
+        *totals.entry("asides".to_owned()).or_default() += decision.asides.len() as u64;
+        *totals.entry("parents".to_owned()).or_default() += decision.parents as u64;
+    }
+    let show = |map: &BTreeMap<String, u64>| {
+        if map.is_empty() {
+            "none".to_owned()
+        } else {
+            map.iter()
+                .map(|(key, count)| format!("{key}:{count}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+    };
+    let total = |key: &str| totals.get(key).copied().unwrap_or(0);
+    out(&format!(
+        "estate-move plan items={} create={} consolidate={} switch={} held={} held_codes={} refs_created={} refs_forwarded={} refs_switched={} refs_tracked={} refs_kept={} changed={} untracked={} ignored={} land={} merges={} conflicts={} unknown={} register={} asides={} parents={} fetch_bytes={fetch_total} notes={} rows={rows_path:?} (plan only: nothing recorded, fetched or landed)",
+        rows.len(),
+        total("create"),
+        total("consolidate"),
+        total("switch"),
+        total("held"),
+        show(&held_codes),
+        total("refs_created"),
+        total("refs_forwarded"),
+        total("refs_switched"),
+        total("refs_tracked"),
+        total("refs_kept"),
+        total("changed"),
+        total("untracked"),
+        total("ignored"),
+        total("land"),
+        total("merged"),
+        total("conflict"),
+        total("unknown"),
+        total("register"),
+        total("asides"),
+        total("parents"),
+        show(notes),
+    ))
 }
 
 // The destination home the sessions land in (`--dest-home`, default
@@ -2259,4 +2762,45 @@ fn reseat(
         run.state.join("reseat").into_os_string(),
     ]);
     super::reseat_run(&args)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn item(source: &str, repository: &str, workspace: &str) -> estate::Item {
+        estate::Item {
+            source: PathBuf::from(source),
+            repository: PathBuf::from(repository),
+            workspace: Some(PathBuf::from(workspace)),
+        }
+    }
+
+    // The default home map (2026-10-21): under the source's home it lands
+    // under this host's; mapped paths stay; from another host, a path no
+    // map and no home covers is held (`None`), never landed raw.
+    #[test]
+    fn the_default_home_map_places_or_holds() {
+        let homes = (PathBuf::from("/Users/jess"), PathBuf::from("/home/jess"));
+        let cache = item(
+            "/Users/jess/.cache/lanes/wt",
+            "/srv/git/repo",
+            "/Users/jess/.cache/lanes/wt",
+        );
+        let placed = remap_item(&cache, Some(&homes), false).unwrap();
+        assert_eq!(
+            placed.workspace,
+            Some(PathBuf::from("/home/jess/.cache/lanes/wt"))
+        );
+        assert_eq!(placed.repository, PathBuf::from("/srv/git/repo"));
+        assert_eq!(placed.source, cache.source);
+        let mapped = item("/Users/jess/git/a", "/srv/git/a", "/srv/git/a");
+        assert_eq!(remap_item(&mapped, Some(&homes), false).unwrap(), mapped);
+        let nowhere = item("/opt/work/x", "/opt/work/x", "/opt/work/x");
+        assert_eq!(remap_item(&nowhere, Some(&homes), false), None);
+        assert_eq!(remap_item(&cache, None, false), None);
+        // This host's plan is this host's paths already.
+        assert_eq!(remap_item(&nowhere, Some(&homes), true).unwrap(), nowhere);
+    }
 }

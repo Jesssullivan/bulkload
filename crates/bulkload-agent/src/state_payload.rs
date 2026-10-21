@@ -144,6 +144,8 @@ const CARRY_LEDGERS: &[&str] = &[
     "move-source.done",
     "move-source.refusals",
     "move-source.notes",
+    // The source's home, for the destination's default home map.
+    "move-source.home",
 ];
 
 /// The suffix of an item's streamed capture in `carry/` (SPEC rule 2

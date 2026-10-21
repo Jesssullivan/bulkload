@@ -402,6 +402,11 @@ pub enum BulkloadRefusal {
     /// exists, and never a parent: the operator named DEST, not the path
     /// above it. Nothing is written.
     DestinationParentMissing,
+    /// An estate item's source path maps nowhere on the destination: no
+    /// `--map` prefix covers it and it is outside the source home the
+    /// default home map translates (estate-move, 2026-10-21). It is held,
+    /// never landed at the source's raw path.
+    DestinationUnmapped,
     /// The destination path holds the wrong kind of node for the verb
     /// (#232): a directory where `--file` would land one regular file, a
     /// regular or special file or a symlink where a tree would land, or a
@@ -705,6 +710,7 @@ impl BulkloadRefusal {
             Self::DestinationOccupied => "DESTINATION_OCCUPIED",
             Self::DestinationMapConflict => "DESTINATION_MAP_CONFLICT",
             Self::DestinationParentMissing => "DESTINATION_PARENT_MISSING",
+            Self::DestinationUnmapped => "DESTINATION_UNMAPPED",
             Self::DestinationKindMismatch => "DESTINATION_KIND_MISMATCH",
             Self::DestinationExchangeUnsupported => "DESTINATION_EXCHANGE_UNSUPPORTED",
             Self::SalvageBoundExceeded => "SALVAGE_BOUND_EXCEEDED",
@@ -831,6 +837,7 @@ impl BulkloadRefusal {
         "DESTINATION_OCCUPIED",
         "DESTINATION_MAP_CONFLICT",
         "DESTINATION_PARENT_MISSING",
+        "DESTINATION_UNMAPPED",
         "DESTINATION_KIND_MISMATCH",
         "DESTINATION_EXCHANGE_UNSUPPORTED",
         "SALVAGE_BOUND_EXCEEDED",
@@ -1120,6 +1127,7 @@ mod tests {
             BulkloadRefusal::DestinationOccupied,
             BulkloadRefusal::DestinationMapConflict,
             BulkloadRefusal::DestinationParentMissing,
+            BulkloadRefusal::DestinationUnmapped,
             BulkloadRefusal::DestinationKindMismatch,
             BulkloadRefusal::DestinationExchangeUnsupported,
             BulkloadRefusal::SalvageBoundExceeded,

@@ -157,9 +157,10 @@ const BYPASSES: &[Bypass] = &[
              }ssh.arg(\"--\").arg(host).arg(remote);\
              ifbulkload_agent::durable::durability()==bulkload_agent::durable::Durability::Strict{ssh.arg(\"--durability=strict\");\
              }ifbulkload_agent::durable::ledger_sync()==bulkload_agent::durable::LedgerSync::Full{ssh.arg(\"--source-ledger-sync=full\");\
-             }letrelay=matchmode{Remote::Serve(_)=>false,Remote::UploadPack(repo)=>{ifrepo.contains('\\'')||!repo.starts_with('/'){returnErr(BulkloadRefusal::PathNotPortable);\
+             }letrelay=matchmode{Remote::Serve(_)=>false,Remote::Negotiate=>{ssh.arg(\"negotiate\");false}\
+             Remote::UploadPack(repo)=>{ifrepo.contains('\\'')||!repo.starts_with('/'){returnErr(BulkloadRefusal::PathNotPortable);\
              }ssh.arg(\"upload-pack\").arg(format!(\"'{repo}'\"));true}};\
-             if!relay{forflaginbulkload_agent::transfer::serve_flags(){ssh.arg(flag);\
+             if!relay&&!matches!(mode,Remote::Negotiate){forflaginbulkload_agent::transfer::serve_flags(){ssh.arg(flag);\
              }ssh.arg(\"serve\");\
              }ifkind==bulkload_agent::transfer::RootKind::File{ssh.arg(\"--file\");\
              }let(wire_in,wire_out)=ifrelay{(Stdio::inherit(),Stdio::inherit())}else{(Stdio::piped(),Stdio::piped())};\
@@ -172,7 +173,10 @@ const BYPASSES: &[Bypass] = &[
               upload-pack REPO` a streamed fetch relays to, its stdio the \
               local `git fetch`'s, REPO an absolute path, single-quoted and \
               refused if it holds a quote; upload-pack is a read and also \
-              enters background priority. The \
+              enters background priority; or (the B2 plan, 2026-10-21) the \
+              remote `bulkload-agent negotiate`, every Git child of it a \
+              read, its framed question and answer on stdin and stdout, no \
+              path on its command line. The \
               remote word is `bulkload-agent` or a validated absolute path, \
               and the ssh child touches no local source. The three mode flags \
               it may pass (`--durability=strict`, WP0(g)'s \

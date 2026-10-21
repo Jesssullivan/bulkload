@@ -231,12 +231,53 @@ fn writable(directory: &Path) -> Result<bool> {
 // a level another writer made included. Returns the levels this call made,
 // and the refusal that stopped it, if any.
 fn create(absent: &[PathBuf]) -> (Vec<PathBuf>, Result<()>) {
+    create_mode(absent, MODE)
+}
+
+fn create_mode(absent: &[PathBuf], mode: u32) -> (Vec<PathBuf>, Result<()>) {
     let mut created = Vec::new();
-    let outcome = create_into(absent, &mut created);
+    let outcome = create_into(absent, mode, &mut created);
     (created, outcome)
 }
 
-fn create_into(absent: &[PathBuf], created: &mut Vec<PathBuf>) -> Result<()> {
+/// Make the absent parents of `destination` inside `home`.
+///
+/// `home` is the destination home's real directory (estate-move's default
+/// home map, 2026-10-21): each level 0700, race-safe as [`FirstTarget::place`]'s, and only where
+/// the nearest existing ancestor is a directory inside `home` this user
+/// owns. Returns how many levels it made.
+///
+/// # Errors
+/// `GIT_DESTINATION_PARENT_MISSING` when `destination` is not inside
+/// `home` or the policy refuses; `PATH_ESCAPES_ROOT` when that ancestor is
+/// not this user's; IO.
+pub fn make_home_parents(home: &Path, destination: &Path) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    if !destination.starts_with(home) || destination == home {
+        return Err(BulkloadRefusal::GitDestinationParentMissing);
+    }
+    let absent = absent_parents(destination)?;
+    let Some(first) = absent.first() else {
+        return Ok(0);
+    };
+    let boundary = first
+        .parent()
+        .ok_or(BulkloadRefusal::GitDestinationParentMissing)?;
+    if !boundary.starts_with(home) {
+        return Err(BulkloadRefusal::GitDestinationParentMissing);
+    }
+    let meta = fs::symlink_metadata(boundary).refuse_at("git_carry::parents::home")?;
+    // SAFETY: geteuid has no preconditions or side effects.
+    let me = unsafe { libc::geteuid() };
+    if !meta.is_dir() || meta.uid() != me {
+        return Err(BulkloadRefusal::PathEscapesRoot);
+    }
+    let (created, outcome) = create_mode(&absent, 0o700);
+    outcome?;
+    Ok(u64::try_from(created.len()).unwrap_or(u64::MAX))
+}
+
+fn create_into(absent: &[PathBuf], level_mode: u32, created: &mut Vec<PathBuf>) -> Result<()> {
     const SITE: &str = "git_carry::parents::create";
     let Some(first) = absent.first() else {
         return Ok(());
@@ -258,7 +299,7 @@ fn create_into(absent: &[PathBuf], created: &mut Vec<PathBuf>) -> Result<()> {
             .file_name()
             .ok_or(BulkloadRefusal::GitDestinationParentMissing)?;
         let name = crate::io::c_name(name.as_bytes()).refuse_at(SITE)?;
-        let made = make_level(&parent, &name).map_err(typed)?;
+        let made = make_level(&parent, &name, level_mode).map_err(typed)?;
         let child =
             fs::File::from(crate::io::sys::open_dir_at(parent.as_fd(), &name).map_err(typed)?);
         parent.sync_dir_counted().refuse_at(SITE)?;
@@ -272,7 +313,7 @@ fn create_into(absent: &[PathBuf], created: &mut Vec<PathBuf>) -> Result<()> {
 
 // One level `name` in `parent`: `true` when this call made it, `false` when
 // it was there already (another writer's).
-fn make_level(parent: &fs::File, name: &std::ffi::CStr) -> std::io::Result<bool> {
+fn make_level(parent: &fs::File, name: &std::ffi::CStr, level_mode: u32) -> std::io::Result<bool> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let temporary = crate::io::c_name(
         format!(
@@ -284,7 +325,7 @@ fn make_level(parent: &fs::File, name: &std::ffi::CStr) -> std::io::Result<bool>
     )?;
     crate::io::sys::mkdirat(parent.as_fd(), &temporary, 0o700)?;
     let settled = crate::io::sys::open_dir_at(parent.as_fd(), &temporary).and_then(|made| {
-        crate::io::sys::fchmod(made.as_fd(), MODE)?;
+        crate::io::sys::fchmod(made.as_fd(), level_mode)?;
         fs::File::from(made).sync_dir_counted()
     });
     let renamed = settled.and_then(|()| crate::io::rename_exclusive(parent, &temporary, name));
@@ -295,10 +336,10 @@ fn make_level(parent: &fs::File, name: &std::ffi::CStr) -> std::io::Result<bool>
             if error.raw_os_error() == Some(libc::EEXIST) {
                 Ok(false)
             } else if crate::io::rename_unsupported(&error) {
-                match crate::io::sys::mkdirat(parent.as_fd(), name, MODE) {
+                match crate::io::sys::mkdirat(parent.as_fd(), name, level_mode) {
                     Ok(()) => {
                         let made = crate::io::sys::open_dir_at(parent.as_fd(), name)?;
-                        crate::io::sys::fchmod(made.as_fd(), MODE)?;
+                        crate::io::sys::fchmod(made.as_fd(), level_mode)?;
                         fs::File::from(made).sync_dir_counted()?;
                         Ok(true)
                     }
@@ -513,5 +554,27 @@ mod tests {
             vec![base.join("a/b").as_os_str().as_bytes().to_vec()]
         );
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    // estate-move's default home map (2026-10-21): absent parents under the
+    // destination home are made 0700, never outside it.
+    #[test]
+    fn home_parents_are_made_private_and_only_inside_the_home() {
+        let home = scratch("home-parents");
+        let destination = home.join(".cache/lanes/wt");
+        assert_eq!(make_home_parents(&home, &destination).unwrap(), 2);
+        for level in [home.join(".cache"), home.join(".cache/lanes")] {
+            let mode = fs::symlink_metadata(&level).unwrap().permissions().mode();
+            assert_eq!(mode & 0o7777, 0o700, "{level:?}");
+        }
+        assert!(!destination.exists(), "the landing makes the item itself");
+        assert_eq!(make_home_parents(&home, &destination).unwrap(), 0);
+        let outside = scratch("home-parents-outside").join("x/y");
+        assert_eq!(
+            make_home_parents(&home, &outside),
+            Err(BulkloadRefusal::GitDestinationParentMissing)
+        );
+        assert!(!outside.parent().unwrap().exists());
+        fs::remove_dir_all(&home).unwrap();
     }
 }

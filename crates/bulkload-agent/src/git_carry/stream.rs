@@ -864,4 +864,50 @@ mod tests {
             ]
         );
     }
+
+    // neo's GloriousFlywheel, 2026-10-21: a commit-graph still naming
+    // commits a gc pruned from the store fails `fsck`; the capture reads on
+    // with the graph off and never rewrites it.
+    #[test]
+    fn a_stale_commit_graph_does_not_refuse_the_snapshot() {
+        let root = scratch("stale-graph");
+        let repo = root.0.join("src");
+        fs::create_dir_all(&repo).unwrap();
+        g(&repo, &["init", "-q", "--template=", "-b", "main"]);
+        fs::write(repo.join("a"), "a\n").unwrap();
+        g(&repo, &["add", "a"]);
+        g(&repo, &["commit", "-q", "-m", "c1"]);
+        g(&repo, &["commit", "-q", "--allow-empty", "-m", "c2"]);
+        g(&repo, &["commit-graph", "write", "--reachable"]);
+        g(&repo, &["reset", "-q", "--hard", "HEAD~1"]);
+        g(&repo, &["reflog", "expire", "--expire=now", "--all"]);
+        g(&repo, &["prune", "--expire=now"]);
+        // The reset's ORIG_HEAD names the pruned commit: counted missing,
+        // as any operation file is; this test is the graph's.
+        fs::remove_file(repo.join(".git/ORIG_HEAD")).unwrap();
+        let graph = repo.join(".git/objects/info/commit-graph");
+        let before = fs::read(&graph).unwrap();
+        // The fixture holds: plain Git's fsck refuses this store.
+        let plain = Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "fsck",
+                "--unreachable",
+                "--connectivity-only",
+                "--no-progress",
+            ])
+            .output()
+            .unwrap();
+        assert!(!plain.status.success(), "the stale graph fails plain fsck");
+        let snapshot = snapshot(&repo).unwrap();
+        assert_eq!(snapshot.missing, 0);
+        assert_eq!(
+            fs::read(&graph).unwrap(),
+            before,
+            "the graph is never written"
+        );
+    }
 }

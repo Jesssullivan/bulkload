@@ -128,6 +128,10 @@ SUBCOMMANDS:
                 stdout, read-only, with uploadpack.allowAnySHA1InWant on its
                 command line only, so the destination fetches the ids the
                 capture pinned
+    negotiate   The source end of estate-move --plan-only's B2 preview: one
+                framed question on stdin (refs ancestry and fetch bytes, or a
+                worktree's status, files and merge base), its answer framed
+                on stdout; every Git child a read
     git-export REPO NEW_CAPTURE_DIR [--include-rebuildable]
                 Archive refs/stashes and staged/worktree trees in a bundle
     git-carry-estimate [--state-dir DIR] SOURCE_REPO DEST [SOURCE_REPO DEST ...]
@@ -326,24 +330,29 @@ SUBCOMMANDS:
                 pass that has not finished (rerun once it has). 2 plan: per
                 item, the live path's presence (absent, empty, git, not-git,
                 symlinked: the path or an ancestor, so map to real paths;
-                unreadable) and its capture (held; refused, carried as files;
-                transient or pending, left for the next source pass) give one
-                action: land, adopt (the apply proves it or lands it beside),
-                refs-only, carry-live, carry-beside or refuse (the apply's
-                typed refusal, pending review). One estate-move item= line
-                each, a histogram line and the source notes' counts. A carry
-                once started stays where it went while the item is not
-                captured. --plan-only stops here, recording nothing, after an
-                estate-diff preview (MOVE_STATE/diff.jsonl). 3 apply:
-                estate-apply --adopt --beside .LABEL --refs-in (with
-                --exclude-union, --activate-origin, --side-root as given)
-                into MOVE_STATE/private, --jobs N (default 2); when every
-                item answered, item
-                refusals are each item's and the pass goes on, else it stops.
-                A beside landing converges to a newer capture when its proof
-                holds (gap C12). 4 carry: estate-carry-files for
-                the carry items, at the live path while it is still absent or
-                empty, else with --beside .LABEL. 5 hand-off: estate-handoff
+                unreadable) and its capture (held; refused; transient or
+                pending) give one action: create, consolidate,
+                refs-consolidate or held (a typed hold, nothing written: a
+                refused capture included, SPEC rule 3; nothing is ever
+                carried beside). A path the source half left unmapped is
+                placed by the default home map (the source's home, recorded
+                in carry/move-source.home, to --dest-home, default $HOME,
+                resolved and owner-checked; absent parents under it are made
+                0700 at landing); one outside both is held
+                DESTINATION_UNMAPPED. --plan-only stops here, recording
+                nothing: per item the B2 decision (create, consolidate,
+                switch, held with its code), the ref union (refs_created,
+                forwarded, switched, tracked at refs/remotes/SOURCE, kept),
+                the source's changed, untracked and ignored files, the files
+                to land with their three-way merges and conflicts, the
+                worktree to register, the .neo-*, .sting-* and .LABEL
+                duplicates rule 3 retires (aside= lines) and the absent
+                parents; per repository the bytes to fetch (a read-only
+                negotiate with the source, have/want); the per-file rows in
+                MOVE_STATE/diff.jsonl, read from the B1 ledgers. 3 apply:
+                the streamed landing and B2 consolidation, --jobs N
+                (default 2). 4 holds: each held item recorded typed. 5
+                hand-off: estate-handoff
                 for the items whose workspace this pass landed or adopted
                 (unless --no-hand-off). 6 with --sessions (plan of record
                 2026-10-19, C9/C10/C11; no intermediary stage):
@@ -1050,6 +1059,7 @@ fn main() -> ExitCode {
         Some("sqlite-union") => sqlite_union_command(&args.collect::<Vec<_>>()),
         Some("upload-pack") => upload_pack_command(&args.collect::<Vec<_>>()),
         Some("relay-upload-pack") => relay_upload_pack_command(&args.collect::<Vec<_>>()),
+        Some("negotiate") => negotiate_command(&args.collect::<Vec<_>>()),
         Some("help" | "--help" | "-h") => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -1265,6 +1275,51 @@ fn upload_pack_command(args: &[std::ffi::OsString]) -> Result<()> {
         return Err(BulkloadRefusal::PathNotAbsolute);
     }
     bulkload_agent::git_carry::stream::serve_upload_pack(repo)
+}
+
+// `negotiate`: the source end of estate-move's plan preview (B2,
+// 2026-10-21). One framed question on stdin, its answer framed on stdout;
+// every Git child a read.
+fn negotiate_command(args: &[std::ffi::OsString]) -> Result<()> {
+    if !args.is_empty() {
+        return Err(BulkloadRefusal::FieldDomainViolation);
+    }
+    let ask: bulkload_agent::git_carry::preview::Ask =
+        bulkload_agent::git_carry::preview::unframe(&mut std::io::stdin().lock())?;
+    let answer = bulkload_agent::git_carry::preview::answer(&ask);
+    let mut output = std::io::stdout().lock();
+    output
+        .write_all(&bulkload_agent::git_carry::preview::frame(&answer)?)
+        .refuse_at("main::negotiate_command")?;
+    output.flush().refuse_at("main::negotiate_command")
+}
+
+/// The plan's negotiation with the source (`negotiate`): over `pull`'s ssh
+/// builder to HOST, or answered here for `-`.
+pub(crate) fn negotiate(
+    host: &std::ffi::OsStr,
+    remote: Option<&std::ffi::OsStr>,
+    config: Option<&std::ffi::OsStr>,
+    ask: &bulkload_agent::git_carry::preview::Ask,
+) -> Result<bulkload_agent::git_carry::preview::Answer> {
+    if host == "-" {
+        return Ok(bulkload_agent::git_carry::preview::answer(ask));
+    }
+    let mut pull: Vec<std::ffi::OsString> = vec![host.to_owned()];
+    pull.extend(std::iter::repeat_n(std::ffi::OsString::new(), 4));
+    if remote.is_some() || config.is_some() {
+        pull.push(remote.map_or_else(|| "bulkload-agent".into(), std::ffi::OsStr::to_owned));
+    }
+    if let Some(config) = config {
+        pull.push(config.to_owned());
+    }
+    let framed = bulkload_agent::git_carry::preview::frame(ask)?;
+    pull_command(Remote::Negotiate, &pull, |input, output| {
+        output.write_all(&framed).refuse_at("main::negotiate")?;
+        output.flush().refuse_at("main::negotiate")?;
+        bulkload_agent::git_carry::preview::unframe(input)
+    })?
+    .ok_or(BulkloadRefusal::ProtocolStateViolation)
 }
 
 fn serve_command(args: &[std::ffi::OsString]) -> Result<()> {
@@ -3247,6 +3302,9 @@ enum Remote<'a> {
     /// `upload-pack REPO`, the source end of a streamed fetch (SPEC rule 2
     /// reset, B1), its stdio this process's (a `git fetch`'s pipes).
     UploadPack(&'a str),
+    /// `negotiate`, the source end of the plan's B2 preview: one framed
+    /// question on stdin, one framed answer on stdout, reads only.
+    Negotiate,
 }
 
 // The one ssh session builder (the S2 registry pins this child): a pull's
@@ -3262,7 +3320,7 @@ fn pull_command<T>(
 ) -> Result<Option<T>> {
     let kind = match mode {
         Remote::Serve(kind) => kind,
-        Remote::UploadPack(_) => bulkload_agent::transfer::RootKind::Tree,
+        Remote::UploadPack(_) | Remote::Negotiate => bulkload_agent::transfer::RootKind::Tree,
     };
     let host = args.first().ok_or(BulkloadRefusal::RequiredFieldMissing)?;
     let remote = match args.get(5) {
@@ -3298,6 +3356,10 @@ fn pull_command<T>(
     }
     let relay = match mode {
         Remote::Serve(_) => false,
+        Remote::Negotiate => {
+            ssh.arg("negotiate");
+            false
+        }
         // The repository, quoted for the remote shell ssh hands it to.
         Remote::UploadPack(repo) => {
             if repo.contains('\'') || !repo.starts_with('/') {
@@ -3307,7 +3369,7 @@ fn pull_command<T>(
             true
         }
     };
-    if !relay {
+    if !relay && !matches!(mode, Remote::Negotiate) {
         // The flags this verb hands its source half (`--sqlite-rows`,
         // `--sqlite-carry-wall`): fixed literals and parsed integers.
         for flag in bulkload_agent::transfer::serve_flags() {
