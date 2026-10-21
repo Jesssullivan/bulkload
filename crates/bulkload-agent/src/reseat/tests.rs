@@ -17,8 +17,9 @@ use crate::BulkloadRefusal;
 mod findings;
 
 /// The landed-read counter is process-wide: the rows that measure it run
-/// one at a time.
-static SERIAL: Mutex<()> = Mutex::new(());
+/// one at a time, and so do the rows that read landed bytes beside them
+/// (`place::judge_tests`).
+pub(super) static SERIAL: Mutex<()> = Mutex::new(());
 
 const SOURCE_HOME: &str = "/Users/jess";
 const SID: &str = "11111111-2222-4333-8444-555555555555";

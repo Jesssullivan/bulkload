@@ -63,8 +63,10 @@ use crate::{BulkloadRefusal, Result};
 pub mod check;
 mod claude;
 mod codex;
+pub mod fold;
 pub mod json;
 pub mod key;
+pub mod keymap;
 pub mod ledger;
 pub mod place;
 pub mod regularize;
@@ -443,7 +445,9 @@ pub enum LandingIndex {
 /// `destination-adopted`, `destination-holds`, `destination-row-only`), or
 /// kept with the destination's own copy beside it, as SPEC R2.2 rules
 /// (`diverged`, `dest-ahead`, `dest-continued`, `both-continued`,
-/// `dest-removed`, `extend-raced`). Every other word (a lane refusal code,
+/// `dest-removed`, `extend-raced`), or held in the destination's own copy
+/// (`covered`: a source copy landed beside it whose bytes the live file
+/// already holds, #294 review 1). Every other word (a lane refusal code,
 /// `occupied`, `collision`, `held`, `unreadable-form`, `exchange-unsupported`,
 /// `index-conflict`, ...) leaves the landed bytes somewhere no resume finds
 /// them, and holds the gate.
@@ -469,6 +473,7 @@ pub fn word_accounted(word: &str) -> bool {
             | "both-continued"
             | "dest-removed"
             | "extend-raced"
+            | "covered"
     )
 }
 

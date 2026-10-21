@@ -386,6 +386,18 @@ struct Sessions {
     reseat: Option<bulkload_agent::reseat::Summary>,
 }
 
+/// What one `estate-move` run does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// One pass of the move.
+    Move,
+    /// `--plan-only`: the decisions shown, never recorded.
+    PlanOnly,
+    /// `--key-map-proof` (#280 finding 9): report only, from the plan an
+    /// earlier pass pulled; nothing is pulled, locked or written.
+    KeyMapProof,
+}
+
 /// The real `.claude` and `.codex` this pass's pull ran under, resolved
 /// once and owner-checked ([`Move::live_root`]): the re-seat runs under
 /// exactly these (independent review of #280, N1).
@@ -452,7 +464,7 @@ fn write_listing(path: &Path, listed: Option<Vec<Vec<u8>>>) -> Result<()> {
 
 /// The destination half's arguments.
 struct Move {
-    plan_only: bool,
+    mode: Mode,
     label: String,
     source: String,
     origins: Vec<String>,
@@ -482,7 +494,7 @@ impl Move {
     #[allow(clippy::too_many_lines)] // Argument parsing only.
     fn parse(args: &[OsString]) -> Result<Self> {
         let mut parsed = Self {
-            plan_only: false,
+            mode: Mode::Move,
             label: String::new(),
             source: String::new(),
             origins: Vec::new(),
@@ -515,8 +527,12 @@ impl Move {
         while let Some(arg) = args.get(at).and_then(|arg| arg.to_str()) {
             let mut step = 2;
             match arg {
-                "--plan-only" if !parsed.plan_only => {
-                    parsed.plan_only = true;
+                "--plan-only" if parsed.mode == Mode::Move => {
+                    parsed.mode = Mode::PlanOnly;
+                    step = 1;
+                }
+                "--key-map-proof" if parsed.mode == Mode::Move => {
+                    parsed.mode = Mode::KeyMapProof;
                     step = 1;
                 }
                 "--exclude-union" if !parsed.exclude_union => {
@@ -592,6 +608,10 @@ impl Move {
             || parsed.label.starts_with("carry")
         {
             return Err(BulkloadRefusal::FieldDomainViolation);
+        }
+        // The proof reads the session homes.
+        if parsed.mode == Mode::KeyMapProof && parsed.sessions.is_none() {
+            return Err(BulkloadRefusal::RequiredFieldMissing);
         }
         // `pull` takes SSH_CONFIG only after REMOTE_EXECUTABLE.
         if parsed.config.is_some() && parsed.remote.is_none() {
@@ -745,6 +765,7 @@ impl Move {
             ledger: self.state.join("consolidate"),
             plan_only,
             git: None,
+            archived: self.archived.clone(),
         })
     }
 }
@@ -812,12 +833,20 @@ fn move_command(args: &[OsString]) -> Result<()> {
         out(&format!("estate-move state=retired path={path:?}"))
     })?;
     let passed = move_pass(&run);
+    // `--key-map-proof` is report-only (#294): it writes nothing and prints
+    // no phase line, the state line included.
+    if run.mode == Mode::KeyMapProof {
+        return passed;
+    }
     finish("estate-move", &run.states(), passed)
 }
 
 /// One destination pass (see [`move_command`]).
 #[allow(clippy::too_many_lines)]
 fn move_pass(run: &Move) -> Result<()> {
+    if run.mode == Mode::KeyMapProof {
+        return key_map_proof(run);
+    }
     moving::private_dir(&run.state)?;
     let _lock = moving::lock(&run.state)?;
     // The streamed fetches' scratch repositories: under this state, swept
@@ -884,7 +913,7 @@ fn move_pass(run: &Move) -> Result<()> {
     let mut rows = moving::decide(&items, &inputs, &mut decided, now_ns())?;
     let suffix = run.suffix();
     print_plan(&rows, &suffix, &notes)?;
-    if run.plan_only {
+    if run.mode == Mode::PlanOnly {
         return preview(run, (&plan, &corpus, &private));
     }
     ledger.items = decided.items;
@@ -916,6 +945,8 @@ fn move_pass(run: &Move) -> Result<()> {
             ledger: run.state.join("consolidate"),
             plan_only: false,
             git: None,
+            // A worktree's seats: no transcript link to regularize.
+            archived: Vec::new(),
         })
     };
     let reach = estate::streamed::Reach {
@@ -1219,8 +1250,12 @@ fn move_pass(run: &Move) -> Result<()> {
     // session transfers completed, path refusals included: those stay
     // typed closure rows, and a refused settings file never holds the
     // transcripts' re-seat.
+    let mut key_maps = None;
     let sessions: Option<Sessions> = if let Some(home) = &run.sessions {
-        let (pulled, homes) = sessions_pull(run, home);
+        // #280 finding 9: the source's project keys land at their lanes'
+        // destination keys, once; ambiguous keys stay, typed.
+        let (pulled, homes, derived) = sessions_pull(run, home, &plan);
+        key_maps = derived;
         note(&pulled);
         reached(&mut ledger, &ledger_path, "sessions-pull", word(&pulled))?;
         let mut outcome = Sessions {
@@ -1312,7 +1347,7 @@ fn move_pass(run: &Move) -> Result<()> {
         .collect::<Vec<_>>()
         .join(",");
     out(&format!(
-        "estate-move closure planned={} applied={} applied_beside={} carried={} referenced_only={} refused={} refused_pending_review={} unaccounted={} not_moved={not_moved} refusals={} sessions={} transfer_rows={} reseat_unaccounted={reseat_unaccounted} reseat_held={} objects_unreachable_not_carried={unreachable} objects_missing_at_source={missing_at_source} {} report={report_path:?}",
+        "estate-move closure planned={} applied={} applied_beside={} carried={} referenced_only={} refused={} refused_pending_review={} unaccounted={} not_moved={not_moved} refusals={} sessions={} transfer_rows={} reseat_unaccounted={reseat_unaccounted} reseat_held={} key_maps={} key_maps_held={} key_maps_unused={} diverged={} move_state_bytes={} pull_payload_bytes={} objects_unreachable_not_carried={unreachable} objects_missing_at_source={missing_at_source} {} report={report_path:?}",
         rows.len(),
         report.applied,
         report.applied_beside,
@@ -1325,6 +1360,16 @@ fn move_pass(run: &Move) -> Result<()> {
         if sessions.is_some() { "claude,codex" } else { "none" },
         report.transfer_rows(),
         if held.is_empty() { "none" } else { &held },
+        key_maps.as_ref().map_or(0, |maps| maps.maps.len()),
+        key_maps.as_ref().map_or(0, |maps| maps.held.len()),
+        key_maps.as_ref().map_or(0, |maps| maps.unused.len()),
+        reseat_held
+            .iter()
+            .filter(|(word, _)| word.ends_with("/beside-diverged"))
+            .map(|(_, count)| count)
+            .sum::<u64>(),
+        tree_bytes(&run.state, &|_| true),
+        pull_payload_bytes(&run.state),
         measured.words(),
     ))?;
     let gate = report
@@ -1589,10 +1634,19 @@ fn homes_plan(run: &Move, home: &Path) -> Result<()> {
 // returned; the first refusal is the phase's. `ITEMS_REFUSED` means the
 // session completed with typed path refusals (closure rows), which does
 // not stop the re-seat (C10).
-fn sessions_pull(run: &Move, home: &Path) -> (Result<()>, Option<Homes>) {
+#[allow(clippy::too_many_lines)] // Three pulls, the key map and its notes.
+fn sessions_pull(
+    run: &Move,
+    home: &Path,
+    plan: &Path,
+) -> (
+    Result<()>,
+    Option<Homes>,
+    Option<bulkload_agent::reseat::keymap::KeyMaps>,
+) {
     let dest = match dest_home(run) {
         Ok(dest) => dest,
-        Err(refusal) => return (Err(refusal), None),
+        Err(refusal) => return (Err(refusal), None, None),
     };
     let codex_from = run
         .codex_root
@@ -1606,15 +1660,55 @@ fn sessions_pull(run: &Move, home: &Path) -> (Result<()>, Option<Homes>) {
         .map(|settings| bulkload_agent::transfer::set_consolidate(Some(settings)));
     // The source's transcripts and rollouts, listed by each session: the
     // provenance the re-seat tells them from the destination's own by
-    // (independent review of #280, N4).
+    // (independent review of #280, N4). Listed as they land: under their
+    // mapped keys.
     bulkload_agent::transfer::set_listing(vec![b"projects/".to_vec()]);
     let _ = super::take_listed();
     let claude_root = Move::live_root(&dest.join(".claude"), "claude");
-    let claude = claude_root
+    // #280 finding 9: the Claude tree with the key map of this pass's lanes,
+    // derived for the real, owner-checked home the pull runs under; the
+    // Codex tree without (its rollouts are kept by date, not by working
+    // directory). A map that cannot be derived or set holds the Claude pull:
+    // pulled unmapped, every re-keyed transcript would land twice.
+    let key_maps = claude_root
         .as_ref()
         .map_err(Clone::clone)
-        .and_then(|real| run.transfer_into(&home.join(".claude"), real, "claude"));
-    let claude_listed = write_listing(&pulls.join("claude.listing"), super::take_listed());
+        .and_then(|real| derive_key_maps(run, home, plan, real));
+    let claude = key_maps
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|maps| {
+            print_key_maps(maps)?;
+            bulkload_agent::transfer::set_map_prefixes(maps.prefixes())
+        })
+        .and_then(|()| {
+            claude_root
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|real| run.transfer_into(&home.join(".claude"), real, "claude"))
+        });
+    let unmapped = bulkload_agent::transfer::set_map_prefixes(Vec::new());
+    let claude_listing = super::take_listed();
+    // #294 review 4: a derived map the landed sessions of its lane did not
+    // use (the source keyed them otherwise) leaves them to be re-seated as
+    // before, a second copy: named, typed.
+    let mut key_maps = key_maps;
+    let noted = match (&mut key_maps, &claude_root, &claude_listing) {
+        (Ok(maps), Ok(real), Some(listed)) => key_options(run, home, plan, real)
+            .and_then(|options| bulkload_agent::reseat::keymap::unused(&options, maps, listed))
+            .and_then(|unused| {
+                for note in &unused {
+                    out(&format!(
+                        "estate-move key-map-unused from={} to={} seen={} cwd={:?} reason=source-keyed-otherwise",
+                        note.from, note.to, note.seen, note.cwd
+                    ))?;
+                }
+                maps.unused = unused;
+                Ok(())
+            }),
+        _ => Ok(()),
+    };
+    let claude_listed = write_listing(&pulls.join("claude.listing"), claude_listing);
     // `~/.claude.json` (structured config), merged into the live one; a
     // source with none has nothing to merge, and leaves no record.
     let claude_json = run
@@ -1657,6 +1751,8 @@ fn sessions_pull(run: &Move, home: &Path) -> (Result<()>, Option<Homes>) {
     for result in [
         suffix,
         claude,
+        unmapped,
+        noted,
         claude_listed,
         claude_json,
         codex,
@@ -1673,7 +1769,7 @@ fn sessions_pull(run: &Move, home: &Path) -> (Result<()>, Option<Homes>) {
         (Ok(claude), Ok(codex)) => Some(Homes { claude, codex }),
         _ => None,
     };
-    (outcome, homes)
+    (outcome, homes, key_maps.ok())
 }
 
 // Whether the one-file session recorded in `state` found no file at its
@@ -1693,6 +1789,160 @@ fn source_had_none(state: &Path) -> bool {
                         if matches!(refusal.code(), "SOURCE_VANISHED" | "SOURCE_ROOT_MISSING"))
                 })
         })
+}
+
+// The lanes the re-seat resolves sessions by (`--lanes-from-plan`: the
+// run's `--map` pairs, then the plan's items; `SOURCE_HOME/git` by
+// default), as `estate-reseat` would build them for this pass.
+fn lane_options(run: &Move, home: &Path, plan: &Path) -> Result<bulkload_agent::reseat::Options> {
+    let dest = dest_home(run)?;
+    let mut options =
+        bulkload_agent::reseat::Options::new(home, &dest, &dest, &run.state.join("reseat"));
+    let mut maps = run.maps.clone();
+    for item in estate::inspect(plan)? {
+        if let Some(workspace) = item.workspace {
+            maps.push((item.source, workspace));
+        }
+    }
+    options.maps = maps;
+    Ok(options)
+}
+
+// #280 finding 9: the Claude project-key map of this pass's lanes
+// (`reseat::keymap::derive`), for the real, owner-checked `.claude` the
+// pull runs under (`claude`, independent review of #280, N1).
+fn derive_key_maps(
+    run: &Move,
+    home: &Path,
+    plan: &Path,
+    claude: &Path,
+) -> Result<bulkload_agent::reseat::keymap::KeyMaps> {
+    bulkload_agent::reseat::keymap::derive(&key_options(run, home, plan, claude)?)
+}
+
+// The lanes ([`lane_options`]) over the real `.claude` (`claude`).
+fn key_options(
+    run: &Move,
+    home: &Path,
+    plan: &Path,
+    claude: &Path,
+) -> Result<bulkload_agent::reseat::Options> {
+    let mut options = lane_options(run, home, plan)?;
+    claude.clone_into(&mut options.dest_claude);
+    claude.clone_into(&mut options.landing_claude);
+    Ok(options)
+}
+
+// One line per mapped key and per key held unmapped (typed), then the
+// counts.
+fn print_key_maps(maps: &bulkload_agent::reseat::keymap::KeyMaps) -> Result<()> {
+    for map in &maps.maps {
+        out(&format!(
+            "estate-move key-map from={} to={} cwd={:?}",
+            map.from, map.to, map.cwd
+        ))?;
+    }
+    for held in &maps.held {
+        out(&format!(
+            "estate-move key-map-held key={} reason={} to={} cwds={:?}",
+            held.key,
+            held.reason.word(),
+            held.to.as_deref().unwrap_or("none"),
+            held.cwds,
+        ))?;
+    }
+    out(&format!(
+        "estate-move key-maps mapped={} held={} same={}",
+        maps.maps.len(),
+        maps.held.len(),
+        maps.same
+    ))
+}
+
+// `--key-map-proof` (#280 finding 9): report only. From the plan an earlier
+// pass pulled into MOVE_STATE/carry, the key map this pass would derive,
+// then, for every file under each source-keyed directory of the live
+// DEST_HOME/.claude/projects, whether its destination key holds it
+// byte-identical or byte-prefix-extended (`reseat::keymap::proof`).
+// Nothing is pulled, locked or written; the neo-key directories stay.
+fn key_map_proof(run: &Move) -> Result<()> {
+    let home = run
+        .sessions
+        .as_ref()
+        .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+    let plan = run.state.join("carry").join("plan.postcard");
+    // The live `.claude` resolved and owner-checked as the pull resolves
+    // it (N1), never created: report only.
+    let claude = owned_real(&dest_home(run)?.join(".claude"))?;
+    let options = key_options(run, home, &plan, &claude)?;
+    let maps = bulkload_agent::reseat::keymap::derive(&options)?;
+    print_key_maps(&maps)?;
+    let summary = bulkload_agent::reseat::keymap::proof(&options, &maps, &mut |line| out(line))?;
+    let counts = summary
+        .files
+        .iter()
+        .map(|(word, count)| format!("{word}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    out(&format!(
+        "estate-move key-map-proof dirs={} files={} statuses={}",
+        summary.dirs,
+        summary.files.values().sum::<u64>(),
+        if counts.is_empty() { "none" } else { &counts },
+    ))
+}
+
+// Bytes of every regular file under `root` that `keep` takes (by path),
+// never following a link.
+fn tree_bytes(root: &Path, keep: &dyn Fn(&Path) -> bool) -> u64 {
+    let mut total = 0_u64;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.path().symlink_metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                pending.push(entry.path());
+            } else if meta.is_file() && keep(&entry.path()) {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    total
+}
+
+// Operator ruling 2026-10-20 ("no stage dupes"): bytes under
+// MOVE_STATE/pull/{claude,codex} that are not the pulls' resume state (the
+// transfer store, its lock and its closure records): a staged payload left
+// there. Reported on the closure line.
+fn pull_payload_bytes(state: &Path) -> u64 {
+    ["claude", "codex"]
+        .iter()
+        .map(|name| {
+            tree_bytes(&state.join("pull").join(name), &|path: &Path| {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default();
+                let record = path
+                    .components()
+                    .any(|part| part.as_os_str() == bulkload_agent::transfer_outcome::RECORD_DIR);
+                let lock = path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("lock"));
+                // The store and the consolidation ledger are state, not
+                // payload.
+                !(record
+                    || name.starts_with("transfer.sqlite")
+                    || name.starts_with("consolidate.sqlite")
+                    || lock)
+            })
+        })
+        .sum()
 }
 
 // Whether every session transfer completed: every path answered, refused
@@ -1737,12 +1987,12 @@ fn reseat(
     }
     args.extend(run.reseat_args.iter().cloned());
     // Consolidated homes (operator ruling 2026-10-20): nothing lands
-    // beside, so no beside suffix; and A-106 is a union now, never the
-    // source's copy replacing a destination archive link. Until the
-    // append-log union (#294) lands, a placement over such a link stays
-    // `occupied`: typed, holding the gate.
+    // beside, so no beside suffix. A-106 is the pull's union now: a
+    // transcript linked into a --replace-archived-dest root was unioned with
+    // the archived file and regularized there (the archive copy stays), so
+    // the re-seat is never asked to replace a link.
     if !run.archived.is_empty() {
-        out("estate-move a106=union-pending replace-archived-dest=ignored")?;
+        out("estate-move a106=union-at-pull")?;
     }
     // Review of #280, finding 6: the landed index is the snapshot this
     // pass took, named by this pass's Codex transfer record, or none: never

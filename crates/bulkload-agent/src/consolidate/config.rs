@@ -427,7 +427,12 @@ pub(crate) fn swap_in(
 
 /// Land the source's bytes where the destination holds no such file,
 /// create-only.
-fn create(target: &Target<'_>, name: &CStr, bytes: &[u8], attempt: usize) -> Result<Outcome> {
+pub(super) fn create(
+    target: &Target<'_>,
+    name: &CStr,
+    bytes: &[u8],
+    attempt: usize,
+) -> Result<Outcome> {
     let temp = temp_name(name, attempt)?;
     let file = File::from(
         sys::create_excl_at(target.dir.as_fd(), &temp, 0o600)

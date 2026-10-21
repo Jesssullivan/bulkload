@@ -391,6 +391,12 @@ pub enum BulkloadRefusal {
     /// WP0(d), OI-1003-Q18, #187). The Git carry's occupied destinations
     /// keep `GIT_DESTINATION_OCCUPIED`.
     DestinationOccupied,
+    /// `--map-prefix` (#280 finding 9 review): a source path would reach a
+    /// map's destination by another route than that map (the source holds
+    /// the destination's name itself, or a shorter map's image lies in a
+    /// longer map's destination). Refused with everything under it, so two
+    /// source paths never merge at one name.
+    DestinationMapConflict,
     /// The destination's parent directory is absent (#232). `copy` and
     /// `pull` create an absent DEST itself (mode 0700) when its parent
     /// exists, and never a parent: the operator named DEST, not the path
@@ -561,6 +567,33 @@ pub enum BulkloadRefusal {
     /// (`consolidate::config::ATTEMPTS`). Nothing is changed and nothing is
     /// recorded. It is retryable: the next pass reads and merges it again.
     HomesConsolidateRaced,
+    /// An append-log union that would write (an extension, a union, a fold)
+    /// cannot tell whether a process holds the live file open: the open-file
+    /// check reads `/proc` and has no implementation on this platform (only
+    /// Linux; sting is Linux). Writing anyway could lose a writer's lines to
+    /// a file traded out, so nothing is written and the file is held, typed.
+    HomesConsolidateHolderUnknown,
+
+    // ---- SQLite row union ---------------------------------------------------
+    /// `sqlite-union`: the source store's schema (its tables' `CREATE`
+    /// statements, `user_version` or applied `_sqlx_migrations`) is not the
+    /// destination's (operator ruling 2026-10-20). Nothing is written.
+    SqliteSchemaMismatch,
+    /// `sqlite-union`: the destination has no store at the path to merge
+    /// into. A store is never landed as a file copy (operator ruling
+    /// 2026-10-20); the application creates its own.
+    SqliteUnionTargetAbsent,
+    /// `sqlite-union`: the source store is not in WAL mode, so no read
+    /// snapshot can be held without holding up its writers (SPEC R2.1).
+    SqliteUnionSourceNotWal,
+    /// `sqlite-union`: the store has a table rows cannot be merged into by
+    /// key (a virtual table, or a generated or hidden column). Nothing is
+    /// written.
+    SqliteUnionSchemaUnsupported,
+    /// `sqlite-union`: `SQLite` finds the source store corrupt or not a
+    /// database. It is held, listed, nothing written; the operator rules on
+    /// it (SPEC, the Codex `SQLite` row).
+    SqliteUnionSourceUnreadable,
 
     // ---- handoff proof ------------------------------------------------------
     /// A credential-class probe did not prove what it set out to prove.
@@ -592,7 +625,7 @@ impl BulkloadRefusal {
     /// These strings are the wire/log identity of a refusal and must not change
     /// once a milestone ships.
     #[must_use]
-    #[allow(clippy::too_many_lines)] // One arm per code.
+    #[allow(clippy::too_many_lines, reason = "one arm per refusal code")]
     pub const fn code(&self) -> &'static str {
         match *self {
             Self::SnapshotRootsOverlap => "SNAPSHOT_ROOTS_OVERLAP",
@@ -661,10 +694,16 @@ impl BulkloadRefusal {
             Self::SqliteBackupFailed(_) => "SQLITE_BACKUP_FAILED",
             Self::SqliteSourceAsRoot => "SQLITE_SOURCE_AS_ROOT",
             Self::SqliteSourceNotOwner => "SQLITE_SOURCE_NOT_OWNER",
+            Self::SqliteSchemaMismatch => "SQLITE_SCHEMA_MISMATCH",
+            Self::SqliteUnionTargetAbsent => "SQLITE_UNION_TARGET_ABSENT",
+            Self::SqliteUnionSourceNotWal => "SQLITE_UNION_SOURCE_NOT_WAL",
+            Self::SqliteUnionSchemaUnsupported => "SQLITE_UNION_SCHEMA_UNSUPPORTED",
+            Self::SqliteUnionSourceUnreadable => "SQLITE_UNION_SOURCE_UNREADABLE",
             Self::BudgetExceeded => "BUDGET_EXCEEDED",
             Self::DestinationSpaceInsufficient => "DESTINATION_SPACE_INSUFFICIENT",
             Self::SpaceExhausted(_) => "SPACE_EXHAUSTED",
             Self::DestinationOccupied => "DESTINATION_OCCUPIED",
+            Self::DestinationMapConflict => "DESTINATION_MAP_CONFLICT",
             Self::DestinationParentMissing => "DESTINATION_PARENT_MISSING",
             Self::DestinationKindMismatch => "DESTINATION_KIND_MISMATCH",
             Self::DestinationExchangeUnsupported => "DESTINATION_EXCHANGE_UNSUPPORTED",
@@ -709,6 +748,7 @@ impl BulkloadRefusal {
             Self::ReseatR0Failed => "RESEAT_R0_FAILED",
             Self::HomesConsolidateUnsupported => "HOMES_CONSOLIDATE_UNSUPPORTED",
             Self::HomesConsolidateRaced => "HOMES_CONSOLIDATE_RACED",
+            Self::HomesConsolidateHolderUnknown => "HOMES_CONSOLIDATE_HOLDER_UNKNOWN",
             _ => "",
         }
     }
@@ -789,6 +829,7 @@ impl BulkloadRefusal {
         "DESTINATION_SPACE_INSUFFICIENT",
         "SPACE_EXHAUSTED",
         "DESTINATION_OCCUPIED",
+        "DESTINATION_MAP_CONFLICT",
         "DESTINATION_PARENT_MISSING",
         "DESTINATION_KIND_MISMATCH",
         "DESTINATION_EXCHANGE_UNSUPPORTED",
@@ -819,6 +860,12 @@ impl BulkloadRefusal {
         "RESEAT_R0_FAILED",
         "HOMES_CONSOLIDATE_UNSUPPORTED",
         "HOMES_CONSOLIDATE_RACED",
+        "HOMES_CONSOLIDATE_HOLDER_UNKNOWN",
+        "SQLITE_SCHEMA_MISMATCH",
+        "SQLITE_UNION_TARGET_ABSENT",
+        "SQLITE_UNION_SOURCE_NOT_WAL",
+        "SQLITE_UNION_SCHEMA_UNSUPPORTED",
+        "SQLITE_UNION_SOURCE_UNREADABLE",
         "PROBE_FAILED",
         "IO",
     ];
@@ -1071,6 +1118,7 @@ mod tests {
             BulkloadRefusal::DestinationSpaceInsufficient,
             BulkloadRefusal::SpaceExhausted(None),
             BulkloadRefusal::DestinationOccupied,
+            BulkloadRefusal::DestinationMapConflict,
             BulkloadRefusal::DestinationParentMissing,
             BulkloadRefusal::DestinationKindMismatch,
             BulkloadRefusal::DestinationExchangeUnsupported,
@@ -1101,6 +1149,12 @@ mod tests {
             BulkloadRefusal::ReseatR0Failed,
             BulkloadRefusal::HomesConsolidateUnsupported,
             BulkloadRefusal::HomesConsolidateRaced,
+            BulkloadRefusal::HomesConsolidateHolderUnknown,
+            BulkloadRefusal::SqliteSchemaMismatch,
+            BulkloadRefusal::SqliteUnionTargetAbsent,
+            BulkloadRefusal::SqliteUnionSourceNotWal,
+            BulkloadRefusal::SqliteUnionSchemaUnsupported,
+            BulkloadRefusal::SqliteUnionSourceUnreadable,
             BulkloadRefusal::ProbeFailed,
             BulkloadRefusal::Io(None),
         ];

@@ -331,6 +331,12 @@ impl Maps {
         self.pairs.is_empty()
     }
 
+    /// The pairs, longest source prefix first.
+    #[must_use]
+    pub fn pairs(&self) -> &[(String, String)] {
+        &self.pairs
+    }
+
     /// `text` with every source prefix that stands as a whole path (at the
     /// start of the text or after a character no path name holds, and
     /// followed by `/`, the end, or such a character) written as the

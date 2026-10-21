@@ -85,6 +85,7 @@ pub mod durable {
 }
 
 pub mod priority;
+pub mod procs;
 
 /// Open-file limits and the destination's descriptor budget (M2 W3).
 pub mod limits {
@@ -112,6 +113,7 @@ pub mod provider_sqlite;
 pub mod refuse;
 pub mod reseat;
 pub mod space;
+pub mod sqlite_union;
 // The move verbs' guard on their state directories (SPEC rule 2, reset
 // 2026-10-20): ledgers and resume marks only, never payload.
 pub mod state_payload;

@@ -750,3 +750,39 @@ fn an_old_applied_beside_entry_is_accounted_and_gate_relevant() {
         Disposition::RefusedPendingReview("DESTINATION_OCCUPIED".into())
     );
 }
+
+/// #280 finding 9: each `--map-prefix` a session landed entries through is
+/// a `mapped` transfer row naming the source path and the destination path
+/// (`mapped`), accounted like `applied`, never pending review.
+#[test]
+fn a_mapped_entry_is_accounted_like_applied_and_names_both_paths() {
+    let mut stats = TransferStats::default();
+    stats.mapped.push((
+        b"projects/-Users-jess-git-lab".to_vec(),
+        b"projects/-srv-fast-local-jess-git-lab".to_vec(),
+    ));
+    stats.completed = 3;
+    let dest = state_with(&ended(stats));
+    let report = report_of(&[dest.path()]);
+    assert_eq!(report.transfer_rows(), 2, "the session and the map");
+    assert_eq!(report.applied, 2, "the session and its map");
+    assert_eq!((report.unaccounted, report.refused_pending_review), (0, 0));
+    assert!(report.passes());
+    let mapped = row(&report, "projects/-Users-jess-git-lab");
+    assert_eq!(mapped.disposition, Disposition::Applied);
+    assert_eq!(mapped.kind, RowKind::TransferEntry);
+    assert_eq!(
+        mapped
+            .transfer
+            .as_ref()
+            .and_then(|detail| detail.mapped.as_deref()),
+        Some(&b"projects/-srv-fast-local-jess-git-lab"[..])
+    );
+    let json = report.to_json();
+    assert!(
+        json.contains(
+            "\"path\":\"projects/-Users-jess-git-lab\",\"transfer_outcome\":\"mapped\",\"mapped\":\"projects/-srv-fast-local-jess-git-lab\""
+        ),
+        "{json}"
+    );
+}
