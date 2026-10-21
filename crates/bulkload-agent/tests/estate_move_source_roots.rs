@@ -229,7 +229,13 @@ fn a_remote_pass_pulls_only_ledgers_and_lands_over_ssh() {
     let dst = world.path("dst");
     fs::create_dir_all(&dst).unwrap();
     let map = format!("{}={}", src.display(), dst.display());
-    let _ = agent(&os(&[&"estate-move-source", &"--map", &map, &source_state, &src]));
+    let _ = agent(&os(&[
+        &"estate-move-source",
+        &"--map",
+        &map,
+        &source_state,
+        &src,
+    ]));
     let old = source_state.join("carry/corpus/old-head.bundle");
     fs::create_dir_all(old.parent().unwrap()).unwrap();
     fs::write(&old, vec![9u8; 2048]).unwrap();
@@ -250,11 +256,17 @@ fn a_remote_pass_pulls_only_ledgers_and_lands_over_ssh() {
         Some(&world.path("fake-bin")),
     );
     let both = format!("{}\n{}", moved.stdout, moved.stderr);
-    assert!(moved.stdout.contains("estate-move phase=pull outcome=ok"), "{both}");
+    assert!(
+        moved.stdout.contains("estate-move phase=pull outcome=ok"),
+        "{both}"
+    );
     // The streamed fetch relayed over ssh: the item lands from the live
     // source repository, its objects fetched through the remote
     // `upload-pack`.
-    assert!(moved.stdout.contains("estate-move phase=apply outcome=ok"), "{both}");
+    assert!(
+        moved.stdout.contains("estate-move phase=apply outcome=ok"),
+        "{both}"
+    );
     let head = |repo: &Path| {
         let out = Command::new("git")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
