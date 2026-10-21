@@ -624,7 +624,7 @@ fn a_file_both_sides_changed_merges_three_way_or_is_held() {
     );
 }
 
-/// Part 2, a different branch on each side (the GloriousFlywheel case):
+/// Part 2, a different branch on each side (the `GloriousFlywheel` case):
 /// sting on main and clean, neo on a feature branch with dirty and
 /// untracked files. After the ref union sting switches to neo's branch
 /// ("switch when clean") and neo's files land. A dirty sting is held typed
