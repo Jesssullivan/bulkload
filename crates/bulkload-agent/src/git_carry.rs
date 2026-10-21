@@ -45,6 +45,7 @@ mod inert_origin_tests;
 pub(crate) mod landed;
 pub(crate) mod native_refs;
 pub mod parents;
+pub mod preview;
 mod raw_tree;
 mod ref_table;
 #[cfg(test)]
@@ -66,7 +67,6 @@ pub mod shared;
     clippy::unwrap_used
 )]
 mod source_inert_tests;
-pub mod preview;
 pub mod stream;
 pub mod union;
 

@@ -944,7 +944,12 @@ fn move_pass(run: &Move) -> Result<()> {
     let rows = moving::decide(&items, &inputs, &mut decided, now_ns())?;
     let suffix = run.suffix();
     if run.mode == Mode::PlanOnly {
-        return preview(run, &rows, (&plan, &carry, &refusals, &notes), homes.as_ref());
+        return preview(
+            run,
+            &rows,
+            (&plan, &carry, &refusals, &notes),
+            homes.as_ref(),
+        );
     }
     print_plan(&rows, &notes)?;
     ledger.items = decided.items;
@@ -1026,7 +1031,13 @@ fn move_pass(run: &Move) -> Result<()> {
                 if let Err(refusal) =
                     bulkload_agent::git_carry::parents::make_home_parents(home, place)
                 {
-                    estate::streamed::record_outcome(&private, &row.item, "refused", Some(&refusal), None)?;
+                    estate::streamed::record_outcome(
+                        &private,
+                        &row.item,
+                        "refused",
+                        Some(&refusal),
+                        None,
+                    )?;
                     out(&format!(
                         "estate-move item={} outcome=held code={} live={place:?}",
                         row.id,
@@ -1280,7 +1291,13 @@ fn move_pass(run: &Move) -> Result<()> {
         } else {
             continue;
         };
-        estate::streamed::record_outcome(&private, &row.item, "refused", Some(&refusal), Some(why))?;
+        estate::streamed::record_outcome(
+            &private,
+            &row.item,
+            "refused",
+            Some(&refusal),
+            Some(why),
+        )?;
         out(&format!(
             "estate-move item={} outcome=held code={} capture_code={}",
             row.id,
@@ -1459,10 +1476,7 @@ fn move_pass(run: &Move) -> Result<()> {
 }
 
 // The plan's per-item lines, its histogram and the source notes' counts.
-fn print_plan(
-    rows: &[moving::Row],
-    notes: &std::collections::BTreeMap<String, u64>,
-) -> Result<()> {
+fn print_plan(rows: &[moving::Row], notes: &std::collections::BTreeMap<String, u64>) -> Result<()> {
     for row in rows {
         let place = row.item.workspace.as_ref().unwrap_or(&row.item.repository);
         out(&format!(
@@ -1605,7 +1619,9 @@ fn first_decision(
 
 // An item that owns its repository's store (a main or bare item).
 fn owns_store(item: &estate::Item) -> bool {
-    item.workspace.as_ref().is_none_or(|workspace| *workspace == item.repository)
+    item.workspace
+        .as_ref()
+        .is_none_or(|workspace| *workspace == item.repository)
 }
 
 /// `--plan-only` (2026-10-21): every item's B2 decision, from the B1
@@ -1660,7 +1676,10 @@ fn preview(
         if snapshots.get(at).is_some_and(Option::is_some)
             && b2.get(at).is_some_and(|b| b.action != "held")
         {
-            repos.entry(row.item.repository.clone()).or_default().push(at);
+            repos
+                .entry(row.item.repository.clone())
+                .or_default()
+                .push(at);
         }
     }
     let mut asks = Vec::new();
@@ -1720,8 +1739,10 @@ fn preview(
     };
     let mut after: BTreeMap<PathBuf, Vec<p::RefPreview>> = BTreeMap::new();
     let mut fetch_total = 0u64;
-    for (((repository, members), (ask, answer)), live) in
-        repos.iter().zip(asks.iter().zip(&answers)).zip(&live_values)
+    for (((repository, members), (ask, answer)), live) in repos
+        .iter()
+        .zip(asks.iter().zip(&answers))
+        .zip(&live_values)
     {
         fetch_total += answer.fetch_bytes.unwrap_or(0);
         out(&format!(
@@ -1751,7 +1772,8 @@ fn preview(
                 .map(|(ours, theirs)| (ours.as_str(), theirs.as_str()))
                 .zip(answer.ancestry.iter().copied())
                 .collect();
-            let forwards = |ours: &str, theirs: &str| answered.get(&(ours, theirs)).copied().flatten();
+            let forwards =
+                |ours: &str, theirs: &str| answered.get(&(ours, theirs)).copied().flatten();
             p::refs_preview(repository, &snapshot.snapshot.refs, &forwards)?
         } else {
             snapshot
@@ -1785,9 +1807,11 @@ fn preview(
     let mut file_asks = Vec::new();
     let mut asked = Vec::new();
     for (at, (row, snapshot)) in rows.iter().zip(&snapshots).enumerate() {
-        let (Some(snapshot), Some(_), Some(decision)) =
-            (snapshot.as_ref(), row.item.workspace.as_ref(), b2.get_mut(at))
-        else {
+        let (Some(snapshot), Some(_), Some(decision)) = (
+            snapshot.as_ref(),
+            row.item.workspace.as_ref(),
+            b2.get_mut(at),
+        ) else {
             continue;
         };
         let place = row.item.workspace.as_ref().unwrap_or(&row.item.repository);
@@ -1878,7 +1902,11 @@ fn preview(
         let place = row.item.workspace.as_ref().unwrap_or(&row.item.repository);
         if answer.unreadable {
             decision.action = "held";
-            decision.code = Some(BulkloadRefusal::SourceRootUnreadable(None).code().to_owned());
+            decision.code = Some(
+                BulkloadRefusal::SourceRootUnreadable(None)
+                    .code()
+                    .to_owned(),
+            );
             continue;
         }
         decision.tree_known = answer.diff_known;
@@ -1951,7 +1979,8 @@ fn preview(
                 row.id
             ))?;
         }
-        let count = |map: &BTreeMap<&'static str, u64>, key: &str| map.get(key).copied().unwrap_or(0);
+        let count =
+            |map: &BTreeMap<&'static str, u64>, key: &str| map.get(key).copied().unwrap_or(0);
         out(&format!(
             "estate-move item={} action={}{} reason={} presence={} refs_created={} refs_forwarded={} refs_switched={} refs_tracked={} refs_kept={} refs_same={} changed={} untracked={} ignored={} land={} merges={} conflicts={} same={} unknown={} tree={} worktree={} asides={} parents={} under_home={} source={:?} live={place:?}",
             row.id,

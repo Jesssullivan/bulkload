@@ -1315,9 +1315,7 @@ pub(crate) fn negotiate(
     }
     let framed = bulkload_agent::git_carry::preview::frame(ask)?;
     pull_command(Remote::Negotiate, &pull, |input, output| {
-        output
-            .write_all(&framed)
-            .refuse_at("main::negotiate")?;
+        output.write_all(&framed).refuse_at("main::negotiate")?;
         output.flush().refuse_at("main::negotiate")?;
         bulkload_agent::git_carry::preview::unframe(input)
     })?

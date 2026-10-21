@@ -904,6 +904,10 @@ mod tests {
         assert!(!plain.status.success(), "the stale graph fails plain fsck");
         let snapshot = snapshot(&repo).unwrap();
         assert_eq!(snapshot.missing, 0);
-        assert_eq!(fs::read(&graph).unwrap(), before, "the graph is never written");
+        assert_eq!(
+            fs::read(&graph).unwrap(),
+            before,
+            "the graph is never written"
+        );
     }
 }

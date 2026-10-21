@@ -3195,7 +3195,9 @@ fn plan_line<'a>(stdout: &'a str, path: &Path) -> &'a str {
     stdout
         .lines()
         .find(|line| {
-            line.starts_with("estate-move item=") && line.ends_with(&live) && line.contains(" action=")
+            line.starts_with("estate-move item=")
+                && line.ends_with(&live)
+                && line.contains(" action=")
         })
         .unwrap_or_else(|| panic!("no plan line for {live}:\n{stdout}"))
 }
@@ -3219,19 +3221,34 @@ fn the_plan_prints_every_b2_decision_and_writes_nothing() {
     git(&source, &["commit", "--quiet", "-m", "c0"]);
     git(
         &world.dst(),
-        &["clone", "--quiet", "--template=", source.to_str().unwrap(), "p"],
+        &[
+            "clone",
+            "--quiet",
+            "--template=",
+            source.to_str().unwrap(),
+            "p",
+        ],
     );
     git(&live, &["remote", "remove", "origin"]);
     // A branch only neo has; one both moved apart.
     git(&source, &["branch", "topic"]);
     git(&source, &["checkout", "--quiet", "topic"]);
-    git(&source, &["commit", "--quiet", "--allow-empty", "-m", "topic work"]);
+    git(
+        &source,
+        &["commit", "--quiet", "--allow-empty", "-m", "topic work"],
+    );
     git(&source, &["checkout", "--quiet", "-b", "div", "main"]);
-    git(&source, &["commit", "--quiet", "--allow-empty", "-m", "neo div"]);
+    git(
+        &source,
+        &["commit", "--quiet", "--allow-empty", "-m", "neo div"],
+    );
     git(&source, &["checkout", "--quiet", "main"]);
     git(&live, &["branch", "div"]);
     git(&live, &["checkout", "--quiet", "div"]);
-    git(&live, &["commit", "--quiet", "--allow-empty", "-m", "sting div"]);
+    git(
+        &live,
+        &["commit", "--quiet", "--allow-empty", "-m", "sting div"],
+    );
     git(&live, &["checkout", "--quiet", "main"]);
     // Uncommitted on both sides: f.txt merges, g.txt conflicts; neo's new
     // file lands.
@@ -3283,10 +3300,15 @@ fn the_plan_prints_every_b2_decision_and_writes_nothing() {
     assert_eq!(summary["consolidate"], "1", "{both}");
     assert_eq!(summary["conflicts"], "1", "{both}");
     let rows = fs::read_to_string(world.state().join("diff.jsonl")).unwrap();
-    for (path, verdict) in [("f.txt", "merged"), ("g.txt", "conflict"), ("new.txt", "land")] {
+    for (path, verdict) in [
+        ("f.txt", "merged"),
+        ("g.txt", "conflict"),
+        ("new.txt", "land"),
+    ] {
         assert!(
-            rows.lines().any(|row| row.contains(&format!("\"path\":\"{path}\""))
-                && row.contains(&format!("\"verdict\":\"{verdict}\""))),
+            rows.lines()
+                .any(|row| row.contains(&format!("\"path\":\"{path}\""))
+                    && row.contains(&format!("\"verdict\":\"{verdict}\""))),
             "{path} {verdict}:\n{rows}"
         );
     }
@@ -3355,8 +3377,14 @@ fn a_refused_capture_is_held_and_nothing_is_written_beside_or_live() {
             "a copy beside: {name}\n{both}"
         );
     }
-    let mine: Vec<_> = before.iter().filter(|rel| rel.starts_with("other")).collect();
-    let still: Vec<_> = after.iter().filter(|rel| rel.starts_with("other")).collect();
+    let mine: Vec<_> = before
+        .iter()
+        .filter(|rel| rel.starts_with("other"))
+        .collect();
+    let still: Vec<_> = after
+        .iter()
+        .filter(|rel| rel.starts_with("other"))
+        .collect();
     assert_eq!(mine, still, "the occupied live path is untouched");
 }
 
@@ -3373,7 +3401,14 @@ fn a_path_outside_the_maps_lands_under_the_destination_home() {
     let outside = src_home.join(".cache/lanes/wt");
     git(
         &land,
-        &["worktree", "add", "--quiet", "-b", "wt", outside.to_str().unwrap()],
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "wt",
+            outside.to_str().unwrap(),
+        ],
     );
     let map = format!("{}={}", world.src().display(), world.dst().display());
     let sourced = agent_home(
@@ -3419,10 +3454,13 @@ fn a_path_outside_the_maps_lands_under_the_destination_home() {
         assert_eq!(mode, 0o700, "{} {both}", level.display());
     }
     assert_eq!(
-        out(&world.dst().join("land"), &["worktree", "list", "--porcelain"])
-            .lines()
-            .filter(|line| line.starts_with("worktree "))
-            .count(),
+        out(
+            &world.dst().join("land"),
+            &["worktree", "list", "--porcelain"]
+        )
+        .lines()
+        .filter(|line| line.starts_with("worktree "))
+        .count(),
         2,
         "{both}"
     );
