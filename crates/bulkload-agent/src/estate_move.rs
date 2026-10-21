@@ -817,6 +817,11 @@ fn move_command(args: &[OsString]) -> Result<()> {
         out(&format!("estate-move state=retired path={path:?}"))
     })?;
     let passed = move_pass(&run);
+    // `--key-map-proof` is report-only (#294): it writes nothing and prints
+    // no phase line, the state line included.
+    if run.mode == Mode::KeyMapProof {
+        return passed;
+    }
     finish("estate-move", &run.states(), passed)
 }
 
