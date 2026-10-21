@@ -793,8 +793,13 @@ pub fn reseat(
         let landed = options.landed_codex(&rel);
         let placer = Placer::new(ledger, &dest.root)
             .with_archived(&options.replace_archived)
-            .with_kept_suffix(options.beside_suffix.as_deref())
-            .with_rebind(&options.rebind);
+            .with_rebind(&options.rebind)
+            .with_beside(
+                options
+                    .beside_suffix
+                    .as_deref()
+                    .filter(|_| options.live_codex_landing()),
+            );
         let outcome = placer
             .place(&landed, &dest_rel, Kind::Rollout, &thread.id, None)?
             .outcome;
@@ -1847,8 +1852,13 @@ fn reseat_unindexed(
         }
         let placer = Placer::new(ledger, &dest.root)
             .with_archived(&options.replace_archived)
-            .with_kept_suffix(options.beside_suffix.as_deref())
-            .with_rebind(&options.rebind);
+            .with_rebind(&options.rebind)
+            .with_beside(
+                options
+                    .beside_suffix
+                    .as_deref()
+                    .filter(|_| options.live_codex_landing()),
+            );
         let outcome = placer
             .place(&landed, &dest_rel, Kind::Rollout, &id, None)?
             .outcome;

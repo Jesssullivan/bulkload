@@ -85,6 +85,7 @@ pub mod durable {
 }
 
 pub mod priority;
+pub mod procs;
 
 /// Open-file limits and the destination's descriptor budget (M2 W3).
 pub mod limits {

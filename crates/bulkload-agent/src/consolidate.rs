@@ -6,7 +6,7 @@
 //! union into DEST (C10; LIVE-15, LIVE-18, CONF-05, KEEP-36).
 //!
 //! Each file [`Class`] has its own [`Union`]:
-//! - append logs: the #294 lane's JSONL union;
+//! - append logs: [`append_log`], the #294 lane's JSONL union;
 //! - structured config: [`config`], JSON and TOML merged key by key;
 //! - Codex `SQLite`: the row union ([`crate::sqlite_union`]), over its own
 //!   serve session per store, never this file path;
@@ -22,6 +22,7 @@
 use std::fs::File;
 use std::path::Path;
 
+pub mod append_log;
 pub mod config;
 pub mod json;
 pub mod ledger;
@@ -207,9 +208,10 @@ pub fn union_of(class: Class) -> Option<Union> {
     match class {
         Class::Config(_) => Some(config::union),
         Class::Opaque => Some(opaque),
-        // The #294 lane's JSONL union; a store takes the row union
-        // (`sqlite_union::union_routed`), never a file union.
-        Class::AppendLog | Class::Sqlite => None,
+        Class::AppendLog => Some(append_log::union),
+        // A store takes the row union (`sqlite_union::union_routed`),
+        // never a file union.
+        Class::Sqlite => None,
     }
 }
 

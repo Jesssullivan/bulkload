@@ -5,7 +5,8 @@
 //! - A differing JSON or TOML file is merged into the live file in place,
 //!   and nothing is left beside it.
 //! - An append log is extended (a live prefix), covered (the live file holds
-//!   the source's bytes), or held until the JSONL union lands.
+//!   the source's bytes), or consolidated by the #294 lane's JSONL union:
+//!   one file, the source's bytes then the live file's lines it lacks.
 //! - An opaque file and a live path of another kind are held
 //!   `HOMES_CONSOLIDATE_UNSUPPORTED`, with nothing written. A `SQLite`
 //!   store and its sidecars are routed to the row union
@@ -39,6 +40,7 @@ impl Consolidating {
                 maps: crate::consolidate::Maps::default(),
                 ledger: self.state().join("consolidate"),
                 plan_only,
+                archived: Vec::new(),
             })),
         );
     }
@@ -206,7 +208,11 @@ fn a_differing_config_is_merged_in_place_and_nothing_lands_beside() {
 }
 
 #[test]
-fn an_append_log_is_extended_covered_or_held() {
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "a union that writes needs the open-file check (Linux only; elsewhere HOMES_CONSOLIDATE_HOLDER_UNKNOWN)"
+)]
+fn an_append_log_is_extended_covered_or_consolidated() {
     let run = Consolidating::new(false);
     let (source, destination) = (run.source(), run.destination());
     let grown = noise(401, 400_000);
@@ -217,17 +223,28 @@ fn an_append_log_is_extended_covered_or_held() {
     longer.extend_from_slice(&noise(403, 50_000));
     std::fs::write(source.join("continued.jsonl"), &continued).unwrap();
     std::fs::write(destination.join("continued.jsonl"), &longer).unwrap();
-    let diverged = noise(404, 300_000);
+    let lines = |tag: &str, count: usize| -> Vec<u8> {
+        (0..count).fold(Vec::new(), |mut bytes, at| {
+            bytes.extend_from_slice(format!("{{\"{tag}\":{at}}}\n").as_bytes());
+            bytes
+        })
+    };
+    let mut diverged = lines("shared", 10_000);
+    let mut theirs = diverged.clone();
+    diverged.extend_from_slice(&lines("neo", 100));
+    theirs.extend_from_slice(&lines("sting", 100));
     std::fs::write(source.join("diverged.jsonl"), &diverged).unwrap();
-    std::fs::write(destination.join("diverged.jsonl"), noise(405, 300_000)).unwrap();
-    let theirs = std::fs::read(destination.join("diverged.jsonl")).unwrap();
+    std::fs::write(destination.join("diverged.jsonl"), &theirs).unwrap();
     run.settle();
 
     let stats = run.run();
-    assert_eq!(held(&stats), ["diverged.jsonl"]);
+    assert!(held(&stats).is_empty(), "{:?}", held(&stats));
     assert_eq!(
         consolidated(&stats),
-        [("continued.jsonl".to_owned(), "covered".to_owned())]
+        [
+            ("continued.jsonl".to_owned(), "covered".to_owned()),
+            ("diverged.jsonl".to_owned(), "consolidate".to_owned()),
+        ]
     );
     assert_eq!(
         stats.prefix_extended.len(),
@@ -243,18 +260,20 @@ fn an_append_log_is_extended_covered_or_held() {
         std::fs::read(destination.join("continued.jsonl")).unwrap(),
         longer
     );
+    let mut union = diverged.clone();
+    union.extend_from_slice(&lines("sting", 100));
     assert_eq!(
         std::fs::read(destination.join("diverged.jsonl")).unwrap(),
-        theirs
+        union,
+        "one file: the source's bytes, then the live file's lines"
     );
     run.no_temporaries();
     run.no_payload_in_state(&diverged[..4096]);
     run.no_payload_in_state(&grown[200_000..204_096]);
 
-    // Unchanged: the covered seat is reused and the held one is held again,
-    // with 0 source bytes read.
+    // Unchanged: every seat is reused, with 0 source bytes read.
     let again = run.run();
-    assert_eq!(held(&again), ["diverged.jsonl"]);
+    assert!(held(&again).is_empty());
     assert_eq!(again.source_bytes_read, 0);
 }
 

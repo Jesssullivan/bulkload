@@ -381,8 +381,9 @@ pub struct TransferDetail {
     /// The refused or covered path (entry rows).
     pub path: Option<Vec<u8>>,
     /// The row's outcome name: `completed`, `running` or `refused` for a
-    /// session, `refused`, `sidecar-covered` or `applied-beside` for an
-    /// entry, `null` with no readable record.
+    /// session, `refused`, `sidecar-covered`, `applied-beside`,
+    /// `consolidated` or `mapped` for an entry, `null` with no readable
+    /// record.
     pub outcome: Option<&'static str>,
     /// The recorded refusal, typed or not.
     pub refusal: Option<crate::outcome::Refusal>,
@@ -390,6 +391,9 @@ pub struct TransferDetail {
     pub sqlite_code: Option<i32>,
     /// The beside path an `applied-beside` entry landed at (`--beside`).
     pub beside: Option<Vec<u8>>,
+    /// The destination path a `mapped` entry's source path landed at
+    /// (`--map-prefix`, #280 finding 9).
+    pub mapped: Option<Vec<u8>>,
     /// A `consolidated` entry's action (`--consolidate`).
     pub consolidation: Option<String>,
 }
@@ -1178,6 +1182,13 @@ fn write_transfer(out: &mut String, row: &Row, detail: &TransferDetail) {
             json_string(&beside.escape_ascii().to_string())
         );
     }
+    if let Some(mapped) = &detail.mapped {
+        let _ = write!(
+            out,
+            ",\"mapped\":{}",
+            json_string(&mapped.escape_ascii().to_string())
+        );
+    }
     if let Some(action) = &detail.consolidation {
         let _ = write!(out, ",\"consolidation\":{}", json_string(action));
     }
@@ -1274,6 +1285,7 @@ fn unrecorded(state: &std::path::Path, item: String, source: &str, why: &'static
             refusal: None,
             sqlite_code: None,
             beside: None,
+            mapped: None,
             consolidation: None,
         },
     )
@@ -1328,6 +1340,7 @@ fn record_rows(
         refusal,
         sqlite_code,
         beside: None,
+        mapped: None,
         consolidation: None,
     };
     let record = match read {
@@ -1414,6 +1427,9 @@ fn record_rows(
                 Disposition::AppliedBeside,
                 None,
             ),
+            // `--map-prefix`: the source path landed at its mapped path,
+            // accounted as the session's applied entries are.
+            EntryOutcome::Mapped { .. } => ("mapped", None, None, Disposition::Applied, None),
             // `--consolidate`: the seat's bytes are in the live file, merged
             // or already there; accounted as covered (operator ruling
             // 2026-10-20).
@@ -1434,10 +1450,12 @@ fn record_rows(
                 None,
             ),
         );
-        if let (EntryOutcome::AppliedBeside { beside }, Some(detail)) =
-            (&entry.outcome, entry_row.transfer.as_mut())
-        {
-            detail.beside = Some(beside.clone());
+        if let Some(detail) = entry_row.transfer.as_mut() {
+            match &entry.outcome {
+                EntryOutcome::AppliedBeside { beside } => detail.beside = Some(beside.clone()),
+                EntryOutcome::Mapped { to } => detail.mapped = Some(to.clone()),
+                _ => {}
+            }
         }
         if let (EntryOutcome::Consolidated { action }, Some(detail)) =
             (&entry.outcome, entry_row.transfer.as_mut())

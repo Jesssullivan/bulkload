@@ -412,6 +412,14 @@ counters! {
     // `--replace-archived-dest` root, replaced by the differing landed
     // file (A-106; the archive target kept, the link ledgered).
     ReseatArchivedReplaced => "reseat_archived_replaced",
+    // Landed files the pull put beside an archive link (`<name><suffix>`),
+    // removed once an A-106 replacement placed their whole bytes at
+    // `<name>`: one copy of the source's bytes (#280 finding 9).
+    ReseatBesideConsumed => "reseat_beside_consumed",
+    // Re-seat copies of an append log a race left (an A-106 swap-back's
+    // written copy, a Q198 regularization's copy) unioned into the live
+    // file and removed (SPEC #298 rules 3, 4; `reseat::fold`).
+    ReseatCopyFolded => "reseat_copy_folded",
     // Bounded starvation (M2 item 3): a process at background priority
     // whose counters did not move for `--escalate-after` seconds moved its
     // IO back to the normal class once (`priority::escalate`): how many
