@@ -511,5 +511,4 @@ ok.
   stays kept and held until it can be unioned.
 - A link outside the archive roots, and a session held under a key that
   is no map source, stay held (`OTHER_KIND`, `held_elsewhere`).
-- Empty source-key directories left after folds stay (no directory is removed).
 - `just darwin-check` on pzm is owed before merge.
