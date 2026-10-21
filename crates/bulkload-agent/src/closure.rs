@@ -390,6 +390,8 @@ pub struct TransferDetail {
     pub sqlite_code: Option<i32>,
     /// The beside path an `applied-beside` entry landed at (`--beside`).
     pub beside: Option<Vec<u8>>,
+    /// A `consolidated` entry's action (`--consolidate`).
+    pub consolidation: Option<String>,
 }
 
 /// The ruling that gives a transfer refusal its default disposition.
@@ -1176,6 +1178,9 @@ fn write_transfer(out: &mut String, row: &Row, detail: &TransferDetail) {
             json_string(&beside.escape_ascii().to_string())
         );
     }
+    if let Some(action) = &detail.consolidation {
+        let _ = write!(out, ",\"consolidation\":{}", json_string(action));
+    }
     if let Some(refusal) = &detail.refusal {
         let _ = write!(
             out,
@@ -1269,6 +1274,7 @@ fn unrecorded(state: &std::path::Path, item: String, source: &str, why: &'static
             refusal: None,
             sqlite_code: None,
             beside: None,
+            consolidation: None,
         },
     )
 }
@@ -1322,6 +1328,7 @@ fn record_rows(
         refusal,
         sqlite_code,
         beside: None,
+        consolidation: None,
     };
     let record = match read {
         None => {
@@ -1407,6 +1414,12 @@ fn record_rows(
                 Disposition::AppliedBeside,
                 None,
             ),
+            // `--consolidate`: the seat's bytes are in the live file, merged
+            // or already there; accounted as covered (operator ruling
+            // 2026-10-20).
+            EntryOutcome::Consolidated { .. } => {
+                ("consolidated", None, None, Disposition::Covered, None)
+            }
         };
         let mut entry_row = transfer_row(
             record.entry_item(entry),
@@ -1425,6 +1438,11 @@ fn record_rows(
             (&entry.outcome, entry_row.transfer.as_mut())
         {
             detail.beside = Some(beside.clone());
+        }
+        if let (EntryOutcome::Consolidated { action }, Some(detail)) =
+            (&entry.outcome, entry_row.transfer.as_mut())
+        {
+            detail.consolidation = Some(action.clone());
         }
         entry_row.kind = RowKind::TransferEntry;
         // Only a typed refusal can carry a default: a bare IO never counts.

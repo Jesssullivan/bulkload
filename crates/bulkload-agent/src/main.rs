@@ -32,7 +32,7 @@ USAGE:
 SUBCOMMANDS:
     selftest    Hash a temporary file and round-trip a postcard frame
     walk PATH   Stat-walk PATH and print the row and refusal counts
-    copy [--file] [--beside SUFFIX] SOURCE DEST SOURCE_STATE DEST_STATE
+    copy [--file] [--consolidate [--consolidate-map SRC=DST]... [--plan-only]] SOURCE DEST SOURCE_STATE DEST_STATE
                 Native local copy with private resumable chunk stores; the
                 session's outcomes are recorded in
                 DEST_STATE/transfer.closure.d, one record per transfer, for
@@ -41,27 +41,33 @@ SUBCOMMANDS:
                 keeps the earlier session's refused rows. --file: SOURCE is
                 one file (or symlink, carried as a link), landed as DEST
                 (#232; BOUNDARIES).
-                --beside SUFFIX (plan of record 2026-10-19, C1/C2): land
-                into a live destination. An existing file bulkload did not
-                write is adopted when its bytes are the source's and
-                extended when it is a verified byte prefix of an
-                append-only source (as without the flag); one that differs
-                (and a symlink that differs, and a node of another kind,
-                directories included) is left as it is and the source's
-                bytes are published at <path>SUFFIX, recorded
-                applied-beside in the transfer record (closure counts it
-                carried, never pending review). A database with a live
-                -wal/-shm/-journal beside it lands its snapshot at
-                <db>SUFFIX. A beside path holding something of its own is
-                refused DESTINATION_OCCUPIED; only this store's own earlier
-                beside output is superseded. A live path is never replaced
-                under the flag. SUFFIX is one name component (e.g.
-                .neo-20261019). Without the flag a differing file is
-                refused DESTINATION_OCCUPIED and nothing is placed
-    pull [--file] [--beside SUFFIX] HOST SOURCE DEST SOURCE_STATE DEST_STATE [REMOTE_EXECUTABLE [SSH_CONFIG]]
+                Without --consolidate an existing destination file
+                bulkload did not write is adopted when its bytes are the
+                source's, extended when it is a verified byte prefix of an
+                append-only source, and otherwise refused
+                DESTINATION_OCCUPIED with nothing placed. Nothing is ever
+                landed beside a live file (SPEC rule 3).
+                --consolidate (operator ruling 2026-10-20; SPEC RUL-10):
+                land into a live destination by union, never beside. A
+                differing file is judged by its class: an append log
+                (*.jsonl) is covered when the live file already holds
+                the source's bytes, extended when it is their prefix,
+                and otherwise held until the JSONL union lands (#294); a
+                JSON or TOML file is received in memory and merged key
+                by key into the live file (the later-modified side's
+                value kept where both differ, the other recorded in
+                DEST_STATE/consolidate/consolidate.sqlite); a SQLite
+                store, its sidecars and any other file are held. A held
+                file is refused HOMES_CONSOLIDATE_UNSUPPORTED with
+                nothing written. --consolidate-map SRC=DST: a source
+                path prefix is compared and written as DST. --plan-only:
+                every file is decided and printed (planned PATH class=
+                action= source_size= live_size=), and nothing is staged,
+                written or recorded
+    pull [--file] [--consolidate [--consolidate-map SRC=DST]... [--plan-only]] HOST SOURCE DEST SOURCE_STATE DEST_STATE [REMOTE_EXECUTABLE [SSH_CONFIG]]
                 Native SSH pull; remote bulkload-agent must be installed; the
                 session is recorded in DEST_STATE as copy's is. --file as
-                copy's, run on the source as serve --file; --beside as
+                copy's, run on the source as serve --file; --consolidate as
                 copy's
     serve [--file]
                 Serve one framed request on stdin/stdout (for SSH). With
@@ -292,32 +298,35 @@ SUBCOMMANDS:
                 (unless --no-hand-off). 6 with --sessions (plan of record
                 2026-10-19, C9/C10/C11; no intermediary stage):
                 SOURCE_HOME/.claude and the Codex root (--codex-source-root,
-                default SOURCE_HOME/.codex) are pulled with --beside .LABEL
-                into the LIVE DEST_HOME/.claude and DEST_HOME/.codex
-                (--dest-home, default $HOME; a home that is a symlink, as
-                sting's are, is resolved once to its real directory, which
-                this user must own, and named on an estate-move
-                sessions-home line), transfer records in
-                MOVE_STATE/pull/{claude,codex}: equal files adopted, grown
-                append-only files extended, differing files, nodes of
-                another kind (directories included) and the Codex index's
-                snapshot landed beside as <path>.LABEL. Then,
-                when both sessions completed (paths refused in them stay
-                typed refusals in closure), estate-reseat --lanes-from-plan
-                with each --map and --reseat-arg (one estate-reseat option
-                per flag, e.g. --no-regularize, --unmapped=by-id) re-keys
-                the landed sessions from the live home into DEST_HOME
-                (landing = DEST_HOME, --beside-suffix .LABEL; the landed
-                Codex index is the state_5.sqlite.LABEL this pass's record
-                names, else none; a destination with no index is seeded
-                from it). A destination transcript or rollout that links
-                into a --replace-archived-dest ROOT is replaced by the
-                source's copy of that session (A-106); one with no source
-                copy stays, in place. State MOVE_STATE/reseat. 7
+                default SOURCE_HOME/.codex) and SOURCE_HOME/.claude.json
+                are pulled with --consolidate (operator ruling 2026-10-20:
+                consolidated, never beside; --map and SOURCE_HOME=DEST_HOME
+                translate source paths; ledger MOVE_STATE/consolidate) into
+                the LIVE DEST_HOME/.claude, DEST_HOME/.claude.json and
+                DEST_HOME/.codex (--dest-home, default $HOME; a home that is
+                a symlink, as sting's are, is resolved once to its real
+                directory, which this user must own, and named on an
+                estate-move sessions-home line), transfer records in
+                MOVE_STATE/pull/{claude,claude-json,codex}. A differing file
+                is merged by its class's union or held
+                HOMES_CONSOLIDATE_UNSUPPORTED with nothing written; the
+                Codex stores are held for their row union. Then, when the
+                sessions completed (held paths stay typed refusals in
+                closure), estate-reseat --lanes-from-plan with each --map
+                and --reseat-arg (one estate-reseat option per flag, e.g.
+                --no-regularize, --unmapped=by-id) re-keys the landed
+                sessions from the live home into DEST_HOME (landing =
+                DEST_HOME). --replace-archived-dest is no longer forwarded:
+                A-106 is a union (estate-move a106=union-pending), and a
+                destination archive link is never replaced by the source's
+                copy. With --plan-only --sessions every home file is listed
+                (planned PATH class= action= source_size= live_size=) and
+                nothing is landed, merged or recorded. State
+                MOVE_STATE/reseat. 7
                 closure: closure-report over the plan (with --dispositions, the
                 closure-dispose ledger joined) and, with --sessions, over the
-                two session transfer records (applied-beside accounted,
-                refused paths pending review), written to
+                session transfer records (consolidated files accounted,
+                held paths pending review), written to
                 MOVE_STATE/closure.json, summarised on an estate-move closure
                 line with not_moved= (the source notes) and, with --sessions,
                 sessions= and reseat_unaccounted= (re-seat outcomes that
@@ -1129,14 +1138,24 @@ fn global_flags(
 /// `copy [--file] ...` and `pull [--file] ...`: a leading `--file` (#232)
 /// names a single-file root.
 fn transfer_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
-    let args = beside_option(args)?;
-    let (kind, args) = root_kind(args);
-    let args = beside_option(args)?;
+    let (kind, consolidate, args) = transfer_options(args)?;
     let path = |index: usize| {
         args.get(index)
             .map(Path::new)
             .ok_or(BulkloadRefusal::RequiredFieldMissing)
     };
+    if let Some((maps, plan_only)) = consolidate {
+        // The ledger of the values a union did not keep, in DEST_STATE.
+        let state = match command {
+            "copy" => path(3)?,
+            _ => path(4)?,
+        };
+        bulkload_agent::transfer::set_consolidate(Some(bulkload_agent::transfer::Consolidation {
+            maps: bulkload_agent::consolidate::Maps::new(maps),
+            ledger: state.join("consolidate"),
+            plan_only,
+        }));
+    }
     match command {
         "copy" if args.len() == 4 => {
             // WP3 PR 4: the session's outcomes are closure rows.
@@ -1179,6 +1198,63 @@ fn serve_command(args: &[std::ffi::OsString]) -> Result<()> {
     // The reader thread owns stdin for the session; the process exit closes
     // the transport.
     bulkload_agent::transfer::serve_kind(input, &mut output.lock(), kind)
+}
+
+/// A transfer verb's leading options, in any order: `--file` (#232), and
+/// `--consolidate` with its `--consolidate-map SRC=DST` pairs and
+/// `--plan-only` (operator ruling 2026-10-20). `--plan-only` and a map need
+/// `--consolidate`. There is no `--beside`: nothing lands beside a live
+/// file (SPEC rule 3); the word is refused `FIELD_DOMAIN_VIOLATION`.
+#[allow(clippy::type_complexity)]
+fn transfer_options(
+    args: &[std::ffi::OsString],
+) -> Result<(
+    bulkload_agent::transfer::RootKind,
+    Option<(Vec<(String, String)>, bool)>,
+    &[std::ffi::OsString],
+)> {
+    let mut kind = bulkload_agent::transfer::RootKind::Tree;
+    let (mut consolidate, mut plan_only) = (false, false);
+    let mut maps = Vec::new();
+    let mut rest = args;
+    loop {
+        let before = rest.len();
+        let (found, after) = root_kind(rest);
+        if after.len() < rest.len() {
+            kind = found;
+            rest = after;
+        }
+        match rest.first().and_then(|word| word.to_str()) {
+            Some("--consolidate") => {
+                consolidate = true;
+                rest = rest.get(1..).unwrap_or_default();
+            }
+            Some("--plan-only") => {
+                plan_only = true;
+                rest = rest.get(1..).unwrap_or_default();
+            }
+            Some("--consolidate-map") => {
+                let pair = rest
+                    .get(1)
+                    .and_then(|pair| pair.to_str())
+                    .and_then(|pair| pair.split_once('='))
+                    .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+                maps.push((pair.0.to_owned(), pair.1.to_owned()));
+                rest = rest.get(2..).unwrap_or_default();
+            }
+            Some(word) if word == "--beside" || word.starts_with("--beside=") => {
+                return Err(BulkloadRefusal::FieldDomainViolation);
+            }
+            _ => {}
+        }
+        if rest.len() == before {
+            break;
+        }
+    }
+    if !consolidate && (plan_only || !maps.is_empty()) {
+        return Err(BulkloadRefusal::FieldDomainViolation);
+    }
+    Ok((kind, consolidate.then_some((maps, plan_only)), rest))
 }
 
 /// Split a leading `--file` (#232) from a transfer verb's arguments: the
@@ -1468,30 +1544,6 @@ fn export_command(
     }
     println!("{}", export.bundle.display());
     Ok(())
-}
-
-/// Take a leading `--beside SUFFIX` (or `--beside=SUFFIX`) off `args`,
-/// setting the process's beside suffix, and return the rest.
-fn beside_option(args: &[std::ffi::OsString]) -> Result<&[std::ffi::OsString]> {
-    use std::os::unix::ffi::OsStrExt as _;
-    let Some(first) = args.first() else {
-        return Ok(args);
-    };
-    let (suffix, taken) = if first.as_os_str() == "--beside" {
-        (
-            args.get(1)
-                .ok_or(BulkloadRefusal::RequiredFieldMissing)?
-                .as_bytes()
-                .to_vec(),
-            2,
-        )
-    } else if let Some(value) = first.as_bytes().strip_prefix(b"--beside=") {
-        (value.to_vec(), 1)
-    } else {
-        return Ok(args);
-    };
-    bulkload_agent::transfer::set_beside_suffix(Some(suffix))?;
-    Ok(args.get(taken..).unwrap_or_default())
 }
 
 #[allow(clippy::too_many_lines)] // One arm per verb; `--beside` for copy and pull.
@@ -2078,8 +2130,13 @@ fn reseat_run(args: &[std::ffi::OsString]) -> Result<Option<bulkload_agent::rese
             "--beside-suffix" => {
                 let suffix = value(at + 1)?
                     .to_str()
+                    // One name component: what an earlier pass's beside
+                    // copies (#280, before SPEC rule 3) were named with.
                     .filter(|suffix| {
-                        bulkload_agent::transfer::beside_suffix_allowed(suffix.as_bytes())
+                        !suffix.is_empty()
+                            && !suffix.contains(['/', '\0'])
+                            && *suffix != "."
+                            && *suffix != ".."
                     })
                     .ok_or(BulkloadRefusal::FieldDomainViolation)?;
                 beside_suffix = Some(suffix.to_owned());
@@ -2589,16 +2646,6 @@ fn take_listed() -> Option<Vec<Vec<u8>>> {
         .take()
 }
 
-fn copy_recorded(source: &Path, dest: &Path, source_state: &Path, dest_state: &Path) -> Result<()> {
-    copy_recorded_kind(
-        bulkload_agent::transfer::RootKind::Tree,
-        source,
-        dest,
-        source_state,
-        dest_state,
-    )
-}
-
 // #232: `copy_recorded` of a root of `kind` (`copy --file`).
 fn copy_recorded_kind(
     kind: bulkload_agent::transfer::RootKind,
@@ -2607,6 +2654,20 @@ fn copy_recorded_kind(
     source_state: &Path,
     dest_state: &Path,
 ) -> Result<()> {
+    // `--plan-only`: nothing is recorded; the plan is printed.
+    if bulkload_agent::transfer::plan_only() {
+        bulkload_agent::transfer::copy_roots_apart_kind(
+            source,
+            dest,
+            source_state,
+            dest_state,
+            kind,
+        )?;
+        let stats =
+            bulkload_agent::transfer::copy_kind(source, dest, source_state, dest_state, kind)?;
+        keep_listed(&stats);
+        return report_transfer(&stats);
+    }
     let stats = bulkload_agent::transfer_outcome::record_session(
         dest_state,
         "copy",
@@ -2631,10 +2692,6 @@ fn copy_recorded_kind(
 // WP3 PR 4: a pull session's outcomes are closure rows, keyed on
 // HOST:SOURCE and the canonical DEST, recorded in DEST_STATE around the
 // session (`pull_command`, whose ssh child the S2 registry pins).
-fn pull_recorded(args: &[std::ffi::OsString]) -> Result<()> {
-    pull_recorded_kind(bulkload_agent::transfer::RootKind::Tree, args)
-}
-
 // #232: `pull_recorded` of a root of `kind` (`pull --file`).
 fn pull_recorded_kind(
     kind: bulkload_agent::transfer::RootKind,
@@ -2646,6 +2703,13 @@ fn pull_recorded_kind(
             .ok_or(BulkloadRefusal::RequiredFieldMissing)
     };
     let host = args.first().ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+    // `--plan-only`: nothing is recorded; the plan is printed.
+    if bulkload_agent::transfer::plan_only() {
+        bulkload_agent::transfer::receive_roots_apart_kind(path(2)?, path(4)?, kind)?;
+        let stats = pull_command(kind, args)?;
+        keep_listed(&stats);
+        return report_transfer(&stats);
+    }
     bulkload_agent::transfer_outcome::record_session(
         path(4)?,
         "pull",
@@ -3149,7 +3213,7 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
     println!(
         "completed={} reused={} bytes_received={} source_bytes_read={} refusals={} \
          source_engine_temporaries={} capped_subtrees={} sqlite_mode={} sqlite_snapshots={} \
-         sqlite_sidecars_covered={} applied_beside={}",
+         sqlite_sidecars_covered={} consolidated={} held={} planned={}",
         stats.completed,
         stats.reused,
         stats.bytes_received,
@@ -3160,13 +3224,31 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
         bulkload_agent::transfer::sqlite_mode_label(stats.sqlite_mode),
         stats.sqlite_snapshots.len(),
         stats.sqlite_sidecars_covered.len(),
-        stats.applied_beside.len()
+        stats.consolidated.len(),
+        stats.held.len(),
+        stats.planned.len(),
     );
-    for (path, beside) in &stats.applied_beside {
+    for (path, action) in &stats.consolidated {
+        eprintln!("consolidated {} action={action}", path.escape_ascii());
+    }
+    for (path, reason) in &stats.held {
         eprintln!(
-            "applied-beside {} at={}",
-            path.escape_ascii(),
-            beside.escape_ascii()
+            "held {}: HOMES_CONSOLIDATE_UNSUPPORTED reason=\"{reason}\"",
+            path.escape_ascii()
+        );
+    }
+    // `--plan-only`: every seat and its action, on stdout.
+    for seat in &stats.planned {
+        println!(
+            "planned {} class={} action={} source_size={} live_size={}{}",
+            seat.rel_path.escape_ascii(),
+            seat.class,
+            seat.action,
+            seat.source_size,
+            seat.live_size
+                .map_or_else(|| "-".to_owned(), |size| size.to_string()),
+            seat.reason
+                .map_or_else(String::new, |reason| format!(" reason=\"{reason}\"")),
         );
     }
     for (path, code) in &stats.refusals {

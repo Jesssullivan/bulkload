@@ -2,7 +2,7 @@
 //!
 //! Each variant has a stable machine-readable code, and variants are grouped
 //! into families by prefix: `Snapshot*`, `Capture*`, `Digest*`, `Git*`,
-//! `Sqlite*`, `Path*`, `Protocol*`, `Budget*` and `Reseat*`.
+//! `Sqlite*`, `Path*`, `Protocol*`, `Budget*`, `Reseat*` and `Homes*`.
 //!
 //! Every variant has at least one constructor outside test code
 //! (`crates/bulkload-agent/tests/refusal_taxonomy.rs`, WP3): a code nothing
@@ -530,6 +530,20 @@ pub enum BulkloadRefusal {
     /// hand-off note is missing), or a check component was not given.
     ReseatR0Failed,
 
+    // ---- agent homes ------------------------------------------------------
+    /// An agent-home file the consolidation does not merge (operator ruling
+    /// 2026-10-20: the homes are consolidated, never landed beside). It is
+    /// a file whose class has no union, an opaque or binary file whose bytes
+    /// differ, or a structured file that does not parse losslessly (a
+    /// duplicate key, a key two source keys translate to). Nothing is
+    /// written: the destination's file stands, and the file is listed for
+    /// review.
+    HomesConsolidateUnsupported,
+    /// A writer changed an agent-home file on every read of a consolidation
+    /// (`consolidate::config::ATTEMPTS`). Nothing is changed and nothing is
+    /// recorded. It is retryable: the next pass reads and merges it again.
+    HomesConsolidateRaced,
+
     // ---- SQLite row union ---------------------------------------------------
     /// `sqlite-union`: the source store's schema (its tables' `CREATE`
     /// statements, `user_version` or applied `_sqlx_migrations`) is not the
@@ -680,6 +694,8 @@ impl BulkloadRefusal {
             Self::ReseatRegularizeRaced => "RESEAT_REGULARIZE_RACED",
             Self::ReseatUndoTargetChanged => "RESEAT_UNDO_TARGET_CHANGED",
             Self::ReseatR0Failed => "RESEAT_R0_FAILED",
+            Self::HomesConsolidateUnsupported => "HOMES_CONSOLIDATE_UNSUPPORTED",
+            Self::HomesConsolidateRaced => "HOMES_CONSOLIDATE_RACED",
             Self::SqliteSchemaMismatch => "SQLITE_SCHEMA_MISMATCH",
             Self::SqliteUnionTargetAbsent => "SQLITE_UNION_TARGET_ABSENT",
             Self::SqliteUnionSourceNotWal => "SQLITE_UNION_SOURCE_NOT_WAL",
@@ -792,6 +808,8 @@ impl BulkloadRefusal {
         "RESEAT_REGULARIZE_RACED",
         "RESEAT_UNDO_TARGET_CHANGED",
         "RESEAT_R0_FAILED",
+        "HOMES_CONSOLIDATE_UNSUPPORTED",
+        "HOMES_CONSOLIDATE_RACED",
         "SQLITE_SCHEMA_MISMATCH",
         "SQLITE_UNION_TARGET_ABSENT",
         "SQLITE_UNION_SOURCE_NOT_WAL",
@@ -1073,6 +1091,8 @@ mod tests {
             BulkloadRefusal::ReseatRegularizeRaced,
             BulkloadRefusal::ReseatUndoTargetChanged,
             BulkloadRefusal::ReseatR0Failed,
+            BulkloadRefusal::HomesConsolidateUnsupported,
+            BulkloadRefusal::HomesConsolidateRaced,
             BulkloadRefusal::SqliteSchemaMismatch,
             BulkloadRefusal::SqliteUnionTargetAbsent,
             BulkloadRefusal::SqliteUnionSourceNotWal,
