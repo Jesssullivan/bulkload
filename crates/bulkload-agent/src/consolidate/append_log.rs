@@ -478,9 +478,7 @@ pub fn union_stream(
             Decided::Adopted => return Ok(nothing(Action::Adopted)),
             Decided::Covered => return Ok(nothing(Action::Covered)),
             Decided::Extended => {
-                if !free(live.path)? {
-                    return Err(BulkloadRefusal::HomesConsolidateRaced);
-                }
+                free(live.path)?;
                 if append_tail(live.dir, &name, &stat, (&source, stat.size, size))? {
                     // The live file now: the source's bytes, its own inode.
                     record(
@@ -501,9 +499,7 @@ pub fn union_stream(
                 keep,
                 source_records,
             } => {
-                if !free(live.path)? {
-                    return Err(BulkloadRefusal::HomesConsolidateRaced);
-                }
+                free(live.path)?;
                 let extra: u64 = keep.iter().map(|(_, length)| length).sum();
                 let output = Output::open(live.dir, live.name, feed, (size, &source))?;
                 let wrote = output.append(&read_live, &keep, size);
@@ -782,9 +778,8 @@ pub fn union_link(
     let Some(decided) = decide(&read_target, stat.size, &source, size, by_uuid(live.rel))? else {
         return Err(BulkloadRefusal::HomesConsolidateRaced);
     };
-    if !free(target)? || !free(live.path)? {
-        return Err(BulkloadRefusal::HomesConsolidateRaced);
-    }
+    free(target)?;
+    free(live.path)?;
     // The regular file the live name is to hold: the target's own bytes
     // where it covers the source, else the source's, then (a union) the
     // target's extra records.
@@ -870,10 +865,18 @@ pub fn union_link(
     })
 }
 
-/// No process holds `path` open (or works under it); `false` where this
-/// platform cannot say.
-fn free(path: &Path) -> Result<bool> {
-    Ok(matches!(crate::procs::inside(&[path])?, Some(pids) if pids.is_empty()))
+/// No process holds `path` open (or works under it).
+///
+/// # Errors
+/// `HOMES_CONSOLIDATE_RACED` when one does (retryable);
+/// `HOMES_CONSOLIDATE_HOLDER_UNKNOWN` where this platform cannot say
+/// (anything but Linux): nothing is written then.
+fn free(path: &Path) -> Result<()> {
+    match crate::procs::inside(&[path])? {
+        Some(pids) if pids.is_empty() => Ok(()),
+        Some(_) => Err(BulkloadRefusal::HomesConsolidateRaced),
+        None => Err(BulkloadRefusal::HomesConsolidateHolderUnknown),
+    }
 }
 
 /// The BLAKE3 of `[0, size)` of `read`, streamed.

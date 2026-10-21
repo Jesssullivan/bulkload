@@ -129,6 +129,7 @@ pub fn fold(
         Ok(_)
         | Err(
             BulkloadRefusal::HomesConsolidateRaced
+            | BulkloadRefusal::HomesConsolidateHolderUnknown
             | BulkloadRefusal::DestinationKindMismatch
             | BulkloadRefusal::PathEscapesRoot
             | BulkloadRefusal::DestinationExchangeUnsupported,

@@ -362,6 +362,10 @@ fn run_hooked(
 /// second copy stays (SPEC #298 rules 3 and 4). The next pass regularizes
 /// the whole transcript.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "a union that writes needs the open-file check (Linux only; elsewhere HOMES_CONSOLIDATE_HOLDER_UNKNOWN)"
+)]
 fn q198_2_rr_append_between_read_and_swap_keeps_both_copies() {
     let _serial = SERIAL
         .lock()
@@ -415,6 +419,10 @@ fn q198_2_rr_append_between_read_and_swap_keeps_both_copies() {
 /// session opened the path after the swap), both stay: the copy at the
 /// path, the archive untouched, and `--undo` refuses the row.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "a union that writes needs the open-file check (Linux only; elsewhere HOMES_CONSOLIDATE_HOLDER_UNKNOWN)"
+)]
 fn q198_2_rr_append_under_the_swap_keeps_both_copies() {
     let _serial = SERIAL
         .lock()

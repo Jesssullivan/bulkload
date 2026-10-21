@@ -549,6 +549,12 @@ pub enum BulkloadRefusal {
     /// (`consolidate::config::ATTEMPTS`). Nothing is changed and nothing is
     /// recorded. It is retryable: the next pass reads and merges it again.
     HomesConsolidateRaced,
+    /// An append-log union that would write (an extension, a union, a fold)
+    /// cannot tell whether a process holds the live file open: the open-file
+    /// check reads `/proc` and has no implementation on this platform (only
+    /// Linux; sting is Linux). Writing anyway could lose a writer's lines to
+    /// a file traded out, so nothing is written and the file is held, typed.
+    HomesConsolidateHolderUnknown,
 
     // ---- handoff proof ------------------------------------------------------
     /// A credential-class probe did not prove what it set out to prove.
@@ -682,6 +688,7 @@ impl BulkloadRefusal {
             Self::ReseatR0Failed => "RESEAT_R0_FAILED",
             Self::HomesConsolidateUnsupported => "HOMES_CONSOLIDATE_UNSUPPORTED",
             Self::HomesConsolidateRaced => "HOMES_CONSOLIDATE_RACED",
+            Self::HomesConsolidateHolderUnknown => "HOMES_CONSOLIDATE_HOLDER_UNKNOWN",
             Self::ProbeFailed => "PROBE_FAILED",
             Self::Io(_) => "IO",
         }
@@ -792,6 +799,7 @@ impl BulkloadRefusal {
         "RESEAT_R0_FAILED",
         "HOMES_CONSOLIDATE_UNSUPPORTED",
         "HOMES_CONSOLIDATE_RACED",
+        "HOMES_CONSOLIDATE_HOLDER_UNKNOWN",
         "PROBE_FAILED",
         "IO",
     ];
@@ -1071,6 +1079,7 @@ mod tests {
             BulkloadRefusal::ReseatR0Failed,
             BulkloadRefusal::HomesConsolidateUnsupported,
             BulkloadRefusal::HomesConsolidateRaced,
+            BulkloadRefusal::HomesConsolidateHolderUnknown,
             BulkloadRefusal::ProbeFailed,
             BulkloadRefusal::Io(None),
         ];

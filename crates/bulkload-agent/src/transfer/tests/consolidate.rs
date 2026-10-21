@@ -205,6 +205,10 @@ fn a_differing_config_is_merged_in_place_and_nothing_lands_beside() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "a union that writes needs the open-file check (Linux only; elsewhere HOMES_CONSOLIDATE_HOLDER_UNKNOWN)"
+)]
 fn an_append_log_is_extended_covered_or_consolidated() {
     let run = Consolidating::new(false);
     let (source, destination) = (run.source(), run.destination());

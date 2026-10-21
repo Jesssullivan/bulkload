@@ -229,6 +229,10 @@ fn a_growing_transcript_is_extended_in_place_under_its_mapped_key() {
 /// live file, the source's bytes then the live file's line, never beside
 /// (SPEC rule 3).
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "a union that writes needs the open-file check (Linux only; elsewhere HOMES_CONSOLIDATE_HOLDER_UNKNOWN)"
+)]
 fn a_small_transcript_that_grew_is_extended_and_a_small_fork_is_consolidated() {
     let run = Mapped::new(vec![pair(NEO, STING)], true);
     let small: &[u8] = b"{\"a\":1}\n";
@@ -268,6 +272,10 @@ fn a_small_transcript_that_grew_is_extended_and_a_small_fork_is_consolidated() {
 /// (SPEC rule 7); one both sides continued is consolidated into one file;
 /// an unchanged rerun reads nothing.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "a union that writes needs the open-file check (Linux only; elsewhere HOMES_CONSOLIDATE_HOLDER_UNKNOWN)"
+)]
 fn a_live_file_that_holds_the_seat_and_more_is_covered_and_never_rewritten() {
     let run = Mapped::new(vec![pair(NEO, STING)], true);
     let neo: Vec<u8> = (0..20_000).fold(Vec::new(), |mut bytes, at| {
@@ -428,6 +436,10 @@ fn a_refused_second_route_is_listed_as_the_sources() {
 /// the source-key copy is unioned into the mapped one and removed. Both
 /// are ledgered (`key_fold`); `--plan-only` lists them and does nothing.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "a union that writes needs the open-file check (Linux only; elsewhere HOMES_CONSOLIDATE_HOLDER_UNKNOWN)"
+)]
 fn a_source_key_copy_is_folded_into_the_mapped_key() {
     use std::os::unix::fs::MetadataExt as _;
     let shared: &[u8] = b"{\"uuid\":\"a\"}\n";
@@ -545,6 +557,10 @@ type SubFile = (&'static str, &'static [u8], Option<&'static [u8]>);
 
 #[test]
 #[allow(clippy::too_many_lines)] // Plan, then run, then each file's end.
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "a union that writes needs the open-file check (Linux only; elsewhere HOMES_CONSOLIDATE_HOLDER_UNKNOWN)"
+)]
 fn a_sessions_subfiles_at_the_source_key_fold_the_same_way() {
     let files: [SubFile; 5] = [
         // (path under the session, the hand copy's bytes, the mapped key's)

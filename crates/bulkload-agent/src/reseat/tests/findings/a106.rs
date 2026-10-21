@@ -518,6 +518,10 @@ fn a106_a_target_written_under_the_swap_is_put_back() {
 /// are durable. Nothing stays beside the live name (no dot-name at all in
 /// its directory).
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "a union that writes needs the open-file check (Linux only; elsewhere HOMES_CONSOLIDATE_HOLDER_UNKNOWN)"
+)]
 fn a106_a_copy_written_through_the_live_name_is_unioned_into_the_live_file() {
     let _serial = SERIAL
         .lock()

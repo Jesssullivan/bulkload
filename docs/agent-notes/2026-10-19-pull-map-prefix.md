@@ -46,8 +46,9 @@ re-keyed transcript twice. An A-106 replacement also left neo's
    2.1.299's function) and pulls the Claude tree with
    `projects/<key(S)>=projects/<key(D)>`. Codex is pulled without maps
    (rollouts are kept by date; the `cwd` respell stays A-055's).
-   `estate-move key-map` and `key-maps mapped= held= same=` lines; closure
-   line `key_maps= key_maps_held=`.
+   `estate-move key-map` lines and a `key-maps` summary line (mapped, held
+   and same counts); the closure line gains two fields: the count of key
+   maps, and the count of keys held.
 3. Keys more than one lane source keys to (`ambiguous-source-key`), keys
    whose destination key another source key also maps to
    (`dest-key-collision`) and lanes that do not resolve (`lane-unresolved`)

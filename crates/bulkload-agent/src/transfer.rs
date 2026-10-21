@@ -1525,6 +1525,10 @@ const ELSEWHERE_PENDING: &str =
 const OVER_MEMORY: &str = "over the 64 MiB a union gathers in memory";
 /// Why a live path of another kind is held.
 const OTHER_KIND: &str = "the live path is a link or another kind";
+/// Why a source-key copy was not folded on this platform: whether a process
+/// holds it open cannot be told (`HOMES_CONSOLIDATE_HOLDER_UNKNOWN`).
+const KEY_FOLD_HOLDER_UNKNOWN: &str =
+    "the source-key copy was not folded: whether a process holds it cannot be told here";
 /// Why a per-session file at a map's source key was not folded: the mapped
 /// key holds other bytes under its name (not an append log, so no union).
 const KEY_FOLD_DIFFERS: &str =
@@ -6954,10 +6958,10 @@ impl<W: Write> Inbound<'_, W> {
             if !equal(&to_meta) {
                 return Ok(Some(KEY_FOLD_DIFFERS));
             }
-            let free = matches!(
-                crate::procs::inside(&[from.as_path()])?,
-                Some(pids) if pids.is_empty()
-            );
+            let free = match crate::procs::inside(&[from.as_path()])? {
+                Some(pids) => pids.is_empty(),
+                None => return Ok(Some(KEY_FOLD_HOLDER_UNKNOWN)),
+            };
             let unmoved = std::fs::symlink_metadata(&from)
                 .is_ok_and(|now| now.ino() == from_meta.ino() && now.len() == from_meta.len());
             if !free || !unmoved {
@@ -7006,6 +7010,9 @@ impl<W: Write> Inbound<'_, W> {
         match outcome {
             Ok(outcome) if !matches!(outcome.action, crate::consolidate::Action::Held(_)) => {}
             Ok(_) | Err(BulkloadRefusal::HomesConsolidateRaced) => return Ok(Some(KEY_FOLD_RACED)),
+            Err(BulkloadRefusal::HomesConsolidateHolderUnknown) => {
+                return Ok(Some(KEY_FOLD_HOLDER_UNKNOWN))
+            }
             Err(refusal) => return Err(refusal),
         }
         // The merged bytes are durable (the union syncs what it writes; a
@@ -7016,10 +7023,10 @@ impl<W: Write> Inbound<'_, W> {
         }
         let unmoved = std::fs::symlink_metadata(&from)
             .is_ok_and(|now| now.ino() == from_meta.ino() && now.len() == from_meta.len());
-        let free = matches!(
-            crate::procs::inside(&[from.as_path()])?,
-            Some(pids) if pids.is_empty()
-        );
+        let free = match crate::procs::inside(&[from.as_path()])? {
+            Some(pids) => pids.is_empty(),
+            None => return Ok(Some(KEY_FOLD_HOLDER_UNKNOWN)),
+        };
         if !unmoved || !free {
             return Ok(Some(KEY_FOLD_RACED));
         }

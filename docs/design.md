@@ -385,6 +385,9 @@ same report, totals and gate:
     `fold` field (`move`, `union`, `remove`, `hold`, `none`).
   - A log that a process holds open, or that ends inside a line, is
     `HOMES_CONSOLIDATE_RACED`, retryable, with nothing written.
+    Whether a process holds the file is read from `/proc`, so off Linux
+    (sting is Linux) a union that would write is held as
+    `HOMES_CONSOLIDATE_HOLDER_UNKNOWN`, with nothing written.
 - one **mapped** row per `--map-prefix SRC_REL=DST_REL` a `copy` or `pull`
   landed entries through (#280 finding 9, "no duplicates"; accounted like
   `applied`, the row printing `mapped`, the destination path). The map is a

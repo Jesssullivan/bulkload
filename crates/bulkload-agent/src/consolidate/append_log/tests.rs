@@ -460,7 +460,8 @@ fn a_link_is_never_followed_and_an_absent_log_is_created() {
     assert!(home.ledgered().is_empty(), "a creation is no union");
 }
 
-/// Where no process can be seen, nothing is written.
+/// Where no process can be seen (anything but Linux), nothing is written:
+/// held typed, `HOMES_CONSOLIDATE_HOLDER_UNKNOWN`.
 #[test]
 #[cfg(not(target_os = "linux"))]
 fn where_open_files_cannot_be_seen_nothing_is_written() {
@@ -469,7 +470,7 @@ fn where_open_files_cannot_be_seen_nothing_is_written() {
     let path = home.live(TRANSCRIPT, &live);
     assert_eq!(
         home.union(TRANSCRIPT, &cat(&[A, B, NEO])).unwrap_err(),
-        BulkloadRefusal::HomesConsolidateRaced
+        BulkloadRefusal::HomesConsolidateHolderUnknown
     );
     assert_eq!(fs::read(&path).unwrap(), live);
 }
