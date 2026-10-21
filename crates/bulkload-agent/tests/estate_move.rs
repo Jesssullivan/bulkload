@@ -297,6 +297,7 @@ fn item_line<'a>(stdout: &'a str, path: &Path) -> &'a str {
 fn a_streamed_pass_lands_every_absent_item_with_no_payload_anywhere() {
     let world = World::new("streamed");
     world.estate();
+    let untouched = admin_digest(&world.src().join("land/.git"));
     let sourced = world.source();
     assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
     assert!(
@@ -313,6 +314,13 @@ fn a_streamed_pass_lands_every_absent_item_with_no_payload_anywhere() {
     holds_no_payload(&world.source_state(), 3);
     let moved = world.moved();
     let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    // The source repository is as it was, byte for byte: no ref, lock,
+    // reflog, index or configuration write by either half.
+    assert_eq!(
+        admin_digest(&world.src().join("land/.git")),
+        untouched,
+        "{both}"
+    );
     assert!(
         moved.stdout.contains("estate-move phase=pull outcome=ok"),
         "{both}"
@@ -395,6 +403,48 @@ fn a_streamed_pass_lands_every_absent_item_with_no_payload_anywhere() {
     }
     assert_eq!(out(&dst.join("land"), &["for-each-ref"]), refs);
     holds_no_payload(&world.state(), 3);
+}
+
+/// A shallow source is a typed hold until it has a test: refused on the
+/// source half, nothing recorded for it to land.
+#[test]
+fn a_shallow_source_is_held_typed() {
+    let world = World::new("shallow");
+    world.estate();
+    let src = world.src();
+    let from = format!("file://{}", src.join("other").display());
+    let ran = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .args(["clone", "--quiet", "--depth=1", &from])
+        .arg(src.join("shallow"))
+        .output()
+        .unwrap();
+    assert!(
+        ran.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    let sourced = world.source();
+    assert!(
+        sourced.stdout.lines().any(|line| line
+            .contains("outcome=refused code=GIT_HAVES_UNPROVABLE")
+            && line.contains("shallow")),
+        "{}",
+        sourced.stdout
+    );
+}
+
+// Every file under `admin` (a repository's administration), by path and
+// bytes: what a pass must never change on the source.
+fn admin_digest(admin: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    tree(admin)
+        .into_iter()
+        .filter(|rel| fs::symlink_metadata(admin.join(rel)).unwrap().is_file())
+        .map(|rel| {
+            let bytes = fs::read(admin.join(&rel)).unwrap();
+            (rel, bytes)
+        })
+        .collect()
 }
 
 /// B1 holds, typed, a live path that holds another version: nothing is

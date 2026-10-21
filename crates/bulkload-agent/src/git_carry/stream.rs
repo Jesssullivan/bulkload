@@ -60,6 +60,10 @@ pub struct Snapshot {
     /// Ids named somewhere (a reflog entry, an operation file) that the
     /// source no longer holds: counted, never wanted.
     pub missing: u64,
+    /// Objects in the source's store that nothing names (no ref, reflog,
+    /// index or operation file): they have no name to carry and `gc` would
+    /// prune them. Counted, never carried; closure shows the number.
+    pub unreachable: u64,
 }
 
 /// One worktree of a snapshot.
@@ -209,13 +213,35 @@ fn operation_ids(admin: &Path, ids: &mut BTreeSet<String>) -> Result<()> {
 pub fn snapshot(repo: &Path) -> Result<Snapshot> {
     let (object_format, refs, worktrees, named) = named(repo)?;
     let (wants, missing) = partition(repo, &named)?;
+    let unreachable = unreachable(repo)?;
     Ok(Snapshot {
         object_format,
         refs,
         worktrees,
         wants,
         missing,
+        unreachable,
     })
+}
+
+// How many objects `repo`'s store holds that no ref, reflog, index or
+// operation file reaches (`fsck --unreachable`, connectivity only: commits
+// and trees are read, blobs are not).
+fn unreachable(repo: &Path) -> Result<u64> {
+    let listed = output(git(repo).args([
+        "fsck",
+        "--unreachable",
+        "--connectivity-only",
+        "--no-progress",
+        "--no-dangling",
+    ]))?;
+    u64::try_from(
+        listed
+            .split(|byte| *byte == b'\n')
+            .filter(|line| line.starts_with(b"unreachable "))
+            .count(),
+    )
+    .map_err(|_| BulkloadRefusal::GitInventoryMalformed)
 }
 
 /// The ids `repo`'s administration names that its object store lacks: what

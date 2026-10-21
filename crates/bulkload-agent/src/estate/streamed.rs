@@ -289,6 +289,7 @@ pub fn land(
     state: &Path,
     map: &[(Vec<u8>, Vec<u8>)],
     reach: &Reach<'_>,
+    fetched: stream::Fetched,
 ) -> Result<Landed> {
     let item = &snapshot.item;
     let identity = id(item)?;
@@ -305,36 +306,10 @@ pub fn land(
         missing_at_source: snapshot.snapshot.missing,
         ..Landed::default()
     };
-    let owns_store = snapshot
-        .excluded
-        .iter()
-        .any(|path| path.ends_with(b"objects"));
-    // 1. The objects, into the live store, before any ref names them.
-    if owns_store {
-        let admin = snapshot
-            .excluded
-            .iter()
-            .find(|path| path.ends_with(b"objects"))
-            .map(|path| {
-                use std::os::unix::ffi::OsStrExt as _;
-                live.join(std::ffi::OsStr::from_bytes(path))
-            })
-            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-        for dir in [admin.join("pack"), admin.join("info")] {
-            fs::create_dir_all(&dir).refuse_at(SITE)?;
-        }
-        let fetched = stream::fetch_into(
-            &admin,
-            &snapshot.snapshot.object_format,
-            &source_url,
-            reach.upload_pack,
-            &snapshot.snapshot,
-            &marks_path(state, &identity),
-        )?;
-        landed.batches = fetched.batches;
-        landed.skipped = fetched.skipped;
-        landed.object_bytes = fetched.bytes;
-    }
+    let owns_store = store_of(snapshot, &live).is_some();
+    landed.batches = fetched.batches;
+    landed.skipped = fetched.skipped;
+    landed.object_bytes = fetched.bytes;
     // 2. The seats and the administration's own files.
     let root = {
         fs::create_dir_all(&live).refuse_at(SITE)?;
@@ -391,6 +366,52 @@ pub fn land(
         }
     }
     Ok(landed)
+}
+
+// The live object store an item owns (a main or bare repository's), from
+// its excluded `objects` path.
+fn store_of(snapshot: &ItemSnapshot, live: &Path) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    snapshot
+        .excluded
+        .iter()
+        .find(|path| path.ends_with(b"objects"))
+        .map(|path| live.join(std::ffi::OsStr::from_bytes(path)))
+}
+
+/// Fetch `snapshot`'s objects by id from the live source repository into
+/// the item's live object store, before any ref names them (step 1 of the
+/// module docs): what a pass runs for every item in parallel. A linked
+/// worktree owns no store: nothing to fetch.
+///
+/// # Errors
+/// The fetch's refusals.
+pub fn fetch_objects(
+    snapshot: &ItemSnapshot,
+    state: &Path,
+    upload_pack: &str,
+) -> Result<stream::Fetched> {
+    let item = &snapshot.item;
+    let live = item
+        .workspace
+        .clone()
+        .unwrap_or_else(|| item.repository.clone());
+    let Some(objects) = store_of(snapshot, &live) else {
+        return Ok(stream::Fetched::default());
+    };
+    for dir in [objects.join("pack"), objects.join("info")] {
+        fs::create_dir_all(&dir).refuse_at(SITE)?;
+    }
+    stream::fetch_into(
+        &objects,
+        &snapshot.snapshot.object_format,
+        item.source
+            .to_str()
+            .ok_or(BulkloadRefusal::PathNotPortable)?,
+        upload_pack,
+        &snapshot.snapshot,
+        &marks_path(state, &id(item)?),
+    )
 }
 
 /// The journal a finished landing writes (the closure ledger's

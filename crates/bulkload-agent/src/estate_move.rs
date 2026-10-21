@@ -872,6 +872,8 @@ fn move_pass(run: &Move) -> Result<()> {
         row.item.source != row.item.repository
             && row.item.workspace.as_ref() != Some(&row.item.repository)
     });
+    // Which items land: a held one is recorded and left untouched.
+    let mut landing = Vec::new();
     for row in order {
         let Some(snapshot) = estate::streamed::recorded(&carry, &row.id)? else {
             continue;
@@ -899,14 +901,40 @@ fn move_pass(run: &Move) -> Result<()> {
             first_refusal.get_or_insert(refusal);
             continue;
         }
+        landing.push((row, snapshot));
+    }
+    // The objects first, every item's fetch in parallel (`--jobs`), each
+    // timed for the race against rclone.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(run.jobs.max(1))
+        .build()
+        .map_err(|_| BulkloadRefusal::WorkerLost)?;
+    let fetched: Vec<(Result<bulkload_agent::git_carry::stream::Fetched>, u128)> =
+        pool.install(|| {
+            use rayon::prelude::*;
+            landing
+                .par_iter()
+                .map(|(_, snapshot)| {
+                    let started = std::time::Instant::now();
+                    let fetched = upload_pack
+                        .as_ref()
+                        .map_err(Clone::clone)
+                        .and_then(|program| {
+                            estate::streamed::fetch_objects(snapshot, &private, program)
+                        });
+                    (fetched, started.elapsed().as_millis())
+                })
+                .collect()
+        });
+    // Then each item's seats, host-path files and proof, mains first.
+    for ((row, snapshot), (fetched, fetch_ms)) in landing.iter().zip(fetched) {
+        let place = row.item.workspace.as_ref().unwrap_or(&row.item.repository);
         let started = std::time::Instant::now();
-        let landing = upload_pack
-            .as_ref()
-            .map_err(Clone::clone)
-            .and_then(|_| estate::streamed::land(&snapshot, &private, &map, &reach));
+        let landing = fetched
+            .and_then(|fetched| estate::streamed::land(snapshot, &private, &map, &reach, fetched));
         match landing {
             Ok(done) => {
-                estate::streamed::journal(&private, &snapshot, &run.source)?;
+                estate::streamed::journal(&private, snapshot, &run.source)?;
                 let outcome = if row.item.workspace.is_some() {
                     "workspace-restored"
                 } else {
@@ -914,13 +942,14 @@ fn move_pass(run: &Move) -> Result<()> {
                 };
                 estate::streamed::record_outcome(&private, &row.item, outcome, None, None)?;
                 out(&format!(
-                    "estate-move item={} outcome={outcome} object_batches={} object_batches_skipped={} object_bytes={} topped_up={} missing_at_source={} wall_ms={} live={place:?}",
+                    "estate-move item={} outcome={outcome} object_batches={} object_batches_skipped={} object_bytes={} fetch_ms={fetch_ms} topped_up={} missing_at_source={} unreachable_not_carried={} land_ms={} live={place:?}",
                     row.id,
                     done.batches,
                     done.skipped,
                     done.object_bytes,
                     done.topped_up,
                     done.missing_at_source,
+                    snapshot.snapshot.unreachable,
                     started.elapsed().as_millis(),
                 ))?;
                 landed.push(row.id.clone());
@@ -1073,13 +1102,22 @@ fn move_pass(run: &Move) -> Result<()> {
         .join(",");
     let not_moved: u64 = notes.values().sum();
     let measured = bulkload_agent::state_payload::measure_all(&run.states())?;
+    // Objects no name reaches on the source: counted, never carried.
+    let mut unreachable = 0u64;
+    let mut missing_at_source = 0u64;
+    for row in &rows {
+        if let Some(snapshot) = estate::streamed::recorded(&carry, &row.id)? {
+            unreachable = unreachable.saturating_add(snapshot.snapshot.unreachable);
+            missing_at_source = missing_at_source.saturating_add(snapshot.snapshot.missing);
+        }
+    }
     let held = reseat_held
         .iter()
         .map(|(word, count)| format!("{word}:{count}"))
         .collect::<Vec<_>>()
         .join(",");
     out(&format!(
-        "estate-move closure planned={} applied={} applied_beside={} carried={} referenced_only={} refused={} refused_pending_review={} unaccounted={} not_moved={not_moved} refusals={} sessions={} transfer_rows={} reseat_unaccounted={reseat_unaccounted} reseat_held={} {} report={report_path:?}",
+        "estate-move closure planned={} applied={} applied_beside={} carried={} referenced_only={} refused={} refused_pending_review={} unaccounted={} not_moved={not_moved} refusals={} sessions={} transfer_rows={} reseat_unaccounted={reseat_unaccounted} reseat_held={} objects_unreachable_not_carried={unreachable} objects_missing_at_source={missing_at_source} {} report={report_path:?}",
         rows.len(),
         report.applied,
         report.applied_beside,
