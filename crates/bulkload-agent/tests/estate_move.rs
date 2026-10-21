@@ -3599,6 +3599,9 @@ fn no_pass_leaves_an_empty_corpus_and_an_old_one_is_removed() {
     let world = World::new("nocorpus");
     world.estate();
     fs::create_dir_all(world.source_state().join("carry/corpus")).unwrap();
+    for dir in [world.source_state(), world.source_state().join("carry")] {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let sourced = world.source();
     assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
     assert!(!world.source_state().join("carry/corpus").exists());
