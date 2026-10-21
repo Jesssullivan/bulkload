@@ -1143,6 +1143,7 @@ fn transfer_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
             maps: bulkload_agent::consolidate::Maps::new(maps),
             ledger: state.join("consolidate"),
             plan_only,
+            archived: Vec::new(),
         }));
     }
     match command {
@@ -3018,6 +3019,7 @@ fn report_counters(verb: &str, started: std::time::Instant, priority: Priority) 
     }
 }
 
+#[allow(clippy::too_many_lines)] // One line per field, then one per path.
 fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()> {
     println!(
         "completed={} reused={} bytes_received={} source_bytes_read={} refusals={} \
@@ -3064,6 +3066,13 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
     for (source, destination) in &stats.mapped {
         eprintln!(
             "mapped {} at={}",
+            source.escape_ascii(),
+            destination.escape_ascii()
+        );
+    }
+    for (source, destination, action) in &stats.folded {
+        eprintln!(
+            "key-fold {} into={} action={action}",
             source.escape_ascii(),
             destination.escape_ascii()
         );

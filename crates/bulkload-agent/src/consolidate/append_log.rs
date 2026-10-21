@@ -18,10 +18,13 @@
 //!   line, counted. Both branches of a session continued on both hosts are
 //!   kept.
 //!
-//! The union is written under a private name, made durable and traded in for
-//! the live file by [`super::config`]'s crash-safe trade, checked against
-//! the live file as read (a writer that changed it is merged again; one that
-//! changes it on every read is `HOMES_CONSOLIDATE_RACED`). A live file a
+//! An extension (the live file a prefix of the source's) appends the missing
+//! tail in place, to the same inode, through `O_APPEND`. A true union (the
+//! live file holds records the source lacks) is written under a private
+//! name, made durable and traded in for the live file by
+//! [`super::config`]'s crash-safe trade, checked against the live file as
+//! read (a writer that changed it is merged again; one that changes it on
+//! every read is `HOMES_CONSOLIDATE_RACED`). A live file a
 //! process holds open ([`crate::procs::inside`], or where that cannot be
 //! said) or that ends inside a line (a writer at it) is
 //! `HOMES_CONSOLIDATE_RACED` too, retryable, nothing written: a writer's
@@ -205,6 +208,20 @@ pub fn union(live: &Live<'_>, source: &Source<'_>, ledger: &Ledger) -> Result<Ou
         if !free(live.path)? {
             return Err(BulkloadRefusal::HomesConsolidateRaced);
         }
+        if plan.action == Action::Extended {
+            // SPEC: the missing tail is appended in place. The same inode,
+            // so a writer's open handle never writes into a file traded out.
+            let tail = output.get(bytes.len()..).unwrap_or_default();
+            if append_tail(live.dir, &name, &stat, tail)? {
+                record(ledger, live.rel, &plan, (&bytes, &offered, output))?;
+                return Ok(Outcome {
+                    action: plan.action,
+                    written: tail.len() as u64,
+                    recorded: 1,
+                });
+            }
+            continue;
+        }
         if config::swap_in(live.dir, &name, &stat, output, attempt)? {
             record(ledger, live.rel, &plan, (&bytes, &offered, output))?;
             return Ok(Outcome {
@@ -215,6 +232,172 @@ pub fn union(live: &Live<'_>, source: &Source<'_>, ledger: &Ledger) -> Result<Ou
         }
     }
     Err(BulkloadRefusal::HomesConsolidateRaced)
+}
+
+/// Append `tail` to the live file in place, through `O_APPEND` (a byte a
+/// writer appended first is never written over), checked against the live
+/// file as read (`stat`) before the write and after it, then made durable.
+/// `false`: the file moved before the write, and nothing was written.
+///
+/// # Errors
+/// `HOMES_CONSOLIDATE_RACED` when a writer appended between the check and
+/// the write: both its bytes and the tail are in the file, in that order,
+/// and the next pass merges again. The I/O refusals.
+fn append_tail(dir: &File, name: &CStr, stat: &Stat, tail: &[u8]) -> Result<bool> {
+    let fd = match sys::open_append_at(dir, name) {
+        Ok(fd) => fd,
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(BulkloadRefusal::DestinationKindMismatch);
+        }
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(false),
+        Err(error) => return Err(error).refuse_at(SITE),
+    };
+    let file = File::from(fd);
+    let same = |now: &Stat| {
+        now.node == stat.node && now.size == stat.size && now.mtime_ns == stat.mtime_ns
+    };
+    if !same(&sys::fstat(&file).refuse_at(SITE)?) {
+        return Ok(false);
+    }
+    #[cfg(test)]
+    tests::before_append(&file);
+    sys::pwrite_all(&file, tail, stat.size).refuse_at(SITE)?;
+    file.sync_all().refuse_at(SITE)?;
+    let after = sys::fstat(&file).refuse_at(SITE)?;
+    if after.node != stat.node || after.size != stat.size + tail.len() as u64 {
+        return Err(BulkloadRefusal::HomesConsolidateRaced);
+    }
+    Ok(true)
+}
+
+/// The union of the source's bytes into a live transcript that is a link to
+/// an archived file, regularized at the live name.
+///
+/// SPEC; A-055, A-106, TIN-6587: `target`, the link's resolved target under
+/// an archive root, is the live file. The union of the source's bytes and the target's is
+/// written as a regular file at the live name in place of the link
+/// (regularized: Claude Code's picker lists regular files only). The archive
+/// file stays exactly as it is.
+///
+/// The target is read stable, held open by no process, and the union
+/// planned as [`union`] plans it (a target holding every source record
+/// keeps its own bytes; the live name still becomes a regular file). The
+/// file is written under a private name, made durable, and traded for the
+/// link only while the link (its identity and text) and the target are as
+/// read; what the trade took out must be that link, else it goes back. Then
+/// the link is removed. Ledgered once durable.
+///
+/// # Errors
+/// - `HOMES_CONSOLIDATE_RACED`: the target ends inside a line, a process
+///   holds it open, or the link or target moved under the trade.
+/// - `DESTINATION_KIND_MISMATCH` when the name is no longer a link to
+///   `target`; `PATH_ESCAPES_ROOT` for another user's file.
+/// - The I/O and ledger refusals.
+pub fn union_link(
+    live: &Live<'_>,
+    target: &Path,
+    source: &Source<'_>,
+    ledger: &Ledger,
+) -> Result<Outcome> {
+    use std::os::fd::AsFd as _;
+    if source.size > SIZE_LIMIT {
+        return Ok(Outcome {
+            action: Action::Held("append-log: over the size limit"),
+            written: 0,
+            recorded: 0,
+        });
+    }
+    let offered = read_source(source)?;
+    let name = io::c_name(live.name).refuse_at(SITE)?;
+    let link = sys::fstatat_nofollow(live.dir, &name).refuse_at(SITE)?;
+    let text = std::fs::read_link(live.path).refuse_at(SITE)?;
+    if link.mode & 0o170_000 != 0o120_000
+        || std::fs::canonicalize(live.path).ok().as_deref() != Some(target)
+    {
+        return Err(BulkloadRefusal::DestinationKindMismatch);
+    }
+    let (Some(target_parent), Some(target_name)) = (target.parent(), target.file_name()) else {
+        return Err(BulkloadRefusal::DestinationKindMismatch);
+    };
+    let target_dir = File::open(target_parent).refuse_at(SITE)?;
+    let target_c = io::c_name(target_name.as_encoded_bytes()).refuse_at(SITE)?;
+    let (stat, bytes) = match read_live(&target_dir, &target_c)? {
+        Read::Live(stat, bytes) => (stat, bytes),
+        Read::Over => {
+            return Ok(Outcome {
+                action: Action::Held("append-log: over the size limit"),
+                written: 0,
+                recorded: 0,
+            })
+        }
+        Read::Absent | Read::Changed => return Err(BulkloadRefusal::HomesConsolidateRaced),
+    };
+    let Some(plan) = plan(&bytes, &offered, by_uuid(live.rel)) else {
+        return Err(BulkloadRefusal::HomesConsolidateRaced);
+    };
+    if !free(target)? || !free(live.path)? {
+        return Err(BulkloadRefusal::HomesConsolidateRaced);
+    }
+    let output = plan.bytes.clone().unwrap_or_else(|| bytes.clone());
+    let temp = io::c_name(
+        format!(
+            ".{}.bulkload-regularize.{}",
+            String::from_utf8_lossy(live.name),
+            std::process::id()
+        )
+        .as_bytes(),
+    )
+    .refuse_at(SITE)?;
+    let file = File::from(
+        sys::create_excl_at(live.dir.as_fd(), &temp, stat.mode & 0o7777).refuse_at(SITE)?,
+    );
+    let written = sys::pwrite_all(&file, &output, 0)
+        .and_then(|()| sys::fchmod(&file, stat.mode & 0o7777))
+        .and_then(|()| file.sync_all());
+    if let Err(error) = written {
+        let _ = sys::unlinkat(live.dir, &temp, false);
+        return Err(error).refuse_at(SITE);
+    }
+    drop(file);
+    let unmoved = |at: &Stat| at.node == link.node && at.ctime_ns == link.ctime_ns;
+    let target_held = || {
+        sys::fstatat_nofollow(&target_dir, &target_c).is_ok_and(|now| {
+            now.node == stat.node && now.size == stat.size && now.mtime_ns == stat.mtime_ns
+        })
+    };
+    let still = sys::fstatat_nofollow(live.dir, &name).is_ok_and(|now| unmoved(&now))
+        && std::fs::read_link(live.path).is_ok_and(|now| now == text);
+    if !still || !target_held() {
+        let _ = sys::unlinkat(live.dir, &temp, false);
+        return Err(BulkloadRefusal::HomesConsolidateRaced);
+    }
+    if let Err(error) = io::exchange(live.dir, &temp, &name) {
+        let _ = sys::unlinkat(live.dir, &temp, false);
+        if io::rename_unsupported(&error) {
+            return Err(BulkloadRefusal::DestinationExchangeUnsupported);
+        }
+        return Err(error).refuse_at(SITE);
+    }
+    // What the trade took out must be the link that was read, and the
+    // target still as read; else it goes back.
+    let out = sys::fstatat_nofollow(live.dir, &temp);
+    if !out.as_ref().is_ok_and(unmoved) || !target_held() {
+        io::exchange(live.dir, &temp, &name).refuse_at(SITE)?;
+        let _ = sys::unlinkat(live.dir, &temp, false);
+        live.dir.sync_all().refuse_at(SITE)?;
+        return Err(BulkloadRefusal::HomesConsolidateRaced);
+    }
+    sys::unlinkat(live.dir, &temp, false).refuse_at(SITE)?;
+    live.dir.sync_all().refuse_at(SITE)?;
+    record(ledger, live.rel, &plan, (&bytes, &offered, &output))?;
+    Ok(Outcome {
+        action: match plan.action {
+            Action::Adopted | Action::Covered => Action::Consolidated,
+            action => action,
+        },
+        written: output.len() as u64,
+        recorded: 1,
+    })
 }
 
 /// No process holds `path` open (or works under it); `false` where this

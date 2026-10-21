@@ -129,7 +129,26 @@ impl Home {
 impl Drop for Home {
     fn drop(&mut self) {
         set_hook(None);
+        set_append_hook(None);
     }
+}
+
+thread_local! {
+    static BEFORE_APPEND: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Runs between the extension's check and its write.
+pub(super) fn before_append(_file: &File) {
+    BEFORE_APPEND.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+}
+
+fn set_append_hook(hook: Option<Box<dyn FnMut()>>) {
+    BEFORE_APPEND.with(|slot| *slot.borrow_mut() = hook);
 }
 
 /// Each answer of the union, nothing read or written: equal, covered by
@@ -276,12 +295,54 @@ fn a_transcript_continued_on_both_hosts_is_one_file_holding_both_branches() {
         cat(&[A, B, NEO, NEO2, STING, STING2])
     );
     assert_eq!(home.ledgered().len(), 2);
-    // A live prefix of the source's is extended to it.
+    // A live prefix of the source's is extended to it, in place: the same
+    // inode, only the tail written.
+    let inode = fs::metadata(&path).unwrap().ino();
     let extended = home
         .union(TRANSCRIPT, &cat(&[A, B, NEO, NEO2, STING, STING2, NEO3]))
         .unwrap();
     assert_eq!(extended.action, Action::Extended);
+    assert_eq!(extended.written, NEO3.len() as u64);
+    assert_eq!(fs::metadata(&path).unwrap().ino(), inode, "in place");
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        cat(&[A, B, NEO, NEO2, STING, STING2, NEO3])
+    );
     assert_eq!(home.ledgered()[2].1, "extend");
+}
+
+/// A writer that appends between the extension's check and its write: its
+/// bytes are kept (`O_APPEND` never writes over them), the extension is
+/// raced, and the next pass merges again.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "a write needs the open-file check, Linux only"
+)]
+fn an_append_racing_the_extension_is_never_written_over() {
+    use std::io::Write as _;
+    let home = Home::new();
+    let path = home.live(TRANSCRIPT, &cat(&[A, B]));
+    let writer = path.clone();
+    set_append_hook(Some(Box::new(move || {
+        let mut file = File::options().append(true).open(&writer).unwrap();
+        file.write_all(STING.as_bytes()).unwrap();
+    })));
+    assert_eq!(
+        home.union(TRANSCRIPT, &cat(&[A, B, NEO])).unwrap_err(),
+        BulkloadRefusal::HomesConsolidateRaced
+    );
+    set_append_hook(None);
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        cat(&[A, B, STING, NEO]),
+        "nothing lost"
+    );
+    // The next pass: covered (every record held), nothing rewritten.
+    let inode = fs::metadata(&path).unwrap().ino();
+    let again = home.union(TRANSCRIPT, &cat(&[A, B, NEO])).unwrap();
+    assert_eq!(again.action, Action::Covered);
+    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
 }
 
 /// `history.jsonl` (no record `uuid`): the union by exact line, a line held

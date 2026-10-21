@@ -34,6 +34,7 @@ impl Mapped {
                     maps: crate::consolidate::Maps::new(Vec::new()),
                     ledger: corpus.base.join("consolidate"),
                     plan_only: false,
+                    archived: Vec::new(),
                 })),
             );
         }
@@ -419,4 +420,114 @@ fn a_refused_second_route_is_listed_as_the_sources() {
         "{listed:?}"
     );
     assert!(!listed.iter().any(|path| path.starts_with(NEO.as_bytes())));
+}
+
+/// #280 finding 9 with `--consolidate`: the destination holds the same
+/// session at the map's source key (an earlier hand copy). Absent at the
+/// mapped key, it is moved there (the same inode, never copied); present,
+/// the source-key copy is unioned into the mapped one and removed. Both
+/// are ledgered (`key_fold`); `--plan-only` lists them and does nothing.
+#[test]
+fn a_source_key_copy_is_folded_into_the_mapped_key() {
+    use std::os::unix::fs::MetadataExt as _;
+    let shared: &[u8] = b"{\"uuid\":\"a\"}\n";
+    let mut neo_moved = shared.to_vec();
+    neo_moved.extend_from_slice(b"{\"uuid\":\"n\"}\n");
+    let mut old_union = shared.to_vec();
+    old_union.extend_from_slice(b"{\"uuid\":\"o\"}\n");
+    let mut sting_union = shared.to_vec();
+    sting_union.extend_from_slice(b"{\"uuid\":\"s\"}\n");
+    let setup = |run: &Mapped| {
+        Mapped::write(&run.source(&format!("{NEO}/m.jsonl")), &neo_moved);
+        Mapped::write(&run.source(&format!("{NEO}/u.jsonl")), shared);
+        // The hand copies at the source key on the destination.
+        Mapped::write(&run.destination(&format!("{NEO}/m.jsonl")), shared);
+        Mapped::write(&run.destination(&format!("{NEO}/u.jsonl")), &old_union);
+        // The mapped key holds u's own continuation.
+        Mapped::write(&run.destination(&format!("{STING}/u.jsonl")), &sting_union);
+        run.settle();
+    };
+
+    // Planned: listed, nothing done.
+    let plan = Mapped::new(vec![pair(NEO, STING)], true);
+    set_consolidate_for(
+        &plan.root,
+        Some(Some(Consolidation {
+            maps: crate::consolidate::Maps::new(Vec::new()),
+            ledger: plan.corpus.base.join("consolidate"),
+            plan_only: true,
+            archived: Vec::new(),
+        })),
+    );
+    setup(&plan);
+    let planned = plan.corpus.run().unwrap();
+    let mut folds: Vec<(String, &str)> = planned
+        .planned
+        .iter()
+        .filter(|seat| seat.action.starts_with("fold-"))
+        .map(|seat| {
+            (
+                String::from_utf8_lossy(&seat.rel_path).into_owned(),
+                seat.action,
+            )
+        })
+        .collect();
+    folds.sort();
+    assert_eq!(
+        folds,
+        [
+            (format!("{NEO}/m.jsonl"), "fold-move"),
+            (format!("{NEO}/u.jsonl"), "fold-union"),
+        ]
+    );
+    assert!(plan.destination(&format!("{NEO}/m.jsonl")).exists());
+
+    let run = Mapped::new(vec![pair(NEO, STING)], true);
+    setup(&run);
+    let hand = std::fs::metadata(run.destination(&format!("{NEO}/m.jsonl")))
+        .unwrap()
+        .ino();
+    let first = run.corpus.run().unwrap();
+    assert!(first.refusals.is_empty(), "{:?}", first.refusals);
+    let mut folded = first.folded;
+    folded.sort();
+    assert_eq!(
+        folded
+            .iter()
+            .map(|(_, _, action)| action.as_str())
+            .collect::<Vec<_>>(),
+        ["move", "union"]
+    );
+    // m: moved (the same inode), then extended in place by neo's line.
+    let m = run.destination(&format!("{STING}/m.jsonl"));
+    assert_eq!(
+        std::fs::metadata(&m).unwrap().ino(),
+        hand,
+        "moved, never copied"
+    );
+    assert_eq!(std::fs::read(&m).unwrap(), neo_moved);
+    // u: the hand copy's record unioned into the mapped file, then neo's.
+    let u = std::fs::read(run.destination(&format!("{STING}/u.jsonl"))).unwrap();
+    for record in [
+        &b"{\"uuid\":\"a\"}\n"[..],
+        b"{\"uuid\":\"o\"}\n",
+        b"{\"uuid\":\"s\"}\n",
+    ] {
+        assert_eq!(
+            u.windows(record.len())
+                .filter(|window| *window == record)
+                .count(),
+            1,
+            "{}",
+            String::from_utf8_lossy(&u)
+        );
+    }
+    assert!(!run.destination(&format!("{NEO}/m.jsonl")).exists());
+    assert!(!run.destination(&format!("{NEO}/u.jsonl")).exists());
+    let ledger =
+        rusqlite::Connection::open(run.corpus.base.join("consolidate/consolidate.sqlite")).unwrap();
+    let rows: i64 = ledger
+        .query_row("SELECT count(*) FROM key_fold", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 2);
 }

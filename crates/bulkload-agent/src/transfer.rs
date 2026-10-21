@@ -350,6 +350,11 @@ pub struct TransferStats {
     pub held: Vec<(Vec<u8>, &'static str)>,
     /// `--plan-only`: every seat's planned action.
     pub planned: Vec<PlannedSeat>,
+    /// `--map-prefix` with `--consolidate`: the same session at a map's
+    /// source key on the destination, folded into the mapped key
+    /// `(source path, destination path, move | union)`, ledgered in
+    /// `consolidate.sqlite` (`key_fold`).
+    pub folded: Vec<(Vec<u8>, Vec<u8>, String)>,
     /// `--map-prefix SRC_REL=DST_REL` ([`set_map_prefixes`]): each map an
     /// entry of the session was landed through, `(source path, destination
     /// path)`, as first used. Each is a `mapped` row of the session's
@@ -1357,6 +1362,37 @@ pub struct Consolidation {
     /// `--plan-only`: every seat is decided and reported
     /// ([`TransferStats::planned`]); nothing is staged, written or recorded.
     pub plan_only: bool,
+    /// The archive roots (`--replace-archived-dest`): a transcript whose
+    /// live path is a link to a regular file under one of them is unioned
+    /// with that file and regularized in its place
+    /// ([`crate::consolidate::append_log::union_link`]); any other link is
+    /// held.
+    pub archived: Vec<PathBuf>,
+}
+
+/// The archived file an append log's live path links to
+/// ([`Consolidation::archived`]), canonical; `None` for anything else.
+fn archive_target(root: &Path, rel_path: &[u8], archived: &[PathBuf]) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    if archived.is_empty()
+        || crate::consolidate::Class::of(rel_path, false) != crate::consolidate::Class::AppendLog
+    {
+        return None;
+    }
+    let live = root.join(std::ffi::OsStr::from_bytes(rel_path));
+    if !std::fs::symlink_metadata(&live)
+        .ok()?
+        .file_type()
+        .is_symlink()
+    {
+        return None;
+    }
+    let target = std::fs::canonicalize(&live).ok()?;
+    (target.is_file()
+        && archived
+            .iter()
+            .any(|root| std::fs::canonicalize(root).is_ok_and(|root| target.starts_with(root))))
+    .then_some(target)
 }
 
 static CONSOLIDATE: Mutex<Option<Arc<Consolidation>>> = Mutex::new(None);
@@ -1427,6 +1463,13 @@ const SQLITE_PENDING: &str = "sqlite: the row union (#278) has not landed";
 const ELSEWHERE_PENDING: &str = "append-log: the destination holds this session under another key";
 /// Why a live path of another kind is held.
 const OTHER_KIND: &str = "the live path is a link or another kind";
+/// Why a source-key copy was not folded into the mapped key: a writer at
+/// either, or it moved; nothing removed, the next pass folds again.
+const KEY_FOLD_RACED: &str =
+    "append-log: the source-key copy could not be folded now (in use or moved)";
+/// A transcript whose live path links into an archive root: unioned with
+/// the archived file and regularized (the archive copy stays).
+const ARCHIVE_LINK: &str = "archive link: unioned with its target and regularized";
 
 /// One seat's planned action under `--plan-only`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6590,11 +6633,27 @@ impl<W: Write> Inbound<'_, W> {
         if class == Class::Sqlite && union_of(class).is_none() {
             return self.hold_seat(row, class, None, SQLITE_PENDING, plan);
         }
+        // The same session at the map's source key on the destination (an
+        // earlier hand copy): folded into the mapped key first, one file.
+        if class == Class::AppendLog {
+            if let Some(reason) = self.fold_source_key(row, settings)? {
+                return self.hold_seat(row, class, None, reason, plan);
+            }
+        }
         let identity = match self.target.identity(row) {
             Ok(identity) => identity,
             Err(
                 BulkloadRefusal::DestinationOccupied | BulkloadRefusal::DestinationKindMismatch,
             ) => {
+                // A transcript linked into an archive root: its target is the
+                // live file, unioned and regularized when the bytes arrive.
+                if archive_target(self.target.path(), &row.rel_path, &settings.archived).is_some() {
+                    if plan {
+                        self.plan_seat(row, class.word(), "consolidate", None, Some(ARCHIVE_LINK));
+                        return Ok(Decision::Skip);
+                    }
+                    return Ok(Decision::WantManifest);
+                }
                 return self.hold_seat(row, class, None, OTHER_KIND, plan);
             }
             // A plan creates no directory: one the seat would be landed in
@@ -6642,6 +6701,211 @@ impl<W: Write> Inbound<'_, W> {
             return Err(refused.refusal());
         }
         Ok(Decision::WantManifest)
+    }
+
+    /// `--map-prefix` with `--consolidate` (#280 finding 9; SPEC rule 3): a
+    /// transcript `projects/<D>/<name>` landed through the map `S -> D`
+    /// whose destination also holds `projects/<S>/<name>` (the same
+    /// session, copied there by hand before the map) holds one session
+    /// twice. Folded into `projects/<D>/<name>`:
+    /// - absent there: the source-key node is renamed there (never copied);
+    /// - a regular file there: the source-key copy is unioned into it
+    ///   ([`crate::consolidate::append_log::union`], ledgered);
+    /// - a link into an archive root there: unioned with its target and
+    ///   regularized ([`crate::consolidate::append_log::union_link`]).
+    ///
+    /// The source-key name is removed once the merged bytes are durable,
+    /// while it is still the node read and no process holds it. Under
+    /// `--plan-only` it is reported (`fold-move`, `fold-union`) and nothing
+    /// is done. `Some`: the fold was refused, and the seat is held with that
+    /// reason, nothing removed.
+    #[allow(clippy::too_many_lines)] // Find, plan, move or union, then remove.
+    fn fold_source_key(
+        &mut self,
+        row: &RowSchema,
+        settings: &Consolidation,
+    ) -> Result<Option<&'static str>> {
+        use std::os::unix::ffi::OsStrExt as _;
+        let mut parts = row.rel_path.split(|byte| *byte == b'/');
+        let (Some(b"projects"), Some(key), Some(name), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Ok(None);
+        };
+        let mut dest_dir = b"projects/".to_vec();
+        dest_dir.extend_from_slice(key);
+        let Some(source_dir) = self
+            .maps
+            .maps()
+            .iter()
+            .find(|(_, destination)| *destination == dest_dir)
+            .map(|(source, _)| source.clone())
+        else {
+            return Ok(None);
+        };
+        let root = self.target.path().to_path_buf();
+        let from_dir = root.join(std::ffi::OsStr::from_bytes(&source_dir));
+        let from = from_dir.join(std::ffi::OsStr::from_bytes(name));
+        let Ok(from_meta) = std::fs::symlink_metadata(&from) else {
+            return Ok(None);
+        };
+        let to = root.join(std::ffi::OsStr::from_bytes(&row.rel_path));
+        let to_meta = std::fs::symlink_metadata(&to).ok();
+        let mut source_rel = source_dir;
+        source_rel.push(b'/');
+        source_rel.extend_from_slice(name);
+        if settings.plan_only {
+            let action = if to_meta.is_some() {
+                "fold-union"
+            } else {
+                "fold-move"
+            };
+            self.stats.planned.push(PlannedSeat {
+                rel_path: source_rel,
+                class: crate::consolidate::Class::AppendLog.word(),
+                action,
+                source_size: from_meta.len(),
+                live_size: to_meta.as_ref().map(std::fs::Metadata::len),
+                reason: Some("the same session at the map's source key"),
+            });
+            return Ok(None);
+        }
+        let c = |bytes: &[u8]| crate::io::c_name(bytes).refuse_at("transfer::fold_source_key");
+        let open_dir = |dir: &Path| std::fs::File::open(dir).refuse_at("transfer::fold_source_key");
+        let from_handle = open_dir(&from_dir)?;
+        let from_c = c(name)?;
+        let Some(to_meta) = to_meta else {
+            // Absent at the mapped key: the node itself moves there.
+            let to_dir = open_dir(to.parent().ok_or(BulkloadRefusal::PathEscapesRoot)?)?;
+            match crate::io::sys::rename_exclusive_at(&from_handle, &from_c, &to_dir, &c(name)?) {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
+                    return Ok(Some(KEY_FOLD_RACED));
+                }
+                Err(error) => return Err(error).refuse_at("transfer::fold_source_key"),
+            }
+            crate::io::durable::seal_dir(&to_dir).refuse_at("transfer::fold_source_key")?;
+            crate::io::durable::seal_dir(&from_handle).refuse_at("transfer::fold_source_key")?;
+            self.record_fold(&source_rel, &row.rel_path, "move", settings)?;
+            self.forget_elsewhere(name, key);
+            return Ok(None);
+        };
+        // Present: the source-key copy (its bytes, through a link too) is
+        // unioned into the mapped one, then its name removed.
+        let Ok(source_file) = std::fs::File::open(&from) else {
+            return Ok(Some(KEY_FOLD_RACED));
+        };
+        let size = source_file.metadata().map_or(0, |meta| meta.len());
+        if self.consolidate_ledger.is_none() {
+            self.consolidate_ledger = Some(crate::consolidate::Ledger::open(&settings.ledger)?);
+        }
+        let ledger = self
+            .consolidate_ledger
+            .as_ref()
+            .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
+        let to_dir = open_dir(to.parent().ok_or(BulkloadRefusal::PathEscapesRoot)?)?;
+        let live = crate::consolidate::Live {
+            dir: &to_dir,
+            name,
+            path: &to,
+            rel: &row.rel_path,
+        };
+        let source = crate::consolidate::Source {
+            file: &source_file,
+            path: &from,
+            size,
+            mtime_ns: 0,
+            maps: &settings.maps,
+        };
+        let outcome = if to_meta.file_type().is_symlink() {
+            match archive_target(&root, &row.rel_path, &settings.archived) {
+                Some(target) => {
+                    crate::consolidate::append_log::union_link(&live, &target, &source, ledger)
+                }
+                None => return Ok(Some(OTHER_KIND)),
+            }
+        } else {
+            crate::consolidate::append_log::union(&live, &source, ledger)
+        };
+        match outcome {
+            Ok(outcome) if !matches!(outcome.action, crate::consolidate::Action::Held(_)) => {}
+            Ok(_) | Err(BulkloadRefusal::HomesConsolidateRaced) => return Ok(Some(KEY_FOLD_RACED)),
+            Err(refusal) => return Err(refusal),
+        }
+        // The merged bytes are durable (the union syncs what it writes; a
+        // covered file is synced here). The source-key name goes only while
+        // it is the node read and nobody holds it.
+        if let Ok(file) = std::fs::File::open(&to) {
+            file.sync_all().refuse_at("transfer::fold_source_key")?;
+        }
+        let unmoved = std::fs::symlink_metadata(&from)
+            .is_ok_and(|now| now.ino() == from_meta.ino() && now.len() == from_meta.len());
+        let free = matches!(
+            crate::procs::inside(&[from.as_path()])?,
+            Some(pids) if pids.is_empty()
+        );
+        if !unmoved || !free {
+            return Ok(Some(KEY_FOLD_RACED));
+        }
+        crate::io::sys::unlinkat(&from_handle, &from_c, false)
+            .refuse_at("transfer::fold_source_key")?;
+        crate::io::durable::seal_dir(&from_handle).refuse_at("transfer::fold_source_key")?;
+        self.record_fold(&source_rel, &row.rel_path, "union", settings)?;
+        self.forget_elsewhere(name, key);
+        Ok(None)
+    }
+
+    /// Ledger a source-key fold (`key_fold` in `consolidate.sqlite`).
+    fn record_fold(
+        &mut self,
+        from: &[u8],
+        to: &[u8],
+        action: &str,
+        settings: &Consolidation,
+    ) -> Result<()> {
+        if self.consolidate_ledger.is_none() {
+            self.consolidate_ledger = Some(crate::consolidate::Ledger::open(&settings.ledger)?);
+        }
+        let ledger = self
+            .consolidate_ledger
+            .as_ref()
+            .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
+        let conn = ledger.connection();
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos()),
+        )
+        .unwrap_or(i64::MAX);
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS key_fold(
+                source BLOB NOT NULL,
+                destination BLOB NOT NULL,
+                action TEXT NOT NULL,
+                at_ns INTEGER NOT NULL,
+                PRIMARY KEY(source, destination, at_ns)
+            );",
+        )
+        .map_err(|_| BulkloadRefusal::SqliteStateChanged)?;
+        conn.execute(
+            "INSERT INTO key_fold(source, destination, action, at_ns) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![from, to, action, now],
+        )
+        .map_err(|_| BulkloadRefusal::SqliteStateChanged)?;
+        self.stats
+            .folded
+            .push((from.to_vec(), to.to_vec(), action.to_owned()));
+        Ok(())
+    }
+
+    /// The destination's key index without `name` at `key`'s map source,
+    /// once it was folded.
+    fn forget_elsewhere(&mut self, name: &[u8], key: &[u8]) {
+        if let Some(index) = self.elsewhere.as_mut() {
+            if let Some(keys) = index.get_mut(name) {
+                keys.retain(|held| held.as_slice() == key);
+            }
+        }
     }
 
     /// Whether `rel_path`, a transcript `projects/<key>/<name>`, is a name
@@ -7534,6 +7798,7 @@ impl<W: Write> Inbound<'_, W> {
             .flatten()
             .and_then(|(file, _)| file.metadata().ok())
             .map(|found| StatIdentity::from_metadata(&found));
+        let archived = archive_target(self.target.path(), &row.rel_path, &settings.archived);
         let Some(union) = crate::consolidate::union_of(class) else {
             let reason = if class == crate::consolidate::Class::Sqlite {
                 SQLITE_PENDING
@@ -7563,22 +7828,25 @@ impl<W: Write> Inbound<'_, W> {
         // An in-memory file has no name: a union that opens by path opens
         // this one.
         let source_path = PathBuf::from(format!("/proc/self/fd/{}", staged.file().as_raw_fd()));
-        let outcome = union(
-            &crate::consolidate::Live {
-                dir: staged.parent(),
-                name: staged.leaf(),
-                path: &live_path,
-                rel: &row.rel_path,
-            },
-            &crate::consolidate::Source {
-                file: staged.file(),
-                path: &source_path,
-                size: row.size,
-                mtime_ns: row.mtime_ns,
-                maps: &settings.maps,
-            },
-            ledger,
-        )?;
+        let live = crate::consolidate::Live {
+            dir: staged.parent(),
+            name: staged.leaf(),
+            path: &live_path,
+            rel: &row.rel_path,
+        };
+        let source = crate::consolidate::Source {
+            file: staged.file(),
+            path: &source_path,
+            size: row.size,
+            mtime_ns: row.mtime_ns,
+            maps: &settings.maps,
+        };
+        let outcome = match &archived {
+            Some(target) => {
+                crate::consolidate::append_log::union_link(&live, target, &source, ledger)?
+            }
+            None => union(&live, &source, ledger)?,
+        };
         Ok((outcome, before))
     }
 
@@ -7607,6 +7875,21 @@ impl<W: Write> Inbound<'_, W> {
             Ok(None) => {
                 drop_staged(staged);
                 return Err(BulkloadRefusal::ProtocolStateViolation);
+            }
+            Err(_)
+                if archive_target(self.target.path(), &row.rel_path, &settings.archived)
+                    .is_some() =>
+            {
+                if settings.plan_only {
+                    drop_staged(staged);
+                    self.plan_seat(row, class.word(), "consolidate", None, Some(ARCHIVE_LINK));
+                    self.answered_now = Some(false);
+                    return Ok(());
+                }
+                let Some(staged) = staged else {
+                    return Err(BulkloadRefusal::ProtocolStateViolation);
+                };
+                return self.consolidate_staged(staged, row, &key, class, racy);
             }
             Err(_) => {
                 drop_staged(staged);
@@ -8626,7 +8909,13 @@ fn plan_consolidating(
         Ok(None) if plan => return dry("create", None, None),
         Ok(None) => return Consolidating::Land,
         Err(BulkloadRefusal::DestinationOccupied | BulkloadRefusal::DestinationKindMismatch) => {
-            return held(None, None, OTHER_KIND)
+            if archive_target(context.target.path(), &row.rel_path, &settings.archived).is_some() {
+                if plan {
+                    return dry("consolidate", None, Some(ARCHIVE_LINK));
+                }
+                return Consolidating::Stage(class);
+            }
+            return held(None, None, OTHER_KIND);
         }
         Err(refusal) => return done(Plan::Refuse(refusal)),
     };

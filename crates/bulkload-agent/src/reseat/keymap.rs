@@ -514,8 +514,21 @@ pub fn proof(
                 Some(to) => status(&path, meta.len(), &projects.join(to).join(&rel), suffix)?,
             };
             *summary.files.entry(word).or_default() += 1;
+            // What the next mapped pull does with it (`--consolidate`): a
+            // top-level transcript under a mapped source key is folded into
+            // the destination key, moved when absent there, else unioned.
+            let fold = match &to {
+                Some(to) if basis == "key-map" && *to != dir && rel.components().count() == 1 => {
+                    if std::fs::symlink_metadata(projects.join(to).join(&rel)).is_ok() {
+                        "union"
+                    } else {
+                        "move"
+                    }
+                }
+                _ => "none",
+            };
             emit(&format!(
-                "{{\"schema\":\"{SCHEMA}\",\"kind\":\"key-map-proof\",\"tool\":\"claude\",\"source_key\":{},\"dest_key\":{},\"basis\":\"{basis}\",\"path\":{},\"size\":{},\"status\":\"{word}\"}}",
+                "{{\"schema\":\"{SCHEMA}\",\"kind\":\"key-map-proof\",\"tool\":\"claude\",\"source_key\":{},\"dest_key\":{},\"basis\":\"{basis}\",\"path\":{},\"size\":{},\"status\":\"{word}\",\"fold\":\"{fold}\"}}",
                 json_string(&dir),
                 to.as_deref().map_or_else(|| "null".to_owned(), json_string),
                 json_string(&rel.to_string_lossy()),

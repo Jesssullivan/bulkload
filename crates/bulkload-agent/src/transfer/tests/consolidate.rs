@@ -37,6 +37,7 @@ impl Consolidating {
                 maps: crate::consolidate::Maps::default(),
                 ledger: self.state().join("consolidate"),
                 plan_only,
+                archived: Vec::new(),
             })),
         );
     }

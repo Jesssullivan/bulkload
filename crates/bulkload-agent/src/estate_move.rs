@@ -698,6 +698,7 @@ impl Move {
             maps: bulkload_agent::consolidate::Maps::new(pairs),
             ledger: self.state.join("consolidate"),
             plan_only,
+            archived: self.archived.clone(),
         })
     }
 }
@@ -1611,12 +1612,12 @@ fn reseat(
     }
     args.extend(run.reseat_args.iter().cloned());
     // Consolidated homes (operator ruling 2026-10-20): nothing lands
-    // beside, so no beside suffix; and A-106 is a union now, never the
-    // source's copy replacing a destination archive link. Until the
-    // append-log union (#294) lands, a placement over such a link stays
-    // `occupied`: typed, holding the gate.
+    // beside, so no beside suffix. A-106 is the pull's union now: a
+    // transcript linked into a --replace-archived-dest root was unioned with
+    // the archived file and regularized there (the archive copy stays), so
+    // the re-seat is never asked to replace a link.
     if !run.archived.is_empty() {
-        out("estate-move a106=union-pending replace-archived-dest=ignored")?;
+        out("estate-move a106=union-at-pull")?;
     }
     // Review of #280, finding 6: the landed index is the snapshot this
     // pass took, named by this pass's Codex transfer record, or none: never

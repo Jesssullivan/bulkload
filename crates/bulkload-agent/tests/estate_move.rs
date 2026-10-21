@@ -1268,33 +1268,36 @@ fn archive_links_follow_a106_and_destination_links_stay() {
         moved.stdout,
         moved.stderr
     );
-    // A-106 is a union now (operator ruling 2026-10-20), never neo's copy
-    // replacing the destination's: until the append-log union (#294)
-    // lands, the archive link at the lane's key stays, the archived fork is
-    // untouched, and the placement is `occupied`, holding the gate.
+    // A-106 is a union at the pull (operator ruling 2026-10-20; A-055): a
+    // transcript linked into the archive root is unioned with the archived
+    // file and regularized at the live name; the archive copy stays.
     assert!(
-        moved.stdout.contains("estate-move a106=union-pending"),
+        moved.stdout.contains("estate-move a106=union-at-pull"),
         "{}",
         moved.stdout
     );
-    // The live name holds the destination's fork (the re-seat regularizes
-    // its archive link in place, OI-1003-Q198), never neo's copy. Neo's
-    // copy is held at the pull, typed, and written nowhere: one session,
-    // one file on sting (SPEC rule 3), until the append-log union merges
-    // them.
     let at_live = dst_projects.join(format!("{SID_FORK}.jsonl"));
-    assert_eq!(fs::read_to_string(&at_live).unwrap(), fork_bytes);
+    assert!(
+        fs::symlink_metadata(&at_live).unwrap().is_file(),
+        "regularized: {}\n{}",
+        moved.stdout,
+        moved.stderr
+    );
+    let unioned = fs::read_to_string(&at_live).unwrap();
+    assert!(
+        unioned.starts_with(&neo(SID_FORK)),
+        "neo's bytes first: {unioned}"
+    );
+    for line in fork_bytes.lines() {
+        assert!(
+            unioned.contains(line),
+            "the archived fork's line kept: {line}"
+        );
+    }
     assert_eq!(
         fs::read_to_string(archive.join("fork.jsonl")).unwrap(),
-        fork_bytes
-    );
-    assert!(
-        moved.stderr.contains(&format!(
-            "held projects/{}/{SID_FORK}.jsonl: HOMES_CONSOLIDATE_UNSUPPORTED",
-            key(&dst_lane)
-        )),
-        "{}",
-        moved.stderr
+        fork_bytes,
+        "the archive copy stays"
     );
     let copies: Vec<String> = tree_files(&dst_claude)
         .into_iter()
@@ -1304,47 +1307,53 @@ fn archive_links_follow_a106_and_destination_links_stay() {
     assert_eq!(
         copies,
         [format!("projects/{}/{SID_FORK}.jsonl", key(&dst_lane))],
-        "nothing new at any key"
+        "one file per session"
     );
     assert!(
         !moved.stdout.contains("RESEAT_DEST_DIVERGED"),
         "{}",
         moved.stdout
     );
-    // Under the neo key: the destination's link is held at the pull (a live
-    // path of another kind), never landed beside; the live name keeps the
-    // destination's archived bytes, never neo's copy.
-    assert_eq!(
-        fs::read_to_string(neo_key_dir.join(format!("{SID_NEO_KEY}.jsonl"))).unwrap(),
-        transcript(SID_NEO_KEY, &src_lane, "OLD")
-    );
+    // Under the neo key: the same session the map lands at the lane's key.
+    // The neo-key link was moved there (never copied), then unioned with
+    // neo's copy and regularized; nothing stays under the neo key.
     assert!(
-        moved.stderr.contains(&format!(
-            "held projects/{}/{SID_NEO_KEY}.jsonl: HOMES_CONSOLIDATE_UNSUPPORTED",
-            key(&dst_lane)
-        )),
+        fs::symlink_metadata(neo_key_dir.join(format!("{SID_NEO_KEY}.jsonl"))).is_err(),
         "{}",
         moved.stderr
     );
-    assert!(!neo_key_dir
-        .join(format!("{SID_NEO_KEY}.jsonl.{LABEL}"))
-        .exists());
+    let moved_here = dst_projects.join(format!("{SID_NEO_KEY}.jsonl"));
+    assert!(fs::symlink_metadata(&moved_here).unwrap().is_file());
+    let folded = fs::read_to_string(&moved_here).unwrap();
+    assert!(folded.starts_with(&neo(SID_NEO_KEY)), "{folded}");
+    for line in transcript(SID_NEO_KEY, &src_lane, "OLD").lines() {
+        assert!(folded.contains(line), "the old copy's line kept: {line}");
+    }
+    assert_eq!(
+        fs::read_to_string(archive.join("old-neo-key.jsonl")).unwrap(),
+        transcript(SID_NEO_KEY, &src_lane, "OLD")
+    );
+    assert!(
+        moved.stderr.contains("key-fold ") && moved.stderr.contains("action=move"),
+        "{}",
+        moved.stderr
+    );
     // The destination's own session keeps its own bytes.
     assert_eq!(
         fs::read_to_string(dst_projects.join(format!("{SID_DEST}.jsonl"))).unwrap(),
         transcript(SID_DEST, &dst_lane, "OWN")
     );
-    // Codex: the archive link at neo's rollout path is held too; it and the
-    // archived rollout are untouched.
+    // Codex: the archive link at neo's rollout path is unioned and
+    // regularized the same way; the archived rollout is untouched.
     let live_rollout = dst_codex.join(&fork_rel);
     assert!(
-        fs::symlink_metadata(&live_rollout)
-            .unwrap()
-            .file_type()
-            .is_symlink(),
+        fs::symlink_metadata(&live_rollout).unwrap().is_file(),
         "{}",
         moved.stdout
     );
+    let rollout = fs::read(&live_rollout).unwrap();
+    assert!(rollout.starts_with(neo_rollout.as_bytes()));
+    assert!(rollout.ends_with(b"{\"sting\":true}\n"));
     assert_eq!(
         fs::read(archive.join("rollout-fork.jsonl")).unwrap(),
         archived_rollout
@@ -1625,7 +1634,7 @@ fn sessions_land_once_under_the_mapped_key_and_a_shared_key_stays_typed() {
     );
     let inode = std::os::unix::fs::MetadataExt::ino(&fs::metadata(&at_lane).unwrap());
 
-    // The session grows on the source: landed again under the key
+    // The session grows on the source: extended in place, under the key
     // (both sides quiet past the racy window, as between real passes).
     let mut grown = neo;
     grown.push_str(&transcript(SID, &src_lane, "NEO2"));
@@ -1641,9 +1650,13 @@ fn sessions_land_once_under_the_mapped_key_and_a_shared_key_stays_typed() {
         again.stdout,
         again.stderr
     );
-    // This store's own output from the first pass: superseded whole by
-    // the crash-safe exchange (WP0(d)), one file at the path.
-    let _ = inode;
+    // SPEC: the missing tail is appended in place, the same inode, so a
+    // session writing through an open handle never loses a turn.
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&fs::metadata(&at_lane).unwrap()),
+        inode,
+        "extended in place"
+    );
     assert!(!at_lane.with_extension(format!("jsonl.{LABEL}")).exists());
     assert!(!dst_claude.join("projects").join(key(&src_lane)).exists());
     // The extended empty file is the seat's now: adopted, never landed
