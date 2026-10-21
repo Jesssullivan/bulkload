@@ -1527,7 +1527,7 @@ pub fn plan_only() -> bool {
 }
 
 /// Why an append log that diverged is held: its union is the #294 lane's.
-const APPEND_LOG_PENDING: &str = "append-log: diverged, and the JSONL union (#294) has not landed";
+const APPEND_LOG_PENDING: &str = "append-log: diverged, and no union is available for it";
 /// Why a `SQLite` store (or its `-wal`, `-shm`, `-journal`) is held: its
 /// union is the row stream (`sqlite_union`, `--sqlite-rows`), never this file
 /// path.
@@ -1536,7 +1536,7 @@ const SQLITE_PENDING: &str = "sqlite: a store is merged by the row union, never 
 /// held: a second copy of one session is a duplicate (SPEC rule 3), and
 /// the union into the one live file is the #294 lane's.
 const ELSEWHERE_PENDING: &str =
-    "append-log: the destination holds this session under another key, and the JSONL union (#294) has not landed";
+    "append-log: the destination holds this session under another key no map covers";
 /// Why a file too large to gather in memory is held.
 const OVER_MEMORY: &str = "over the 64 MiB a union gathers in memory";
 /// Why a live path of another kind is held.
@@ -1624,6 +1624,33 @@ fn listing() -> Vec<Vec<u8>> {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .clone()
+}
+
+/// The destination subtrees a session leaves to another session
+/// ([`set_skip`]).
+static SKIP: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+/// Answer every entry at or under one of `prefixes` `Skip`.
+///
+/// The prefixes are destination relative paths, whole components; in every
+/// session of this process such an entry is never decided, written or
+/// recorded: a subtree another session lands (estate-move's live links: a
+/// home directory that links into a declared root is merged there, at its
+/// real path). An empty list: none.
+pub fn set_skip(prefixes: Vec<Vec<u8>>) {
+    *SKIP.lock().unwrap_or_else(PoisonError::into_inner) = prefixes;
+}
+
+fn skip() -> Vec<Vec<u8>> {
+    SKIP.lock().unwrap_or_else(PoisonError::into_inner).clone()
+}
+
+/// Whether `path` is `prefix` or lies under it, by whole components.
+fn under_prefix(path: &[u8], prefix: &[u8]) -> bool {
+    path == prefix
+        || (path.len() > prefix.len()
+            && path.starts_with(prefix)
+            && path.get(prefix.len()) == Some(&b'/'))
 }
 
 /// The delta lever by canonical destination root, for tests that compare
@@ -5647,6 +5674,8 @@ struct Inbound<'a, W> {
     listing: Vec<Vec<u8>>,
     /// The paths never landed ([`set_excluded`]).
     excluded: Vec<Vec<u8>>,
+    /// Destination subtrees another session lands ([`set_skip`]).
+    skip: Vec<Vec<u8>>,
     /// `--consolidate` for this session's root ([`consolidation`]).
     consolidate: Option<Arc<Consolidation>>,
     /// The consolidation ledger, opened at the first union.
@@ -5682,6 +5711,11 @@ enum Walked {
     },
     EngineTemporary {
         rel_path: Vec<u8>,
+    },
+    /// An entry in a subtree another session lands ([`set_skip`]): answered
+    /// `Skip`, never decided or recorded here, never a batch member.
+    Skipped {
+        entry: u64,
     },
     /// `--map-prefix`: an entry the owner rule refuses (it would reach a
     /// map's destination another way), at its source path: never a batch
@@ -6014,6 +6048,7 @@ fn receive_session<R: Read, W: Write>(
             snapshot_bases: HashSet::new(),
             listing: listing(),
             excluded: excluded_paths,
+            skip: skip(),
             consolidate,
             consolidate_ledger: None,
             answered_now: None,
@@ -6346,6 +6381,17 @@ impl<W: Write> Inbound<'_, W> {
                 self.stats.source_engine_temporaries.push(rel_path);
                 Ok(())
             }
+            Walked::Skipped { entry } => {
+                write_control(
+                    self.output,
+                    &Control::Decide {
+                        entry,
+                        decision: Decision::Skip,
+                    },
+                )?;
+                fault_point!(ReceiveAfterDecide);
+                Ok(())
+            }
             Walked::Unowned { entry, row } => {
                 // Refused, and still the source's: listed at its own path,
                 // as any source path the walk refused (verification of
@@ -6375,6 +6421,13 @@ impl<W: Write> Inbound<'_, W> {
     /// path ([`PrefixMap::land`]), recording the map it was landed
     /// through, or [`Walked::Unowned`] at its source path.
     fn landed(&mut self, entry: u64, mut row: RowSchema, wal: Option<SidecarId>) -> Walked {
+        if self
+            .skip
+            .iter()
+            .any(|prefix| under_prefix(&self.maps.path(row.rel_path.clone()), prefix))
+        {
+            return Walked::Skipped { entry };
+        }
         if self.maps.is_empty() {
             return Walked::Entry { entry, row, wal };
         }
@@ -7019,6 +7072,10 @@ impl<W: Write> Inbound<'_, W> {
         if from_meta.is_dir() {
             return Ok(None);
         }
+        // A source-key copy may be a link (into the archive): its bytes are
+        // its target's, compared and merged through it, and only the link
+        // name is ever removed, never the target.
+        let from_bytes_meta = std::fs::metadata(&from).ok();
         let to = root.join(std::ffi::OsStr::from_bytes(&row.rel_path));
         let to_meta = std::fs::symlink_metadata(&to).ok();
         let append_log = class == crate::consolidate::Class::AppendLog;
@@ -7027,8 +7084,9 @@ impl<W: Write> Inbound<'_, W> {
         // are held.
         let equal = |to_meta: &std::fs::Metadata| -> bool {
             to_meta.is_file()
-                && from_meta.is_file()
-                && to_meta.len() == from_meta.len()
+                && from_bytes_meta
+                    .as_ref()
+                    .is_some_and(|meta| meta.is_file() && meta.len() == to_meta.len())
                 && files_equal(&from, &to).unwrap_or(false)
         };
         if settings.plan_only {
@@ -7042,7 +7100,7 @@ impl<W: Write> Inbound<'_, W> {
                 rel_path: source_rel,
                 class: class.word(),
                 action,
-                source_size: from_meta.len(),
+                source_size: from_bytes_meta.as_ref().map_or(0, std::fs::Metadata::len),
                 live_size: to_meta.as_ref().map(std::fs::Metadata::len),
                 reason: Some("the same session at the map's source key"),
             });

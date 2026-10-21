@@ -515,3 +515,19 @@ ok.
 - A link outside the archive roots, and a session held under a key that
   is no map source, stay held (`OTHER_KIND`, `held_elsewhere`).
 - `just darwin-check` on pzm is owed before merge.
+
+## 2026-10-21: the gate ruling and the escalation deflake (after #294 merged)
+
+- Operator ruling, 2026-10-21, verbatim: "honey load is a self-fulfillling
+  failiure, cut that gate." `AGENTS.md`'s Validation section now records
+  it. Merge evidence is the lane's targeted tests on honey, fmt and
+  clippy, gitleaks, and the pzm `darwin-check` when the PR is
+  darwin-touched. `just local-gate` stays available but is not required.
+- `an_idle_background_process_escalates_once_after_the_threshold` raced.
+  The watcher moves the IO class first and bumps its counters after, and
+  the test closed stdin as soon as the class moved, so on a loaded host
+  the counters line came first. The test now waits up to 30 s for the
+  escalation event itself: the watcher thread's end, which follows its
+  counters.
+- On honey (load average about 41): fmt and clippy ok, and
+  `priority_escalation` 3/3 three times in a row.
