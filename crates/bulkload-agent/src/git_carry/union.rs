@@ -248,8 +248,9 @@ pub fn stash(repo: &Path, entries: &[(String, String)]) -> Result<u64> {
     Ok(added)
 }
 
-/// Append the source's reflog entries, ref by ref, that the destination's
-/// reflog of that ref (or of its remote-tracking name, when the ref was
+/// Append the source's reflog entries the destination's reflogs lack.
+///
+/// Ref by ref, into the destination's reflog of that ref (or of its remote-tracking name, when the ref was
 /// tracked) lacks, so every id they name stays reachable. Written whole and
 /// synced. Returns how many entries were added.
 ///
@@ -313,7 +314,11 @@ pub fn related(repo: &Path, roots: &[String]) -> Result<bool> {
     if roots.is_empty() {
         return Ok(false);
     }
-    let request: String = roots.iter().map(|root| format!("{root}\n")).collect();
+    let request = roots.iter().fold(String::new(), |mut all, root| {
+        all.push_str(root);
+        all.push('\n');
+        all
+    });
     let answered = input(
         git(repo).args(["cat-file", "--batch-check=%(objectname) %(objecttype)"]),
         request.as_bytes(),
@@ -323,8 +328,9 @@ pub fn related(repo: &Path, roots: &[String]) -> Result<bool> {
         .any(|line| line.ends_with(" commit")))
 }
 
-/// The index's entries (mode, id, stage, path), its stat data and
-/// extensions left out: what "the index changed" means to a later pass
+/// The digest of an index's entries (mode, id, stage, path).
+///
+/// Its stat data and extensions are left out: what "the index changed" means to a later pass
 /// (SPEC rule 8: a destination `git status` refreshing the stat data is no
 /// change). `index` names an index file; `worktree` any worktree of its
 /// repository.
