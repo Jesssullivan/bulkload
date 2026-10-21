@@ -37,7 +37,7 @@ pub const ROWS_VERSION: u16 = 1;
 /// message changes this text, and a peer with another id refuses.
 pub const ROWS_SCHEMA: &str = "bulkload rows v1 (2026-10-20)
 framing: u32be length (tag + body), tag 0x01, postcard body
-request {version u16, schema [u8;32], db bytes, last Option<Identity>, clock Option<bytes>}
+request {version u16, schema [u8;32], db bytes, last Option<Identity>, clock Option<bytes>, plan bool}
 identity {db Stat, wal Option<Stat>}
 stat {dev u64, ino u64, size u64, mtime_ns i64, ctime_ns i64}
 value 0 Null, 1 Integer i64, 2 Real u64 (f64 bits), 3 Text bytes, 4 Blob bytes
@@ -49,7 +49,7 @@ migration {version i64, checksum bytes}
 go 0 Stop, 1 Tables [Want]
 want {table bytes, time Option<bytes>, thread Option<bytes>, after_rowid Option<i64>, after_time Option<Value>}
 row {rowid Option<i64>, values [Value]}
-reply 0 Hello{version u16, schema [u8;32], identity Identity, store Option<Store>}, 1 Table{name bytes, columns [bytes], time_high Option<Value>}, 2 Rows [Row], 3 TableEnd{rows u64}, 4 End{rows u64, held_ns u64}, 5 Refused{code string, sqlite_code Option<i32>}";
+reply 0 Hello{version u16, schema [u8;32], identity Identity, store Option<Store>}, 1 Table{name bytes, columns [bytes], time_high Option<Value>}, 2 Rows [Row], 3 TableEnd{rows u64}, 4 End{rows u64, held_ns u64}, 5 Refused{code string, sqlite_code Option<i32>}, 6 Planned{sqlite bool, wal bool}";
 
 /// BLAKE3 of [`ROWS_SCHEMA`]: both peers must agree on it.
 #[must_use]
@@ -159,6 +159,10 @@ pub struct Request {
     /// is another store than `db`: a thread-scoped table's rows are then
     /// wanted by their thread's change ([`Want::thread`]).
     pub clock: Option<Vec<u8>>,
+    /// `--plan-only`: only the store's header is read (a plain file read,
+    /// no `SQLite` lock), and [`Reply::Planned`] says whether it can be
+    /// merged.
+    pub plan: bool,
 }
 
 /// What the destination wants of one table.
@@ -226,6 +230,12 @@ pub enum Reply {
     Refused {
         code: String,
         sqlite_code: Option<i32>,
+    },
+    /// The answer to a plan request: the file is a `SQLite` database, and
+    /// its header says WAL mode.
+    Planned {
+        sqlite: bool,
+        wal: bool,
     },
 }
 

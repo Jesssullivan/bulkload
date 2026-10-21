@@ -2667,8 +2667,9 @@ fn copy_recorded_kind(
             dest_state,
             kind,
         )?;
-        let stats =
+        let mut stats =
             bulkload_agent::transfer::copy_kind(source, dest, source_state, dest_state, kind)?;
+        union_routed(&mut stats, source, dest, None, &[]);
         keep_listed(&stats);
         return report_transfer(&stats);
     }
@@ -2715,7 +2716,8 @@ fn pull_recorded_kind(
     // `--plan-only`: nothing is recorded; the plan is printed.
     if bulkload_agent::transfer::plan_only() {
         bulkload_agent::transfer::receive_roots_apart_kind(path(2)?, path(4)?, kind)?;
-        let stats = pull_tree(kind, args)?;
+        let mut stats = pull_tree(kind, args)?;
+        union_routed(&mut stats, path(1)?, path(2)?, Some(host), args);
         keep_listed(&stats);
         return report_transfer(&stats);
     }
@@ -2974,6 +2976,7 @@ fn sqlite_union_command(args: &[std::ffi::OsString]) -> Result<()> {
             state: absolute(state)?,
             maps,
             full,
+            plan: false,
         };
         bulkload_agent::sqlite_union::local(&options)?
     } else {
@@ -2998,6 +3001,7 @@ fn sqlite_union_command(args: &[std::ffi::OsString]) -> Result<()> {
             state: absolute(state)?,
             maps,
             full,
+            plan: false,
         };
         bulkload_agent::transfer::set_rows_mode(true);
         pull_command(

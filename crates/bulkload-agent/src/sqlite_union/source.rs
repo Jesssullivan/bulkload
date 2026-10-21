@@ -76,6 +76,24 @@ fn unreadable(refusal: BulkloadRefusal) -> BulkloadRefusal {
     }
 }
 
+/// Whether the file at `path` is a `SQLite` database, and whether its
+/// header says WAL mode (bytes 18 and 19 are 2).
+fn header(path: &Path) -> Result<(bool, bool)> {
+    use std::io::Read as _;
+    let mut head = [0_u8; 100];
+    let file = std::fs::File::open(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => BulkloadRefusal::SourceVanished,
+        _ => BulkloadRefusal::Io(error.raw_os_error()),
+    })?;
+    let read = file
+        .take(100)
+        .read(&mut head)
+        .map_err(|error| BulkloadRefusal::Io(error.raw_os_error()))?;
+    let sqlite = read == 100 && head.starts_with(b"SQLite format 3\0");
+    let wal = sqlite && head.get(18..20) == Some([2, 2].as_slice());
+    Ok((sqlite, wal))
+}
+
 /// Where a thread's `updated_at` is read: the store's own `threads`, or
 /// the clock store attached as `clock`.
 struct Clock {
@@ -131,6 +149,12 @@ fn serve<R: Read, W: Write>(
     let path = PathBuf::from(OsString::from_vec(request.db.clone()));
     if !path.is_absolute() {
         return Err(BulkloadRefusal::PathNotAbsolute);
+    }
+    if request.plan {
+        // The header only: a plain read, no `SQLite` lock on the store.
+        let (sqlite, wal) = header(&path)?;
+        write_message(output, &Reply::Planned { sqlite, wal })?;
+        return Ok(SourceStats::default());
     }
     let identity = super::identity(&path)?;
     if request.last == Some(identity) {

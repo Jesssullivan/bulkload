@@ -147,3 +147,23 @@ are kept.
 
 Honey ran targeted tests only (rule of 2026-10-21): fmt, both clippy lanes,
 and lib `sqlite_union consolidate` (38 passed).
+
+## 2026-10-21: gate fix at 6bf97fc (estate_move:817), plan-only, neo survey
+
+- **The gate's failure.** `sessions_are_consolidated_into_the_live_home_and_the_gate_reads_them`
+  (from #297) built its source Codex store in DELETE mode, so the union
+  held it `SQLITE_UNION_SOURCE_NOT_WAL`, as designed.
+  - The source store is now built in WAL mode (`codex_index_wal`), as real
+    Codex stores are. The test expects it consolidated in pass 1 and
+    covered in the unchanged pass 2, with the gate passing.
+  - The NOT_WAL hold stays (SPEC rule 6).
+- **Sidecar routing.** Pass 2 showed the sidecar check refusing the
+  `-wal`/`-shm` that pass 1's read-only open left beside the source store.
+  A sidecar of a routed store is now routed with it and takes its outcome.
+- **`--plan-only`.** Each store's header is read (no `SQLite` lock). A
+  NOT_WAL or unreadable store is listed `hold` with its code, and each
+  store gets a `planned-sqlite` line.
+- **neo survey** (`sqlite3 -readonly <db> 'PRAGMA journal_mode'` on
+  `/Volumes/TinylandState/tinyland-state/codex`): not possible on
+  2026-10-21. The volume is not mounted on neo, and `~/.codex` is a
+  dangling link to it. Nothing was mounted or changed.

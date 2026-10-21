@@ -517,6 +517,18 @@ fn codex_index(path: &Path, id: &str, rollout: &str, cwd: &Path) {
     conn.close().map_err(|(_, error)| error).unwrap();
 }
 
+/// A Codex index in WAL mode, as a live Codex keeps it: the row union
+/// reads it from one held read snapshot.
+fn codex_index_wal(path: &Path, id: &str, rollout: &str, cwd: &Path) {
+    codex_index(path, id, rollout, cwd);
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+    conn.close().map_err(|(_, error)| error).unwrap();
+}
+
 fn thread_cwds(path: &Path) -> Vec<(String, String)> {
     let conn = rusqlite::Connection::open_with_flags(
         format!("file:{}?immutable=1", path.display()),
@@ -589,7 +601,7 @@ fn sessions_are_consolidated_into_the_live_home_and_the_gate_reads_them() {
         src_lane.display()
     );
     fs::write(&rollout, &rollout_bytes).unwrap();
-    codex_index(
+    codex_index_wal(
         &src_codex.join("state_5.sqlite"),
         THREAD,
         rollout.to_str().unwrap(),
@@ -680,14 +692,14 @@ fn sessions_are_consolidated_into_the_live_home_and_the_gate_reads_them() {
     };
 
     // Pass 1 (operator ruling 2026-10-20): the homes are consolidated.
-    // The Codex store is the row union's (#278), held typed until it lands,
-    // so the sessions pull ends ITEMS_REFUSED; the re-seat still runs.
+    // The Codex store, in WAL mode as a live Codex keeps it, is merged row
+    // by row into the live index (the row union, one serve session).
     let moved = move_pass();
-    assert!(!moved.ok, "{}\n{}", moved.stdout, moved.stderr);
+    assert!(moved.ok, "{}\n{}", moved.stdout, moved.stderr);
     assert!(
         moved
             .stdout
-            .contains("estate-move phase=sessions-pull outcome=refused:ITEMS_REFUSED"),
+            .contains("estate-move phase=sessions-pull outcome=ok"),
         "{}",
         moved.stdout
     );
@@ -760,15 +772,15 @@ fn sessions_are_consolidated_into_the_live_home_and_the_gate_reads_them() {
             );
         }
     }
-    // Codex: the live index and its sidecar are never written by the pull,
-    // and nothing lands beside them; the source's rollout lands in place and
-    // the re-seat registers its thread for the lane from its header.
+    // Codex: the live index is never written as a file and nothing lands
+    // beside it; its rows took the source's thread by the row union. The
+    // source's rollout lands in place.
     assert!(dst_codex.join("state_5.sqlite-wal").exists());
     assert!(!dst_codex.join(format!("state_5.sqlite.{LABEL}")).exists());
     assert!(
         moved
             .stderr
-            .contains("held state_5.sqlite: HOMES_CONSOLIDATE_UNSUPPORTED"),
+            .contains("consolidated state_5.sqlite action=consolidate"),
         "{}",
         moved.stderr
     );
@@ -777,6 +789,10 @@ fn sessions_are_consolidated_into_the_live_home_and_the_gate_reads_them() {
         rollout_bytes
     );
     let cwds = thread_cwds(&dst_codex.join("state_5.sqlite"));
+    assert!(
+        cwds.iter().any(|(id, _)| id == THREAD),
+        "the source's thread is a row of the live index: {cwds:?}"
+    );
     assert!(
         cwds.contains(&(
             DEST_THREAD.to_owned(),
@@ -793,15 +809,15 @@ fn sessions_are_consolidated_into_the_live_home_and_the_gate_reads_them() {
         fs::read_to_string(&rowless_rollout).unwrap(),
         dest_meta(ROWLESS_THREAD)
     );
-    // The closure: the session transfers joined, the merged configs
-    // accounted (covered), the held store pending review: the gate fails.
+    // The closure: the session transfers joined, the merged configs and the
+    // merged store accounted: the gate passes.
     let first = closure(&moved.stdout);
     assert_eq!(first["sessions"], "claude,codex", "{}", moved.stdout);
     assert_eq!(first["applied_beside"], "0", "{}", moved.stdout);
-    assert_eq!(first["refused_pending_review"], "1", "{}", moved.stdout);
+    assert_eq!(first["refused_pending_review"], "0", "{}", moved.stdout);
     assert_eq!(first["unaccounted"], "0", "{}", moved.stdout);
     assert!(
-        moved.stdout.contains("estate-move gate=fail"),
+        moved.stdout.contains("estate-move gate=pass"),
         "{}",
         moved.stdout
     );
@@ -815,12 +831,12 @@ fn sessions_are_consolidated_into_the_live_home_and_the_gate_reads_them() {
         "{closure_json}"
     );
     assert!(
-        closure_json.contains("\"HOMES_CONSOLIDATE_UNSUPPORTED\""),
+        !closure_json.contains("\"HOMES_CONSOLIDATE_UNSUPPORTED\""),
         "{closure_json}"
     );
 
     // Pass 2: unchanged. The merged configs are reused, nothing is
-    // rewritten, and the store is still held.
+    // rewritten, and the unchanged store is covered with nothing read.
     let settings_inode = fs::metadata(dst_claude.join("settings.json"))
         .unwrap()
         .ino();
@@ -832,8 +848,15 @@ fn sessions_are_consolidated_into_the_live_home_and_the_gate_reads_them() {
             .ino(),
         settings_inode
     );
+    assert!(
+        again
+            .stderr
+            .contains("consolidated state_5.sqlite action=covered"),
+        "{}",
+        again.stderr
+    );
     let second = closure(&again.stdout);
-    assert_eq!(second["refused_pending_review"], "1", "{}", again.stdout);
+    assert_eq!(second["refused_pending_review"], "0", "{}", again.stdout);
     assert_eq!(second["unaccounted"], "0", "{}", again.stdout);
     // SPEC rule 3: no `<path>.LABEL` copy anywhere in the homes; the one
     // there is the destination's own, untouched.

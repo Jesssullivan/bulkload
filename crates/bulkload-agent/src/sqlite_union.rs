@@ -230,9 +230,6 @@ pub fn union_routed(
 ) -> Vec<String> {
     use std::os::unix::ffi::OsStrExt as _;
     let routed = routed(&std::mem::take(&mut stats.sqlite_routed));
-    if settings.plan_only {
-        return Vec::new();
-    }
     let pairs: Vec<(Vec<u8>, Vec<u8>)> = settings
         .maps
         .pairs()
@@ -256,8 +253,30 @@ pub fn union_routed(
             state: settings.ledger.clone(),
             maps: maps.clone(),
             full: false,
+            plan: settings.plan_only,
         };
         let result = run(&options);
+        if settings.plan_only {
+            // One line per store the union cannot merge, on its planned
+            // seats: a store not in WAL mode is listed for the operator.
+            if let Err(refusal) = &result {
+                let code = refusal.code();
+                for seat in stats.planned.iter_mut().filter(|seat| {
+                    seat.rel_path == store.store || store.sidecars.contains(&seat.rel_path)
+                }) {
+                    seat.action = "hold";
+                    seat.reason = Some(code);
+                }
+            }
+            let word = result
+                .as_ref()
+                .map_or_else(BulkloadRefusal::code, |_| "row-union");
+            lines.push(format!(
+                "planned-sqlite {} {word}",
+                store.store.escape_ascii()
+            ));
+            continue;
+        }
         let word = match (action(&result), &result) {
             (Some(action), _) => action.word().to_owned(),
             (None, Err(refusal)) => refusal.code().to_owned(),

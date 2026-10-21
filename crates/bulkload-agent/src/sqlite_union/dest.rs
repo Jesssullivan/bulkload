@@ -63,6 +63,9 @@ pub struct Options {
     pub maps: Vec<(Vec<u8>, Vec<u8>)>,
     /// `--full`: read every row, whatever the marks say.
     pub full: bool,
+    /// `--plan-only`: only ask whether the source store can be merged
+    /// (its header); nothing is opened or written here.
+    pub plan: bool,
 }
 
 /// What one union did.
@@ -258,6 +261,9 @@ pub fn consolidate<R: Read, W: Write>(
     output: &mut W,
     options: &Options,
 ) -> Result<UnionStats> {
+    if options.plan {
+        return plan_only(input, output, options);
+    }
     let present = match seat_of(&options.dest) {
         Ok(_) => true,
         Err(BulkloadRefusal::SqliteUnionTargetAbsent) => false,
@@ -290,6 +296,7 @@ pub fn consolidate<R: Read, W: Write>(
             db: options.source_db.clone(),
             last,
             clock: options.source_clock.clone(),
+            plan: false,
         },
     )?;
     let (identity, source_store) = match read_message::<Reply, R>(input)? {
@@ -424,13 +431,44 @@ pub fn consolidate<R: Read, W: Write>(
             Reply::Refused { code, sqlite_code } => {
                 return Err(source_refusal(&code, sqlite_code));
             }
-            Reply::Hello { .. } => return Err(BulkloadRefusal::ProtocolStateViolation),
+            Reply::Hello { .. } | Reply::Planned { .. } => {
+                return Err(BulkloadRefusal::ProtocolStateViolation);
+            }
         }
     }
     let mut stats = merge.stats;
     ledger.set_identity(&identity)?;
     stats.fk_violations = check(&dest)?;
     Ok(stats)
+}
+
+/// `--plan-only`: whether the source store can be merged, from its header
+/// alone. A store not in WAL mode is `SQLITE_UNION_SOURCE_NOT_WAL` (reading
+/// it would need a lock its writer waits on, SPEC rule 6), one that is no
+/// database `SQLITE_UNION_SOURCE_UNREADABLE`.
+fn plan_only<R: Read, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    options: &Options,
+) -> Result<UnionStats> {
+    write_message(
+        output,
+        &Request {
+            version: ROWS_VERSION,
+            schema: rows::rows_id(),
+            db: options.source_db.clone(),
+            last: None,
+            clock: None,
+            plan: true,
+        },
+    )?;
+    match read_message::<Reply, R>(input)? {
+        Reply::Planned { sqlite: false, .. } => Err(BulkloadRefusal::SqliteUnionSourceUnreadable),
+        Reply::Planned { wal: false, .. } => Err(BulkloadRefusal::SqliteUnionSourceNotWal),
+        Reply::Planned { .. } => Ok(UnionStats::default()),
+        Reply::Refused { code, sqlite_code } => Err(source_refusal(&code, sqlite_code)),
+        _ => Err(BulkloadRefusal::ProtocolStateViolation),
+    }
 }
 
 /// A table's marks for this pass. `--full` reads every natural-key row

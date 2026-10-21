@@ -4584,6 +4584,8 @@ type SidecarReport = (Vec<u8>, Vec<u8>);
 /// a sidecar is never counted covered by its name alone: the `-wal` of a
 /// database without the `SQLite` magic (an encrypted store) carried raw, or
 /// a user's `notes-journal` beside a plain `notes`, stays a visible refusal.
+/// The sidecar of a store this session routed to the row union
+/// (`--consolidate`) is routed with it and takes the store's outcome.
 fn resolve_sidecars(
     stats: &mut TransferStats,
     sidecars: &[SidecarReport],
@@ -4604,7 +4606,11 @@ fn resolve_sidecars(
     let mut covered = Vec::new();
     let mut uncovered = Vec::new();
     for (rel_path, database) in sidecars {
-        if snapshot_bases.contains(database) && !refused.contains(database) {
+        if stats.sqlite_routed.contains(database) {
+            if !stats.sqlite_routed.contains(rel_path) {
+                stats.sqlite_routed.push(rel_path.clone());
+            }
+        } else if snapshot_bases.contains(database) && !refused.contains(database) {
             covered.push(rel_path.clone());
         } else {
             uncovered.push(rel_path.clone());
@@ -6622,9 +6628,8 @@ impl<W: Write> Inbound<'_, W> {
         if class == Class::Sqlite && union_of(class).is_none() {
             if plan {
                 self.plan_seat(row, class.word(), "row-union", None, None);
-            } else {
-                self.stats.sqlite_routed.push(row.rel_path.clone());
             }
+            self.stats.sqlite_routed.push(row.rel_path.clone());
             return Ok(Decision::Skip);
         }
         let identity = match self.target.identity(row) {

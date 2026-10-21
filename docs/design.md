@@ -2379,8 +2379,14 @@ joins the session's transfer record before it is written
 - the refusal, for example `HOMES_CONSOLIDATE_RACED` when the live store
   stayed locked past the batch wall or was replaced (retryable).
 
-The store's sidecars follow its outcome. `--plan-only` lists them as
-`row-union`.
+A sidecar the source reports beside a routed store is routed with it
+rather than refused, and the store's sidecars follow its outcome.
+`--plan-only` asks each store's source for its header only: a plain
+100-byte read, no `SQLite` lock. It lists the store `row-union`, or `hold`
+with `SQLITE_UNION_SOURCE_NOT_WAL` (a rollback-journal store, whose read
+would need a shared lock its writer waits on, SPEC rule 6) or
+`SQLITE_UNION_SOURCE_UNREADABLE`. Each store also gets one
+`planned-sqlite STORE WORD` line.
 - `>=` re-reads the rows at the old time mark itself; they are adopted.
 
 ## Durability
