@@ -379,8 +379,9 @@ fn store_of(snapshot: &ItemSnapshot, live: &Path) -> Option<PathBuf> {
         .map(|path| live.join(std::ffi::OsStr::from_bytes(path)))
 }
 
-/// Fetch `snapshot`'s objects by id from the live source repository into
-/// the item's live object store, before any ref names them (step 1 of the
+/// Fetch `snapshot`'s objects into the item's live object store.
+///
+/// By id, from the live source repository, before any ref names them (step 1 of the
 /// module docs): what a pass runs for every item in parallel. A linked
 /// worktree owns no store: nothing to fetch.
 ///
