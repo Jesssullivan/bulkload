@@ -249,8 +249,11 @@ fn holds_no_payload(state: &Path, items: u64) {
     );
 }
 
+// A read of `repo` that never refreshes its index (`status` otherwise
+// rewrites it), so a later pass sees the landed seats as it left them.
 fn out(repo: &Path, args: &[&str]) -> String {
     let ran = Command::new("git")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .arg("-C")
