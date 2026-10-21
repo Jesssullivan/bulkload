@@ -358,10 +358,25 @@ same report, totals and gate:
     branches of a session continued on both hosts are kept.
   - A live log that already holds every source record, in any order, is
     `covered` and is never rewritten (SPEC rule 7).
-  - The union is traded in by the crash-safe swap, checked against the
-    live file as it was read, and ledgered in `consolidate.sqlite`
-    (`append_log_union`: both inputs' and the output's BLAKE3, and the
-    record counts).
+  - A live log that is a prefix of the source's is extended in place: the
+    missing tail is appended to the same inode through `O_APPEND`, so a
+    session writing through an open handle never loses a turn. Only a
+    true union (the live log holds records the source lacks) is traded in
+    by the crash-safe swap, and only while no process holds the file. Both
+    are checked against the live file as it was read and ledgered in
+    `consolidate.sqlite` (`append_log_union`: both inputs' and the
+    output's BLAKE3, and the record counts).
+  - A live transcript that is a link into a `--replace-archived-dest`
+    root is unioned with its archived file and regularized: the union is
+    written as a regular file at the live name in place of the link, and
+    the archive copy stays (A-055, `append_log::union_link`).
+  - With `--map-prefix`, the same session that the destination holds at a
+    map's source key (`projects/<S>/<name>`) is folded into the mapped key
+    (`projects/<D>/<name>`). If absent there it is moved (renamed, never
+    copied); otherwise it is unioned. The source-key name is removed once
+    the merged bytes are durable, ledgered (`key_fold`) and reported on
+    `key-fold` lines. `--plan-only` lists `fold-move` and `fold-union`;
+    `--key-map-proof` gives each file a `fold` field.
   - A log that a process holds open, or that ends inside a line, is
     `HOMES_CONSOLIDATE_RACED`, retryable, with nothing written.
 - one **mapped** row per `--map-prefix SRC_REL=DST_REL` a `copy` or `pull`

@@ -319,10 +319,13 @@ SUBCOMMANDS:
                 and --reseat-arg (one estate-reseat option per flag, e.g.
                 --no-regularize, --unmapped=by-id) re-keys the landed
                 sessions from the live home into DEST_HOME (landing =
-                DEST_HOME). --replace-archived-dest is no longer forwarded:
-                A-106 is a union (estate-move a106=union-pending), and a
-                destination archive link is never replaced by the source's
-                copy. With --plan-only --sessions every home file is listed
+                DEST_HOME). A-106 is a union at the pull (estate-move
+                a106=union-at-pull): a transcript or rollout linking into a
+                --replace-archived-dest ROOT is unioned with its archived
+                file and regularized at the live name, the archive copy
+                kept; a session the destination holds at a mapped source
+                key is folded into the mapped key (moved when absent there,
+                else unioned; key-fold lines). With --plan-only --sessions every home file is listed
                 (planned PATH class= action= source_size= live_size=) and
                 nothing is landed, merged or recorded. State
                 MOVE_STATE/reseat. 7

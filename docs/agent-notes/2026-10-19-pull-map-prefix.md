@@ -464,7 +464,24 @@ shipped). After that, `bulkload-proto` 18/18, `refusal_taxonomy` 5/5,
 `closure` 38/38, `transfer::tests::consolidate` 4/4, and fmt and clippy are
 ok.
 
-## Open
+## Resume blockers: `f794163`
+
+1. In-place extension: the live file a prefix of the source gets its
+   tail through `O_APPEND` on the same inode. A racing writer is never
+   written over; the result is RACED and the next pass merges again.
+   The swap only does true unions, and only when nobody holds the file.
+2. Archive links: `append_log::union_link` writes the union as a regular
+   file at the live name for a link into a `--replace-archived-dest`
+   root, and leaves the archive copy alone. I wrote the union at the live
+   name rather than into the archive target, so the TIN-5268 archive
+   stays untouched. Manifest and streamed paths; Claude and Codex.
+3. Source-key fold: the same session at a map's source key on the
+   destination is moved (renamed) to the mapped key when absent there,
+   else unioned and removed once durable; ledgered (`key_fold`), reported
+   (`key-fold`), planned (`fold-move`, `fold-union`) and proofed (`fold`).
+   Only top-level `projects/<key>/<name>.jsonl` files fold; a session's
+   subagent files under a source key are not folded.
+
 
 - Source-key directories already on sting stay (removing a transcript is
   forbidden); `--key-map-proof` is the operator's evidence for a later
@@ -489,11 +506,7 @@ ok.
   yet). This lane supplies its append-log row (`append_log::plan_at`).
 - A copy whose union keeps refusing (a process never closes the file)
   stays kept and held until it can be unioned.
-- An archive-link transcript at the pull is held by #297's dispatch
-  (`the live path is a link or another kind`, and A-106 is not forwarded
-  after #297). It is not yet unioned into the link's target at the pull;
-  the re-seat's fold unions only race copies.
-- A transcript the destination holds under another key is held
-  (#297's `held_elsewhere`), and that includes neo-key directories that
-  earlier passes left.
+- A link outside the archive roots, and a session held under a key that
+  is no map source, stay held (`OTHER_KIND`, `held_elsewhere`).
+- Subagent files under a source key are not folded.
 - `just darwin-check` on pzm is owed before merge.
