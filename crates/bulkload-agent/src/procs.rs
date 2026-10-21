@@ -115,6 +115,33 @@ pub fn holders(
     scan_holders(files, &dirs, own)
 }
 
+/// Whether descriptor `theirs` of process `pid` is the very open file
+/// description this process holds as `mine` (Linux `kcmp(KCMP_FILE)`, a
+/// read-only compare of two descriptor tables). `None`: the compare did not
+/// answer; `Some(false)` with the descriptor or the process gone (`EBADF`,
+/// `ESRCH`) is told apart by the caller re-reading it.
+#[cfg(target_os = "linux")]
+fn same_description(pid: u32, mine: i32, theirs: i32) -> std::result::Result<bool, i32> {
+    let me = libc::pid_t::try_from(std::process::id()).unwrap_or(-1);
+    // SAFETY: `kcmp` reads two processes' descriptor tables and writes
+    // nothing; every argument is a plain integer.
+    let answer = unsafe {
+        libc::syscall(
+            libc::SYS_kcmp,
+            me,
+            libc::pid_t::try_from(pid).unwrap_or(-1),
+            0, // KCMP_FILE
+            libc::c_long::from(mine),
+            libc::c_long::from(theirs),
+        )
+    };
+    match answer {
+        0 => Ok(true),
+        -1 => Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0)),
+        _ => Ok(false),
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn scan_holders(
     files: &[&std::fs::File],
@@ -130,24 +157,6 @@ fn scan_holders(
         ids.push((meta.dev(), meta.ino()));
     }
     let me = std::process::id();
-    // The same open file description as one of the caller's own handles.
-    let ours = |pid: u32, fd: i32| {
-        own.iter().any(|mine| {
-            // SAFETY: `kcmp` reads two processes' descriptor tables and
-            // writes nothing; every argument is a plain integer.
-            let same = unsafe {
-                libc::syscall(
-                    libc::SYS_kcmp,
-                    libc::pid_t::try_from(me).unwrap_or(-1),
-                    libc::pid_t::try_from(pid).unwrap_or(-1),
-                    0, // KCMP_FILE
-                    libc::c_long::from(*mine),
-                    libc::c_long::from(fd),
-                )
-            };
-            same == 0
-        })
-    };
     let mut found = Vec::new();
     for entry in std::fs::read_dir("/proc").refuse_at(SITE)? {
         let Ok(entry) = entry else { continue };
@@ -161,23 +170,55 @@ fn scan_holders(
         let base = entry.path();
         let working =
             pid != me && std::fs::read_link(base.join("cwd")).is_ok_and(|cwd| under(&cwd, dirs));
-        let holds = working
-            || std::fs::read_dir(base.join("fd")).is_ok_and(|fds| {
-                fds.filter_map(std::result::Result::ok).any(|fd| {
-                    let Some(number) = fd.file_name().to_str().and_then(|n| n.parse::<i32>().ok())
-                    else {
-                        return false;
-                    };
-                    let Ok(meta) = std::fs::metadata(fd.path()) else {
-                        return false;
-                    };
-                    let file = ids.contains(&(meta.dev(), meta.ino()));
-                    let under_dir = !dirs.is_empty()
+        // Each descriptor on one of the files (or a regular file under a
+        // dir): what it refers to, read now.
+        let matches = |fd: &std::path::Path| {
+            std::fs::metadata(fd).is_ok_and(|meta| {
+                ids.contains(&(meta.dev(), meta.ino()))
+                    || (!dirs.is_empty()
                         && meta.is_file()
-                        && std::fs::read_link(fd.path()).is_ok_and(|target| under(&target, dirs));
-                    (file || under_dir) && !ours(pid, number)
-                })
-            });
+                        && std::fs::read_link(fd).is_ok_and(|target| under(&target, dirs)))
+            })
+        };
+        let mut copy_of_ours = false;
+        let mut other = false;
+        for fd in std::fs::read_dir(base.join("fd"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let path = fd.path();
+            let Some(number) = fd.file_name().to_str().and_then(|n| n.parse::<i32>().ok()) else {
+                continue;
+            };
+            if !matches(&path) {
+                continue;
+            }
+            let mut ours = false;
+            let mut unknown = false;
+            for mine in own {
+                match same_description(pid, *mine, number) {
+                    Ok(true) => ours = true,
+                    Ok(false) => {}
+                    // Gone since it was listed (a forked child's exec closed
+                    // it, or the process ended): judged by re-reading below.
+                    Err(code) if code == libc::EBADF || code == libc::ESRCH => {}
+                    Err(_) => unknown = true,
+                }
+            }
+            if ours {
+                copy_of_ours = true;
+            } else if matches(&path) || unknown {
+                // Still the file, another description of it (or the compare
+                // could not say): a holder, unless the process proves to be
+                // a fork of this one.
+                other = true;
+            }
+        }
+        // A process holding this process's very description is a fork of it
+        // (before its exec): what it holds is a copy of what this process
+        // holds, and this process's own entry is judged on its own.
+        let holds = working || (other && (pid == me || !copy_of_ours));
         if holds {
             found.push(pid);
         }
