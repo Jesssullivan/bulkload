@@ -514,15 +514,19 @@ pub fn proof(
                 Some(to) => status(&path, meta.len(), &projects.join(to).join(&rel), suffix)?,
             };
             *summary.files.entry(word).or_default() += 1;
-            // What the next mapped pull does with it (`--consolidate`): a
-            // top-level transcript under a mapped source key is folded into
-            // the destination key, moved when absent there, else unioned.
+            // What the next mapped pull does with it (`--consolidate`): every
+            // file under a mapped source key is folded into the destination
+            // key: moved when absent there; an append log unioned; another
+            // file removed when the same bytes are there, else held.
             let fold = match &to {
-                Some(to) if basis == "key-map" && *to != dir && rel.components().count() == 1 => {
-                    if std::fs::symlink_metadata(projects.join(to).join(&rel)).is_ok() {
-                        "union"
-                    } else {
-                        "move"
+                Some(to) if basis == "key-map" && *to != dir && meta.is_file() => {
+                    let there = projects.join(to).join(&rel);
+                    let is_log = rel.extension().is_some_and(|ext| ext == "jsonl");
+                    match std::fs::symlink_metadata(&there) {
+                        Err(_) => "move",
+                        Ok(_) if is_log => "union",
+                        Ok(_) if word == "identical" => "remove",
+                        Ok(_) => "hold",
                     }
                 }
                 _ => "none",

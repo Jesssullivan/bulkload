@@ -479,8 +479,11 @@ ok.
    destination is moved (renamed) to the mapped key when absent there,
    else unioned and removed once durable; ledgered (`key_fold`), reported
    (`key-fold`), planned (`fold-move`, `fold-union`) and proofed (`fold`).
-   Only top-level `projects/<key>/<name>.jsonl` files fold; a session's
-   subagent files under a source key are not folded.
+   Every file of a session under the source key now folds, its `<id>/`
+   subdirectory included. An append log is moved or unioned; any other
+   file is moved when absent, removed when it has the same bytes as the
+   mapped key's, and held (both kept) when the bytes differ.
+   Test: `a_sessions_subfiles_at_the_source_key_fold_the_same_way`.
 
 
 - Source-key directories already on sting stay (removing a transcript is
@@ -508,5 +511,5 @@ ok.
   stays kept and held until it can be unioned.
 - A link outside the archive roots, and a session held under a key that
   is no map source, stay held (`OTHER_KIND`, `held_elsewhere`).
-- Subagent files under a source key are not folded.
+- Empty source-key directories left after folds stay (no directory is removed).
 - `just darwin-check` on pzm is owed before merge.

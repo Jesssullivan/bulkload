@@ -531,3 +531,143 @@ fn a_source_key_copy_is_folded_into_the_mapped_key() {
         .unwrap();
     assert_eq!(rows, 2);
 }
+
+/// The same fold for a session's subdirectory under the source key
+/// (subagents, tool results): an append log is moved or unioned, any
+/// other file moved when absent, its source-key copy removed when the
+/// mapped key holds the same bytes, and held (both kept) when it holds
+/// other bytes. `--plan-only` lists every one.
+/// A file under the session: its path, the hand copy's bytes, the mapped
+/// key's (if any).
+type SubFile = (&'static str, &'static [u8], Option<&'static [u8]>);
+
+#[test]
+#[allow(clippy::too_many_lines)] // Plan, then run, then each file's end.
+fn a_sessions_subfiles_at_the_source_key_fold_the_same_way() {
+    let files: [SubFile; 5] = [
+        // (path under the session, the hand copy's bytes, the mapped key's)
+        (
+            "subagents/a1.jsonl",
+            b"{\"uuid\":\"a\"}\n{\"uuid\":\"o\"}\n",
+            Some(b"{\"uuid\":\"a\"}\n{\"uuid\":\"s\"}\n"),
+        ),
+        ("subagents/a2.jsonl", b"{\"uuid\":\"b\"}\n", None),
+        ("tool-results/same.txt", b"same\n", Some(b"same\n")),
+        ("tool-results/diff.txt", b"neo's\n", Some(b"sting's\n")),
+        ("tool-results/moved.txt", b"moved\n", None),
+    ];
+    let setup = |run: &Mapped| {
+        for (rel, hand, mapped) in files {
+            let rel = format!("sid/{rel}");
+            Mapped::write(&run.source(&format!("{NEO}/{rel}")), hand);
+            Mapped::write(&run.destination(&format!("{NEO}/{rel}")), hand);
+            if let Some(mapped) = mapped {
+                Mapped::write(&run.destination(&format!("{STING}/{rel}")), mapped);
+            }
+        }
+        run.settle();
+    };
+    let plan = Mapped::new(vec![pair(NEO, STING)], true);
+    set_consolidate_for(
+        &plan.root,
+        Some(Some(Consolidation {
+            maps: crate::consolidate::Maps::new(Vec::new()),
+            ledger: plan.corpus.base.join("consolidate"),
+            plan_only: true,
+            archived: Vec::new(),
+        })),
+    );
+    setup(&plan);
+    let planned = plan.corpus.run().unwrap();
+    let mut folds: Vec<(String, &str)> = planned
+        .planned
+        .iter()
+        .filter(|seat| seat.action.starts_with("fold-"))
+        .map(|seat| {
+            (
+                String::from_utf8_lossy(&seat.rel_path).into_owned(),
+                seat.action,
+            )
+        })
+        .collect();
+    folds.sort();
+    assert_eq!(
+        folds,
+        [
+            (format!("{NEO}/sid/subagents/a1.jsonl"), "fold-union"),
+            (format!("{NEO}/sid/subagents/a2.jsonl"), "fold-move"),
+            (format!("{NEO}/sid/tool-results/diff.txt"), "fold-hold"),
+            (format!("{NEO}/sid/tool-results/moved.txt"), "fold-move"),
+            (format!("{NEO}/sid/tool-results/same.txt"), "fold-remove"),
+        ]
+    );
+
+    let run = Mapped::new(vec![pair(NEO, STING)], true);
+    setup(&run);
+    let first = run.corpus.run().unwrap();
+    let mut actions: Vec<(String, String)> = first
+        .folded
+        .iter()
+        .map(|(from, _, action)| (String::from_utf8_lossy(from).into_owned(), action.clone()))
+        .collect();
+    actions.sort();
+    assert_eq!(
+        actions,
+        [
+            (format!("{NEO}/sid/subagents/a1.jsonl"), "union".to_owned()),
+            (format!("{NEO}/sid/subagents/a2.jsonl"), "move".to_owned()),
+            (
+                format!("{NEO}/sid/tool-results/moved.txt"),
+                "move".to_owned()
+            ),
+            (
+                format!("{NEO}/sid/tool-results/same.txt"),
+                "remove".to_owned()
+            ),
+        ]
+    );
+    assert_eq!(
+        refused(&first),
+        [(
+            format!("{STING}/sid/tool-results/diff.txt"),
+            "HOMES_CONSOLIDATE_UNSUPPORTED".to_owned()
+        )]
+    );
+    for gone in [
+        "subagents/a1.jsonl",
+        "subagents/a2.jsonl",
+        "tool-results/same.txt",
+        "tool-results/moved.txt",
+    ] {
+        assert!(
+            !run.destination(&format!("{NEO}/sid/{gone}")).exists(),
+            "{gone}"
+        );
+    }
+    // Held: both kept, untouched.
+    assert_eq!(
+        std::fs::read(run.destination(&format!("{NEO}/sid/tool-results/diff.txt"))).unwrap(),
+        b"neo's\n"
+    );
+    assert_eq!(
+        std::fs::read(run.destination(&format!("{STING}/sid/tool-results/diff.txt"))).unwrap(),
+        b"sting's\n"
+    );
+    let a1 = std::fs::read(run.destination(&format!("{STING}/sid/subagents/a1.jsonl"))).unwrap();
+    for record in [
+        &b"{\"uuid\":\"a\"}\n"[..],
+        b"{\"uuid\":\"o\"}\n",
+        b"{\"uuid\":\"s\"}\n",
+    ] {
+        assert_eq!(
+            a1.windows(record.len())
+                .filter(|window| *window == record)
+                .count(),
+            1
+        );
+    }
+    assert_eq!(
+        std::fs::read(run.destination(&format!("{STING}/sid/tool-results/moved.txt"))).unwrap(),
+        b"moved\n"
+    );
+}

@@ -375,8 +375,14 @@ same report, totals and gate:
     (`projects/<D>/<name>`). If absent there it is moved (renamed, never
     copied); otherwise it is unioned. The source-key name is removed once
     the merged bytes are durable, ledgered (`key_fold`) and reported on
-    `key-fold` lines. `--plan-only` lists `fold-move` and `fold-union`;
-    `--key-map-proof` gives each file a `fold` field.
+    `key-fold` lines. The same holds for every file of the session under
+    the source key (its `<id>/` subdirectory: subagent logs, tool results).
+    An append log is moved or unioned; any other file is moved when
+    absent, its source-key copy removed when the mapped key holds the same
+    bytes, and held (`HOMES_CONSOLIDATE_UNSUPPORTED`, both kept) when it
+    holds other bytes. `--plan-only` lists `fold-move`, `fold-union`,
+    `fold-remove` and `fold-hold`; `--key-map-proof` gives each file a
+    `fold` field (`move`, `union`, `remove`, `hold`, `none`).
   - A log that a process holds open, or that ends inside a line, is
     `HOMES_CONSOLIDATE_RACED`, retryable, with nothing written.
 - one **mapped** row per `--map-prefix SRC_REL=DST_REL` a `copy` or `pull`

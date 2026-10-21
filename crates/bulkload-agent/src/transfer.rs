@@ -1370,6 +1370,30 @@ pub struct Consolidation {
     pub archived: Vec<PathBuf>,
 }
 
+/// Whether the regular files at `a` and `b` hold the same bytes, streamed.
+fn files_equal(a: &Path, b: &Path) -> std::io::Result<bool> {
+    use std::io::Read as _;
+    let (mut a, mut b) = (std::fs::File::open(a)?, std::fs::File::open(b)?);
+    let (mut x, mut y) = (vec![0_u8; 1 << 20], vec![0_u8; 1 << 20]);
+    loop {
+        let got = a.read(&mut x)?;
+        let mut filled = 0;
+        while filled < got {
+            let more = b.read(y.get_mut(filled..got).unwrap_or_default())?;
+            if more == 0 {
+                return Ok(false);
+            }
+            filled += more;
+        }
+        if x.get(..got) != y.get(..got) {
+            return Ok(false);
+        }
+        if got == 0 {
+            return Ok(b.read(&mut y)? == 0);
+        }
+    }
+}
+
 /// The archived file an append log's live path links to
 /// ([`Consolidation::archived`]), canonical; `None` for anything else.
 fn archive_target(root: &Path, rel_path: &[u8], archived: &[PathBuf]) -> Option<PathBuf> {
@@ -1466,6 +1490,10 @@ const ELSEWHERE_PENDING: &str =
 const OVER_MEMORY: &str = "over the 64 MiB a union gathers in memory";
 /// Why a live path of another kind is held.
 const OTHER_KIND: &str = "the live path is a link or another kind";
+/// Why a per-session file at a map's source key was not folded: the mapped
+/// key holds other bytes under its name (not an append log, so no union).
+const KEY_FOLD_DIFFERS: &str =
+    "the source-key copy differs from the file at the mapped key: both kept, held";
 /// Why a source-key copy was not folded into the mapped key: a writer at
 /// either, or it moved; nothing removed, the next pass folds again.
 const KEY_FOLD_RACED: &str =
@@ -6687,8 +6715,8 @@ impl<W: Write> Inbound<'_, W> {
         }
         // The same session at the map's source key on the destination (an
         // earlier hand copy): folded into the mapped key first, one file.
-        if class == Class::AppendLog {
-            if let Some(reason) = self.fold_source_key(row, settings)? {
+        if class != Class::Sqlite {
+            if let Some(reason) = self.fold_source_key(row, class, settings)? {
                 return self.hold_seat(row, class, None, reason, plan);
             }
         }
@@ -6775,15 +6803,24 @@ impl<W: Write> Inbound<'_, W> {
     fn fold_source_key(
         &mut self,
         row: &RowSchema,
+        class: crate::consolidate::Class,
         settings: &Consolidation,
     ) -> Result<Option<&'static str>> {
         use std::os::unix::ffi::OsStrExt as _;
-        let mut parts = row.rel_path.split(|byte| *byte == b'/');
-        let (Some(b"projects"), Some(key), Some(name), None) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
+        let Some(after) = row.rel_path.strip_prefix(b"projects/") else {
             return Ok(None);
         };
+        let Some(split) = after.iter().position(|byte| *byte == b'/') else {
+            return Ok(None);
+        };
+        let (Some(key), Some(rest)) = (after.get(..split), after.get(split + 1..)) else {
+            return Ok(None);
+        };
+        let name = rest.rsplit(|byte| *byte == b'/').next().unwrap_or(rest);
+        let top = !rest.contains(&b'/');
+        if rest.is_empty() || row.kind != FileKind::Regular {
+            return Ok(None);
+        }
         let mut dest_dir = b"projects/".to_vec();
         dest_dir.extend_from_slice(key);
         let Some(source_dir) = self
@@ -6796,25 +6833,42 @@ impl<W: Write> Inbound<'_, W> {
             return Ok(None);
         };
         let root = self.target.path().to_path_buf();
-        let from_dir = root.join(std::ffi::OsStr::from_bytes(&source_dir));
-        let from = from_dir.join(std::ffi::OsStr::from_bytes(name));
+        let mut source_rel = source_dir;
+        source_rel.push(b'/');
+        source_rel.extend_from_slice(rest);
+        let from = root.join(std::ffi::OsStr::from_bytes(&source_rel));
+        let from_dir = from
+            .parent()
+            .ok_or(BulkloadRefusal::PathEscapesRoot)?
+            .to_path_buf();
         let Ok(from_meta) = std::fs::symlink_metadata(&from) else {
             return Ok(None);
         };
+        if from_meta.is_dir() {
+            return Ok(None);
+        }
         let to = root.join(std::ffi::OsStr::from_bytes(&row.rel_path));
         let to_meta = std::fs::symlink_metadata(&to).ok();
-        let mut source_rel = source_dir;
-        source_rel.push(b'/');
-        source_rel.extend_from_slice(name);
+        let append_log = class == crate::consolidate::Class::AppendLog;
+        // Another per-session file (tool results and the like) present at
+        // the mapped key: the same bytes are one copy too many; other bytes
+        // are held.
+        let equal = |to_meta: &std::fs::Metadata| -> bool {
+            to_meta.is_file()
+                && from_meta.is_file()
+                && to_meta.len() == from_meta.len()
+                && files_equal(&from, &to).unwrap_or(false)
+        };
         if settings.plan_only {
-            let action = if to_meta.is_some() {
-                "fold-union"
-            } else {
-                "fold-move"
+            let action = match &to_meta {
+                None => "fold-move",
+                Some(_) if append_log => "fold-union",
+                Some(to_meta) if equal(to_meta) => "fold-remove",
+                Some(_) => "fold-hold",
             };
             self.stats.planned.push(PlannedSeat {
                 rel_path: source_rel,
-                class: crate::consolidate::Class::AppendLog.word(),
+                class: class.word(),
                 action,
                 source_size: from_meta.len(),
                 live_size: to_meta.as_ref().map(std::fs::Metadata::len),
@@ -6828,7 +6882,9 @@ impl<W: Write> Inbound<'_, W> {
         let from_c = c(name)?;
         let Some(to_meta) = to_meta else {
             // Absent at the mapped key: the node itself moves there.
-            let to_dir = open_dir(to.parent().ok_or(BulkloadRefusal::PathEscapesRoot)?)?;
+            let to_parent = to.parent().ok_or(BulkloadRefusal::PathEscapesRoot)?;
+            std::fs::create_dir_all(to_parent).refuse_at("transfer::fold_source_key")?;
+            let to_dir = open_dir(to_parent)?;
             match crate::io::sys::rename_exclusive_at(&from_handle, &from_c, &to_dir, &c(name)?) {
                 Ok(()) => {}
                 Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
@@ -6839,9 +6895,35 @@ impl<W: Write> Inbound<'_, W> {
             crate::io::durable::seal_dir(&to_dir).refuse_at("transfer::fold_source_key")?;
             crate::io::durable::seal_dir(&from_handle).refuse_at("transfer::fold_source_key")?;
             self.record_fold(&source_rel, &row.rel_path, "move", settings)?;
-            self.forget_elsewhere(name, key);
+            if top {
+                self.forget_elsewhere(name, key);
+            }
             return Ok(None);
         };
+        if !append_log {
+            // The same bytes at the mapped key: the source-key copy goes.
+            // Other bytes: held, both kept, for review.
+            if !equal(&to_meta) {
+                return Ok(Some(KEY_FOLD_DIFFERS));
+            }
+            let free = matches!(
+                crate::procs::inside(&[from.as_path()])?,
+                Some(pids) if pids.is_empty()
+            );
+            let unmoved = std::fs::symlink_metadata(&from)
+                .is_ok_and(|now| now.ino() == from_meta.ino() && now.len() == from_meta.len());
+            if !free || !unmoved {
+                return Ok(Some(KEY_FOLD_RACED));
+            }
+            std::fs::File::open(&to)
+                .and_then(|file| file.sync_all())
+                .refuse_at("transfer::fold_source_key")?;
+            crate::io::sys::unlinkat(&from_handle, &from_c, false)
+                .refuse_at("transfer::fold_source_key")?;
+            crate::io::durable::seal_dir(&from_handle).refuse_at("transfer::fold_source_key")?;
+            self.record_fold(&source_rel, &row.rel_path, "remove", settings)?;
+            return Ok(None);
+        }
         // Present: the source-key copy (its bytes, through a link too) is
         // unioned into the mapped one, then its name removed.
         let Ok(source_file) = std::fs::File::open(&from) else {
@@ -6897,7 +6979,9 @@ impl<W: Write> Inbound<'_, W> {
             .refuse_at("transfer::fold_source_key")?;
         crate::io::durable::seal_dir(&from_handle).refuse_at("transfer::fold_source_key")?;
         self.record_fold(&source_rel, &row.rel_path, "union", settings)?;
-        self.forget_elsewhere(name, key);
+        if top {
+            self.forget_elsewhere(name, key);
+        }
         Ok(None)
     }
 
