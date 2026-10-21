@@ -384,6 +384,23 @@ pub fn refuse_staging(state: &Path, target: &Path) -> Result<()> {
 pub fn refuse_retired(states: &[&Path], print: &mut dyn FnMut(&Path) -> Result<()>) -> Result<()> {
     let mut first = None;
     for state in states {
+        // An empty retired directory (an older pass's `carry/corpus`) holds
+        // no payload: removed, never refused (2026-10-21).
+        for path in retired(state)? {
+            if fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+                match fs::remove_dir(&path) {
+                    Err(error)
+                        if !matches!(
+                            error.raw_os_error(),
+                            Some(libc::ENOTEMPTY | libc::EEXIST)
+                        ) =>
+                    {
+                        return Err(crate::refuse::io(&error, SITE));
+                    }
+                    _ => {}
+                }
+            }
+        }
         for path in retired(state)? {
             print(&path)?;
             first.get_or_insert(path);
@@ -600,5 +617,26 @@ mod tests {
             std::env::temp_dir().join(format!("bulkload-payload-missing-{}", std::process::id()));
         assert!(retired(&missing).unwrap().is_empty());
         assert_eq!(measure(&missing).unwrap(), Measure::default());
+    }
+
+    // 2026-10-21: an empty `carry/corpus` an older pass left holds no
+    // payload; it is removed, never refused, and a full one still is.
+    #[test]
+    fn an_empty_retired_directory_is_removed_not_refused() {
+        let scratch = Scratch::new("empty-corpus");
+        let state = &scratch.0;
+        scratch.file("carry/plan.postcard", &[1; 3]);
+        fs::create_dir_all(state.join("carry/corpus")).unwrap();
+        let mut printed = Vec::new();
+        refuse_retired(&[state], &mut |path| {
+            printed.push(path.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert!(printed.is_empty(), "{printed:?}");
+        assert!(!state.join("carry/corpus").exists());
+        scratch.file("carry/corpus/item.capture", b"record");
+        assert!(refuse_retired(&[state], &mut |_| Ok(())).is_err());
+        assert!(state.join("carry/corpus/item.capture").exists());
     }
 }

@@ -799,6 +799,126 @@ impl Move {
 // The `upload-pack` program a streamed fetch runs (SPEC rule 2 reset, B1):
 // this agent's `upload-pack` verb for HOST `-`, else its relay to the
 // remote one.
+/// Consolidate the duplicate `aside` into the live checkout `place` and
+/// remove it (SPEC rule 3; phase 3b of [`move_pass`]).
+///
+/// The aside is read as a source on this host: its snapshot taken, its
+/// objects fetched into the live store, then [`estate::streamed::converge`]
+/// unions its refs (diverged ones at `refs/remotes/SUFFIX/`), stash and
+/// reflogs and merges its files three-way. It is removed only when nothing
+/// was held, after the live checkout's directory is synced; a linked
+/// worktree's administration goes with it, and a main whose administration
+/// other worktrees still use is held.
+///
+/// # Errors
+/// The hold's code: `GIT_DESTINATION_OCCUPIED` (not a related checkout, or
+/// its administration still in use), `GIT_DESTINATION_DIVERGED` (a
+/// different branch, the live tree dirty), `HOMES_CONSOLIDATE_UNSUPPORTED`
+/// (a file held), or the capture's, fetch's or merge's refusal.
+fn retire_aside(
+    run: &Move,
+    place: &Path,
+    aside: &Path,
+    (private, scratch, consolidation): (
+        &Path,
+        &Path,
+        &dyn Fn() -> Result<bulkload_agent::transfer::Consolidation>,
+    ),
+) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let suffix = aside
+        .file_name()
+        .and_then(|name| name.to_str())
+        .zip(place.file_name().and_then(|name| name.to_str()))
+        .and_then(|(name, live)| name.strip_prefix(live)?.strip_prefix('.'))
+        .filter(|suffix| bulkload_agent::git_carry::source_label_allowed(suffix))
+        .ok_or(BulkloadRefusal::GitDestinationOccupied)?
+        .to_owned();
+    if moving::presence(aside) != moving::Presence::Git
+        || moving::presence(place) != moving::Presence::Git
+    {
+        return Err(BulkloadRefusal::GitDestinationOccupied);
+    }
+    let item = estate::Item {
+        source: aside.to_path_buf(),
+        repository: aside.to_path_buf(),
+        workspace: Some(place.to_path_buf()),
+    };
+    let snapshot = estate::streamed::capture_source(&item, now_ns(), false)?;
+    if !bulkload_agent::git_carry::union::related(place, &snapshot.history.roots)? {
+        return Err(BulkloadRefusal::GitDestinationOccupied);
+    }
+    let real = std::fs::canonicalize(aside).refuse_at("estate_move::aside")?;
+    let common = bulkload_agent::git_carry::common_repository(aside)?;
+    let main = common.starts_with(&real);
+    // A main aside lands its objects in the live main's own store.
+    if main && !place.join(".git").is_dir() {
+        return Err(BulkloadRefusal::GitDestinationOccupied);
+    }
+    // Its administration must be its own alone.
+    if main {
+        if let Ok(read) = std::fs::read_dir(common.join("worktrees")) {
+            if read.flatten().next().is_some() {
+                return Err(BulkloadRefusal::GitDestinationOccupied);
+            }
+        }
+    }
+    let exe = std::env::current_exe().refuse_at("estate_move::aside")?;
+    let exe = exe.to_str().ok_or(BulkloadRefusal::PathNotPortable)?;
+    if exe.contains('\'') {
+        return Err(BulkloadRefusal::PathNotPortable);
+    }
+    let program = format!("'{exe}' upload-pack");
+    let fetched = estate::streamed::fetch_objects(&snapshot, private, &program, &[])?;
+    let name = format!(
+        "aside-{}",
+        blake3::hash(real.as_os_str().as_bytes()).to_hex()
+    );
+    let (serve, pulls) = (run.state.join("serve"), run.state.join("pull"));
+    moving::private_dir(&serve)?;
+    moving::private_dir(&pulls)?;
+    let transfer = |from: &Path, to: &Path| -> Result<()> {
+        super::copy_recorded_kind(
+            bulkload_agent::transfer::RootKind::Tree,
+            from,
+            to,
+            &serve.join(&name),
+            &pulls.join(&name),
+        )
+    };
+    let reach = estate::streamed::Reach {
+        upload_pack: &program,
+        transfer: &transfer,
+        scratch,
+        consolidation,
+    };
+    let done = estate::streamed::converge(&snapshot, &reach, fetched, &suffix, &[])?;
+    if done.branches_held.is_some() {
+        return Err(BulkloadRefusal::GitDestinationDiverged);
+    }
+    if done.seats_held {
+        return Err(BulkloadRefusal::HomesConsolidateUnsupported);
+    }
+    // The merged result is durable before the duplicate goes.
+    std::fs::File::open(place)
+        .and_then(|dir| dir.sync_all())
+        .refuse_at("estate_move::aside")?;
+    let admin = (!main)
+        .then(|| bulkload_agent::git_carry::absolute_git_dir(aside))
+        .transpose()?
+        .filter(|admin| admin.starts_with(common.join("worktrees")));
+    std::fs::remove_dir_all(&real).refuse_at("estate_move::aside")?;
+    if let Some(admin) = admin {
+        std::fs::remove_dir_all(&admin).refuse_at("estate_move::aside")?;
+    }
+    if let Some(parent) = real.parent() {
+        std::fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .refuse_at("estate_move::aside")?;
+    }
+    Ok(())
+}
+
 fn upload_pack_program(run: &Move) -> Result<String> {
     let quoted = |word: &std::ffi::OsStr| -> Result<String> {
         let word = word.to_str().ok_or(BulkloadRefusal::PathNotPortable)?;
@@ -1263,6 +1383,33 @@ fn move_pass(run: &Move) -> Result<()> {
                     refusal.code()
                 ))?;
                 first_refusal.get_or_insert(refusal);
+            }
+        }
+    }
+    // 3b. SPEC rule 3 (no duplicates): a copy an older pass left beside a
+    // live path this pass landed or consolidated (`.neo-*`, `.sting-*`,
+    // `.LABEL`) is consolidated into it through the B2 rules (refs unioned,
+    // stash and reflogs joined, files merged three-way), then removed once
+    // the merged result is durable. Any hold keeps it, typed.
+    for row in &rows {
+        if !landed.contains(&row.id) {
+            continue;
+        }
+        let place = row.item.workspace.as_ref().unwrap_or(&row.item.repository);
+        for aside in bulkload_agent::git_carry::preview::asides(place, &run.label)? {
+            match retire_aside(run, place, &aside, (&private, &scratch, &consolidation)) {
+                Ok(()) => out(&format!(
+                    "estate-move item={} aside={aside:?} outcome=retired",
+                    row.id
+                ))?,
+                Err(refusal) => {
+                    out(&format!(
+                        "estate-move item={} aside={aside:?} outcome=held code={}",
+                        row.id,
+                        refusal.code()
+                    ))?;
+                    first_refusal.get_or_insert(refusal);
+                }
             }
         }
     }
