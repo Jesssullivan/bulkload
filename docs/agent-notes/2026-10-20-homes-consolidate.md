@@ -177,8 +177,12 @@ that differs from the seat is decided by its class
     held at the pull.
   - At the lane's key the re-seat keeps the destination's fork: its
     archive link is regularized in place (OI-1003-Q198) and the archive is
-    untouched. Neo's copy is kept at its own key, `diverged`, so both are
-    kept until the append-log union merges them.
+    untouched. Neo's copy of that session is held at the pull (a
+    transcript the destination holds under another project key), written
+    at no key, and listed in the plan: a second copy of one session would
+    be a duplicate (SPEC rule 3, coordinator 2026-10-20). Once #294's
+    append-log union merges, that hold becomes a union into the one live
+    file.
 
 ## Item 3: `--plan-only` for the homes
 

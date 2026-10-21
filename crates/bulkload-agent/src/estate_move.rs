@@ -1196,8 +1196,14 @@ fn homes_plan(run: &Move, home: &Path) -> Result<()> {
             continue;
         }
         let pull = format!("plan-{}", name.trim_start_matches('.'));
+        // Report-only: a path refusal (an absent `~/.claude.json` among
+        // them) is printed with the plan; only a session that failed fails it.
         if let Err(refusal) = run.transfer_kind(kind, &from, &to, &pull) {
-            if refusal != BulkloadRefusal::SourceRootMissing && planned.is_ok() {
+            if !matches!(
+                refusal,
+                BulkloadRefusal::SourceRootMissing | BulkloadRefusal::ItemsRefused
+            ) && planned.is_ok()
+            {
                 planned = Err(refusal);
             }
         }

@@ -1029,9 +1029,9 @@ fn sessions_into_a_destination_with_no_codex_index_hold_the_store() {
 /// symlinks into an archive are never read or written through.
 /// - When neo has the same session at the lane's key, the destination's
 ///   fork stays what the picker reads there (its archive link regularized
-///   in place, the archive untouched) and neo's copy is kept at its own key
-///   (`diverged`, both kept) until the append-log union lands: never neo's
-///   copy over the destination's.
+///   in place, the archive untouched). Neo's copy is held at the pull and
+///   written at no key (SPEC rule 3, one session one file) until the
+///   append-log union merges it; the plan lists that hold first.
 /// - Neo's copy whose live path is such a link is held at the pull, never
 ///   landed beside.
 /// - A link neo has no copy of is the destination's own and stays.
@@ -1187,6 +1187,33 @@ fn archive_links_follow_a106_and_destination_links_stay() {
         &src_git,
     ]));
     assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
+    // The plan names the fork's hold before anything lands.
+    let planned = agent(&os(&[
+        &"estate-move",
+        &"--plan-only",
+        &"--label",
+        &LABEL,
+        &"--source",
+        &"neo",
+        &"--sessions",
+        &src_home,
+        &"--dest-home",
+        &dst_home,
+        &"--map",
+        &map,
+        &"-",
+        &source_state,
+        &state,
+    ]));
+    assert!(planned.ok, "{}\n{}", planned.stdout, planned.stderr);
+    assert!(
+        planned.stdout.lines().any(|line| line.starts_with(&format!(
+            "planned projects/{}/{SID_FORK}.jsonl class=append-log action=hold ",
+            key(&src_lane)
+        )) && line.contains("under another key")),
+        "{}",
+        planned.stdout
+    );
     let moved = agent(&os(&[
         &"estate-move",
         &"--label",
@@ -1233,22 +1260,36 @@ fn archive_links_follow_a106_and_destination_links_stay() {
         moved.stdout
     );
     // The live name holds the destination's fork (the re-seat regularizes
-    // its archive link in place, OI-1003-Q198), never neo's copy; neo's
-    // copy is kept at its own key, `diverged`: both kept.
+    // its archive link in place, OI-1003-Q198), never neo's copy. Neo's
+    // copy is held at the pull, typed, and written nowhere: one session,
+    // one file on sting (SPEC rule 3), until the append-log union merges
+    // them.
     let at_live = dst_projects.join(format!("{SID_FORK}.jsonl"));
     assert_eq!(fs::read_to_string(&at_live).unwrap(), fork_bytes);
     assert_eq!(
         fs::read_to_string(archive.join("fork.jsonl")).unwrap(),
         fork_bytes
     );
+    assert!(
+        moved.stderr.contains(&format!(
+            "held projects/{}/{SID_FORK}.jsonl: HOMES_CONSOLIDATE_UNSUPPORTED",
+            key(&src_lane)
+        )),
+        "{}",
+        moved.stderr
+    );
+    let copies: Vec<String> = tree_files(&dst_claude)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name.contains(SID_FORK))
+        .collect();
     assert_eq!(
-        fs::read_to_string(neo_key_dir.join(format!("{SID_FORK}.jsonl"))).unwrap(),
-        neo(SID_FORK)
+        copies,
+        [format!("projects/{}/{SID_FORK}.jsonl", key(&dst_lane))],
+        "nothing new at any key"
     );
     assert!(
-        moved
-            .stdout
-            .contains("\"refused\":\"RESEAT_DEST_DIVERGED\""),
+        !moved.stdout.contains("RESEAT_DEST_DIVERGED"),
         "{}",
         moved.stdout
     );

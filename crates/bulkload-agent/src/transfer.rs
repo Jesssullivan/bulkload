@@ -1415,6 +1415,11 @@ const APPEND_LOG_PENDING: &str = "append-log: diverged, and the JSONL union (#29
 /// union is the #278 lane's row stream (`--sqlite-rows`), never this file
 /// path.
 const SQLITE_PENDING: &str = "sqlite: the row union (#278) has not landed";
+/// Why a transcript the destination holds under another project key is
+/// held: a second copy of one session is a duplicate (SPEC rule 3), and
+/// the union into the one live file is the #294 lane's.
+const ELSEWHERE_PENDING: &str =
+    "append-log: the destination holds this session under another key, and the JSONL union (#294) has not landed";
 /// Why a live path of another kind is held.
 const OTHER_KIND: &str = "the live path is a link or another kind";
 
@@ -5387,6 +5392,9 @@ struct Inbound<'a, W> {
     /// plan): `Held` with this value is sent at once, never awaited from a
     /// group commit.
     answered_now: Option<bool>,
+    /// `--consolidate`: the destination's `projects/<key>/<name>` names, by
+    /// name, with their keys, read once at the first transcript decided.
+    elsewhere: Option<HashMap<Vec<u8>, Vec<Vec<u8>>>>,
 }
 
 /// A walk frame: what a batch of new directories holds back.
@@ -5726,6 +5734,7 @@ fn receive_session<R: Read, W: Write>(
             consolidate,
             consolidate_ledger: None,
             answered_now: None,
+            elsewhere: None,
         };
         drop(setup_timer);
         let source_bytes_read = {
@@ -6530,6 +6539,12 @@ impl<W: Write> Inbound<'_, W> {
             return Ok(self.reuse_seat(row, class, "covered", live_size, plan));
         }
         let Some(identity) = identity else {
+            // A Claude transcript the destination holds under another
+            // project key (A-106: its archived fork at the lane's key) is
+            // never landed as a second copy (SPEC rule 3).
+            if class == Class::AppendLog && self.held_elsewhere(&row.rel_path) {
+                return self.hold_seat(row, class, None, ELSEWHERE_PENDING, plan);
+            }
             if plan {
                 self.plan_seat(row, class.word(), "create", None, None);
                 return Ok(Decision::Skip);
@@ -6557,6 +6572,39 @@ impl<W: Write> Inbound<'_, W> {
             return Err(refused.refusal());
         }
         Ok(Decision::WantManifest)
+    }
+
+    /// Whether `rel_path`, a transcript `projects/<key>/<name>`, is a name
+    /// the destination holds under another key (a file, a link, anything).
+    fn held_elsewhere(&mut self, rel_path: &[u8]) -> bool {
+        let mut parts = rel_path.split(|byte| *byte == b'/');
+        let (Some(b"projects"), Some(key), Some(name), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return false;
+        };
+        let index = self.elsewhere.get_or_insert_with(|| {
+            use std::os::unix::ffi::OsStrExt as _;
+            let mut index: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
+            let projects = self.target.path().join("projects");
+            for dir in std::fs::read_dir(&projects).into_iter().flatten().flatten() {
+                let key = dir.file_name().as_bytes().to_vec();
+                for file in std::fs::read_dir(dir.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
+                    index
+                        .entry(file.file_name().as_bytes().to_vec())
+                        .or_default()
+                        .push(key.clone());
+                }
+            }
+            index
+        });
+        index
+            .get(name)
+            .is_some_and(|keys| keys.iter().any(|held| held.as_slice() != key))
     }
 
     /// A seat reused (or, planning, reported as `action`).
