@@ -1742,12 +1742,13 @@ impl Site<'_> {
                 }
                 bytes
             };
-            let fork = std::fs::read(resolved).refuse_at("reseat::place::replace_union")?;
-            counters::add_len(Counter::ReseatDestRead, fork.len());
+            let archived = std::fs::read(resolved).refuse_at("reseat::place::replace_union")?;
+            counters::add_len(Counter::ReseatDestRead, archived.len());
             let by_uuid = matches!(self.kind, Kind::Transcript | Kind::Sidecar);
             let unmoved = lstat(resolved)?.map(|meta| Identity::of(&meta)) == Some(target.0);
-            let Some(merged) = crate::transfer::consolidate::merge_jsonl(&landed, &fork, by_uuid)
-                .filter(|_| unmoved)
+            let Some(merged) =
+                crate::transfer::consolidate::merge_jsonl(&landed, &archived, by_uuid)
+                    .filter(|_| unmoved)
             else {
                 self.clear_temp()?;
                 return Ok(Placed {

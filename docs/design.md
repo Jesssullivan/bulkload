@@ -406,21 +406,32 @@ same report, totals and gate:
   the live file's order. A Claude transcript record is identified by its
   `uuid`; any other line by its exact bytes, counted. Both branches of a
   session continued on both hosts are kept.
-  - **Write.** The union replaces the live file through the superseding
-    exchange and is checked against the live file as it was read. A file
-    that a process holds open, that ends inside a line, or that a writer
-    changed since the read is refused `DESTINATION_UNSETTLED` and rerun
-    only.
+  - **Write.** The receive side calls the homes' one union,
+    `consolidate::append_log::union`, and acts on its outcome. A live file
+    that is covered (every source record is already held, in any order)
+    is `dest-ahead` and is never rewritten (SPEC #298 rule 7). An extended
+    or consolidated one is traded in by the union's crash-safe swap,
+    checked against the live file as it was read. A file that a process
+    holds open, that ends inside a line, or that a writer keeps changing
+    is refused `DESTINATION_UNSETTLED` and rerun only. The entry is
+    remembered under the live file's identity, so an unchanged rerun reads
+    nothing.
   - **Ledger.** The row records the seat's, the live file's and the
     output's BLAKE3 and the record counts.
   - **Other kinds.** A `.jsonl` whose live path is another kind is
     refused `DESTINATION_KIND_MISMATCH`, except a link to a regular file
     under a `--replace-archived-dest` root. That link's target is the live
     file, and the re-seat's A-106 replacement takes the union of the two.
-  - **Held copies.** A re-seat sets nothing aside. A swap-back copy that a
-    writer appended to is held typed (`held-written`) under its private
-    `.<name>.<token>.bulkload-held`, never beside the live name, and
-    `reseat_kept_aside` is always 0.
+  - **Race copies.** A copy of a transcript that a re-seat race leaves
+    behind is unioned into the live file (the archive target) and removed
+    once the merged bytes are durable (`reseat::fold`, SPEC #298 rules 3
+    and 4). This covers an A-106 swap-back copy that a writer appended to,
+    and a Q198 regularization copy. Only a refusing union holds: the copy
+    is renamed to `.<name>.<token>.kept-<inode>.bulkload-reseat` (the same
+    file, never a new copy) with nothing written, and every later pass
+    retries it first. While it refuses, the path is `held-written`
+    (placement) or `kept-held` (regularization). `reseat_copy_folded`
+    counts the folds; nothing is ever set aside.
   - **Homes dispatch.** The same union is the `AppendLog` class's
     `consolidate::Union` (`consolidate::append_log`), and
     `append_log::plan_at` is its row in #297's `--plan-only` listing.

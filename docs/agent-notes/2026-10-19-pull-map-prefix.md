@@ -388,6 +388,42 @@ concurrent append mid-union, never lost; held open or mid-line, untouched;
 a link never followed; other kinds refused; held-written on two passes
 with the counter at 0.
 
+### Corrections (SPEC rules 3, 4 and 7): `60b9542`, `3e4ea5c`
+
+- `60b9542`: one union. The receive side calls
+  `consolidate::append_log::union` and acts on its outcome.
+  - Covered (a live log holding every record, in any order) is
+    `dest-ahead` and is never rewritten.
+  - Extended or consolidated: the union's swap trades the merged file in.
+  - A refusal is `DESTINATION_UNSETTLED`, rerun only.
+  - The entry is answered without a store publication and remembered
+    under the live identity.
+- `3e4ea5c`: no hidden copies. `reseat::fold` unions a race's leftover
+  copy (the A-106 swap-back copy a writer appended to, every Q198
+  regularize copy) into the live file, ledgers it, and removes it once
+  durable.
+  - Only a refusing union holds. The copy is renamed to its `kept-<inode>`
+    name (the same file, because the temporary name is cleared every
+    pass), and every later pass retries it first.
+  - `held-written` and `kept-held` hold the path meanwhile.
+  - `.bulkload-held` is gone, and so is `reseat_kept_aside` (the
+    counter-coverage test forbids a counter nothing increments; the a106
+    test asserts no copy instead);
+    `reseat_copy_folded` counts the folds.
+- Honey, targeted: fmt and clippy ok; `reseat::` 84/84, `consolidate`
+  36/36, `transfer::tests::consolidate` 6/6, `estate_move` 7/7.
+- Whole suite on honey: `cargo test --workspace --locked --no-fail-fast`
+  under the lane limits ran 47 test binaries: 1398 passed, 1 failed, 9
+  ignored. The one failure was `source_command_registry`
+  `every_child_goes_through_the_source_safe_builder`, which matched a local
+  variable named `fork` in `reseat/place.rs`; the variable is renamed.
+  After that, `source_command_registry` 22/22, `a106` 9/9, fmt and clippy
+  `-D warnings` ok. An earlier full run had also caught
+  `every_counter_is_incremented_somewhere` on the never-bumped
+  `reseat_kept_aside`, which is now removed.
+- Still owed: the merge gate (the coordinator's, after #297 merges) and
+  pzm `darwin-check`.
+
 ### Receipt (2026-10-20, honey, at `e96eea0` plus the docs)
 
 - Same environment and limits as the first receipt. Another lane's full
@@ -426,12 +462,6 @@ with the counter at 0.
   before this lane) is not converged back into the live path (#280's C12).
 - The would-write listing is #297's `--plan-only` (its item 3, not built
   yet). This lane supplies its append-log row (`append_log::plan_at`).
-- The receive path and the `Union` disagree on one case. When the live
-  file holds every source record in another order, the `Union` reports
-  covered, but the receive path rewrites the file with the source's bytes
-  first. Neither loses a record.
-- A held-written copy waits for the operator. No command resolves it yet.
-- `regularize`'s Q198 staged copies are still kept under private
-  `.kept-<inode>.bulkload-reseat` names. That is #280's path, and those
-  names are private holds, not besides.
+- A copy whose union keeps refusing (a process never closes the file)
+  stays kept and held until it can be unioned.
 - `just darwin-check` on pzm is owed before merge.

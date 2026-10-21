@@ -515,8 +515,8 @@ fn a106_a_target_written_under_the_swap_is_put_back() {
 /// the swap is put back. The copy then holds the writer's line. Under SPEC
 /// #298 (rules 3 and 4) it is no second copy: it is unioned into the live
 /// file (the archive target), ledgered, and removed once the merged bytes
-/// are durable. Nothing stays beside the live name, and
-/// `reseat_kept_aside` stays 0.
+/// are durable. Nothing stays beside the live name (no dot-name at all in
+/// its directory).
 #[test]
 fn a106_a_copy_written_through_the_live_name_is_unioned_into_the_live_file() {
     let _serial = SERIAL
@@ -587,9 +587,4 @@ fn a106_a_copy_written_through_the_live_name_is_unioned_into_the_live_file() {
     assert_eq!(unions, 1, "the union ledgered");
     let counted = crate::counters::Counters::snapshot().since(before);
     assert_eq!(counted.get(crate::counters::Counter::ReseatCopyFolded), 1);
-    assert_eq!(
-        counted.get(crate::counters::Counter::ReseatKeptAside),
-        0,
-        "nothing is ever kept aside"
-    );
 }

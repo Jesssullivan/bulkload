@@ -395,11 +395,6 @@ counters! {
     // written copy, a Q198 regularization's copy) unioned into the live
     // file and removed (SPEC #298 rules 3, 4; `reseat::fold`).
     ReseatCopyFolded => "reseat_copy_folded",
-    // Copies a re-seat set aside beside a live name. Always 0: under SPEC
-    // #298 (ratified 2026-10-20) nothing is kept aside; a written A-106
-    // copy is held typed (`held-written`) under its private held name.
-    // Kept only as that assertion.
-    ReseatKeptAside => "reseat_kept_aside",
     // Bounded starvation (M2 item 3): a process at background priority
     // whose counters did not move for `--escalate-after` seconds moved its
     // IO back to the normal class once (`priority::escalate`): how many
