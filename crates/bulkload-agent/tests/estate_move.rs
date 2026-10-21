@@ -471,16 +471,16 @@ fn a_related_live_repository_is_consolidated_and_refs_union_by_name() {
     assert!(world.source().ok);
     let moved = world.moved();
     let both = format!("{}\n{}", moved.stdout, moved.stderr);
-    let line = item_line(&moved.stdout, &live);
-    assert!(line.contains("union=consolidated"), "{line}\n{both}");
+    let receipt = item_line(&moved.stdout, &live);
+    assert!(receipt.contains("union=consolidated"), "{receipt}\n{both}");
     assert!(
-        line.contains("outcome=workspace-restored"),
-        "{line}\n{both}"
+        receipt.contains("outcome=workspace-restored"),
+        "{receipt}\n{both}"
     );
-    assert!(line.contains("refs_created=1 "), "{line}\n{both}");
-    assert!(line.contains("refs_switched=1 "), "{line}\n{both}");
-    assert!(line.contains("refs_tracked=1 "), "{line}\n{both}");
-    assert!(line.contains("stash_added=1 "), "{line}\n{both}");
+    assert!(receipt.contains("refs_created=1 "), "{receipt}\n{both}");
+    assert!(receipt.contains("refs_switched=1 "), "{receipt}\n{both}");
+    assert!(receipt.contains("refs_tracked=1 "), "{receipt}\n{both}");
+    assert!(receipt.contains("stash_added=1 "), "{receipt}\n{both}");
     assert!(
         moved
             .stdout
@@ -515,9 +515,9 @@ fn a_related_live_repository_is_consolidated_and_refs_union_by_name() {
     assert!(world.source().ok);
     let again = world.moved();
     let both = format!("{}\n{}", again.stdout, again.stderr);
-    let line = item_line(&again.stdout, &live);
-    assert!(line.contains("outcome=held"), "{line}\n{both}");
-    assert!(line.contains("seats_held=true"), "{line}\n{both}");
+    let receipt = item_line(&again.stdout, &live);
+    assert!(receipt.contains("outcome=held"), "{receipt}\n{both}");
+    assert!(receipt.contains("seats_held=true"), "{receipt}\n{both}");
     assert_eq!(
         fs::read(live.join("new.txt")).unwrap(),
         b"sting changed it\n"
