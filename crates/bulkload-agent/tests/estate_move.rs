@@ -1238,6 +1238,59 @@ fn sessions_into_a_destination_with_no_codex_index_hold_the_store() {
         &src_git,
     ]));
     assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
+    // The plan resolves the symlinked homes as the real pass does (never
+    // creating or writing them) and lists the Claude tree under the key map
+    // the real pass uses: the source's session at the lane's destination
+    // key.
+    let before = tree_files(&state_dir);
+    let planned = agent(&os(&[
+        &"estate-move",
+        &"--plan-only",
+        &"--label",
+        &LABEL,
+        &"--source",
+        &"neo",
+        &"--sessions",
+        &src_home,
+        &"--dest-home",
+        &dst_home,
+        &"--map",
+        &map,
+        &"-",
+        &source_state,
+        &state,
+    ]));
+    assert!(planned.ok, "{}\n{}", planned.stdout, planned.stderr);
+    assert!(
+        planned
+            .stdout
+            .contains("estate-move sessions-home name=claude"),
+        "{}",
+        planned.stdout
+    );
+    // The Claude home's plan is refused nothing (the Codex store's typed
+    // hold is its own line).
+    assert!(
+        !planned.stdout.contains("homes-plan name=.claude refused="),
+        "{}",
+        planned.stdout
+    );
+    assert!(
+        planned.stdout.lines().any(|line| line.starts_with(&format!(
+            "planned projects/{}/{SID}.jsonl class=append-log action=create",
+            key(&dst_lane)
+        ))),
+        "{}",
+        planned.stdout
+    );
+    assert!(
+        !planned
+            .stdout
+            .contains(&format!("planned projects/{}/", key(&src_lane))),
+        "nothing planned under the source key: {}",
+        planned.stdout
+    );
+    assert_eq!(tree_files(&state_dir), before, "the plan wrote nothing");
     let moved = agent(&os(&[
         &"estate-move",
         &"--label",
@@ -1496,16 +1549,29 @@ fn archive_links_follow_a106_and_destination_links_stay() {
         &dst_home,
         &"--map",
         &map,
+        &"--replace-archived-dest",
+        &archive,
         &"-",
         &source_state,
         &state,
     ]));
     assert!(planned.ok, "{}\n{}", planned.stdout, planned.stderr);
+    // Planned under the key map: the fork at the lane's key is an archive
+    // link, unioned and regularized; the neo-key copy of another session is
+    // folded (moved) into the lane's key.
     assert!(
         planned.stdout.lines().any(|line| line.starts_with(&format!(
-            "planned projects/{}/{SID_FORK}.jsonl class=append-log action=hold ",
+            "planned projects/{}/{SID_FORK}.jsonl class=append-log action=consolidate ",
+            key(&dst_lane)
+        ))),
+        "{}",
+        planned.stdout
+    );
+    assert!(
+        planned.stdout.lines().any(|line| line.starts_with(&format!(
+            "planned projects/{}/{SID_NEO_KEY}.jsonl class=append-log action=fold-move ",
             key(&src_lane)
-        )) && line.contains("under another key")),
+        ))),
         "{}",
         planned.stdout
     );
@@ -2327,6 +2393,7 @@ fn the_homes_plan_lists_every_file_and_writes_nothing() {
     fs::create_dir_all(&dst_git).unwrap();
     repo(&src_git.join("lab"), "l.txt");
     let src_lane = src_git.join("lab");
+    let dst_lane = dst_git.join("lab");
     let src_claude = src_home.join(".claude");
     let src_projects = src_claude.join("projects").join(key(&src_lane));
     fs::create_dir_all(&src_projects).unwrap();
@@ -2394,7 +2461,8 @@ fn the_homes_plan_lists_every_file_and_writes_nothing() {
         ("same.txt", "adopt"),
         ("blob.bin", "hold"),
         (
-            &format!("projects/{}/{SID}.jsonl", key(&src_lane)) as &str,
+            // Under the key map the real pass derives (#280 finding 9).
+            &format!("projects/{}/{SID}.jsonl", key(&dst_lane)) as &str,
             "create",
         ),
         (".claude.json", "consolidate"),
@@ -2492,4 +2560,233 @@ fn no_option_writes_a_label_copy_in_a_home() {
         b"{\"b\": 2}\n"
     );
     assert!(!base.join("dst-state").exists());
+}
+
+/// Operator interview and A-055, 2026-10-21: the homes pass resolves the
+/// home's links before it pulls, and folds through links.
+///
+/// - A home directory linking into a `--live-link-root` is the live
+///   directory itself: the source's files are merged there, the link stays.
+/// - A link into a `--regularize-link-root` (a repair stage) becomes a real
+///   directory holding the stage's files, then the source's are merged in;
+///   the stage is never written, and the regularization is counted.
+/// - A neo-key link (into the archive) whose target is the very bytes at
+///   the lane's key is folded: only the link name goes, never its target.
+/// - The lane of a repository under the git root is derived (no per-repo
+///   --map).
+#[test]
+fn homes_links_are_resolved_and_folded_through() {
+    let base = std::env::temp_dir().join(format!("bulkload-move-links-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    let world = World {
+        base: fs::canonicalize(&base).unwrap(),
+    };
+    let base = &world.base;
+    let src_home = base.join("src/home");
+    let dst_home = base.join("dst/home");
+    let (src_git, dst_git) = (src_home.join("git"), dst_home.join("git"));
+    fs::create_dir_all(&src_git).unwrap();
+    fs::create_dir_all(dst_git.join("lab")).unwrap();
+    repo(&src_git.join("lab"), "l.txt");
+    let (src_lane, dst_lane) = (src_git.join("lab"), dst_git.join("lab"));
+    let src_claude = src_home.join(".claude");
+    let dst_claude = dst_home.join(".claude");
+    fs::create_dir_all(&dst_claude).unwrap();
+    fs::create_dir_all(src_home.join(".codex")).unwrap();
+
+    // The relocated live directory and its link.
+    let relocated = base.join("relocated");
+    fs::create_dir_all(relocated.join("agent-notes-rescue")).unwrap();
+    fs::write(relocated.join("agent-notes-rescue/a.md"), b"sting\n").unwrap();
+    std::os::unix::fs::symlink(
+        relocated.join("agent-notes-rescue"),
+        dst_claude.join("agent-notes-rescue"),
+    )
+    .unwrap();
+    fs::create_dir_all(src_claude.join("agent-notes-rescue")).unwrap();
+    fs::write(src_claude.join("agent-notes-rescue/a.md"), b"sting\n").unwrap();
+    fs::write(src_claude.join("agent-notes-rescue/b.md"), b"neo\n").unwrap();
+
+    // A file-history link into the repair stage.
+    let repair_stage = base.join("stage");
+    let staged = repair_stage.join("forks/x/support/file-history").join(SID);
+    fs::create_dir_all(&staged).unwrap();
+    fs::write(staged.join("v1"), b"old\n").unwrap();
+    fs::create_dir_all(dst_claude.join("file-history")).unwrap();
+    std::os::unix::fs::symlink(&staged, dst_claude.join("file-history").join(SID)).unwrap();
+    fs::create_dir_all(src_claude.join("file-history").join(SID)).unwrap();
+    fs::write(
+        src_claude.join("file-history").join(SID).join("v1"),
+        b"old\n",
+    )
+    .unwrap();
+    fs::write(
+        src_claude.join("file-history").join(SID).join("v2"),
+        b"new\n",
+    )
+    .unwrap();
+
+    // The session: neo's copy at its key; sting's at the lane's key, and an
+    // older hand copy at the neo key that is a link into the archive.
+    let bytes = transcript(SID, &src_lane, "NEO");
+    let src_projects = src_claude.join("projects").join(key(&src_lane));
+    fs::create_dir_all(&src_projects).unwrap();
+    fs::write(src_projects.join(format!("{SID}.jsonl")), &bytes).unwrap();
+    let lane_projects = dst_claude.join("projects").join(key(&dst_lane));
+    fs::create_dir_all(&lane_projects).unwrap();
+    fs::write(lane_projects.join(format!("{SID}.jsonl")), &bytes).unwrap();
+    let archive = base.join("archive");
+    fs::create_dir_all(&archive).unwrap();
+    fs::write(archive.join("hand-copy.jsonl"), &bytes).unwrap();
+    let neo_key_dir = dst_claude.join("projects").join(key(&src_lane));
+    fs::create_dir_all(&neo_key_dir).unwrap();
+    std::os::unix::fs::symlink(
+        archive.join("hand-copy.jsonl"),
+        neo_key_dir.join(format!("{SID}.jsonl")),
+    )
+    .unwrap();
+
+    let source_state = base.join("move-src");
+    let state = base.join("move-dst");
+    let root = base.join("src/empty-root");
+    fs::create_dir_all(&root).unwrap();
+    let sourced = agent(&os(&[&"estate-move-source", &source_state, &root]));
+    assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
+    let map = format!("{}={}", src_git.display(), dst_git.display());
+    let home_map = format!("{}={}", src_home.display(), dst_home.display());
+    let run = |plan: bool| {
+        let mut args: Vec<&dyn AsRef<std::ffi::OsStr>> = vec![&"estate-move"];
+        if plan {
+            args.push(&"--plan-only");
+        }
+        args.extend::<[&dyn AsRef<std::ffi::OsStr>; 16]>([
+            &"--label",
+            &LABEL,
+            &"--source",
+            &"neo",
+            &"--sessions",
+            &src_home,
+            &"--dest-home",
+            &dst_home,
+            &"--map",
+            &home_map,
+            &"--map",
+            &map,
+            &"--live-link-root",
+            &relocated,
+            &"--regularize-link-root",
+            &repair_stage,
+        ]);
+        args.extend::<[&dyn AsRef<std::ffi::OsStr>; 5]>([
+            &"--reseat-arg",
+            &"--no-default-by-id",
+            &"-",
+            &source_state,
+            &state,
+        ]);
+        agent(&os(&args))
+    };
+
+    // The plan: the lane is derived, the regularization and the live link
+    // are named, nothing is written.
+    let homes = || {
+        [&dst_home, &relocated, &repair_stage, &archive]
+            .iter()
+            .map(|root| tree_files(root))
+            .collect::<Vec<_>>()
+    };
+    let before = homes();
+    let planned = run(true);
+    assert!(planned.ok, "{}\n{}", planned.stdout, planned.stderr);
+    assert!(
+        planned.stdout.contains(&format!(
+            "estate-move key-map from={} to={}",
+            key(&src_lane),
+            key(&dst_lane)
+        )),
+        "{}",
+        planned.stdout
+    );
+    assert!(
+        planned
+            .stdout
+            .contains("estate-move regularized-links home=claude links=1 files=1 bytes=4 remaining=1 (plan only)"),
+        "{}",
+        planned.stdout
+    );
+    assert!(
+        planned
+            .stdout
+            .contains("estate-move live-link home=plan-claude"),
+        "{}",
+        planned.stdout
+    );
+    assert!(
+        planned.stdout.lines().any(|line| line.starts_with(&format!(
+            "planned projects/{}/{SID}.jsonl class=append-log action=fold-union ",
+            key(&src_lane)
+        ))),
+        "{}",
+        planned.stdout
+    );
+    assert_eq!(homes(), before, "the plan wrote nothing");
+
+    let moved = run(false);
+    assert!(
+        moved
+            .stdout
+            .contains("estate-move phase=sessions-pull outcome=ok"),
+        "{}\n{}",
+        moved.stdout,
+        moved.stderr
+    );
+    // The live link: merged at its real directory; the link stays.
+    assert!(fs::symlink_metadata(dst_claude.join("agent-notes-rescue"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        fs::read(relocated.join("agent-notes-rescue/b.md")).unwrap(),
+        b"neo\n"
+    );
+    assert_eq!(
+        fs::read(relocated.join("agent-notes-rescue/a.md")).unwrap(),
+        b"sting\n"
+    );
+    // The stage link: a real directory with the stage's and neo's files;
+    // the stage untouched.
+    let history = dst_claude.join("file-history").join(SID);
+    assert!(
+        fs::symlink_metadata(&history).unwrap().is_dir(),
+        "{}",
+        moved.stdout
+    );
+    assert_eq!(fs::read(history.join("v1")).unwrap(), b"old\n");
+    assert_eq!(fs::read(history.join("v2")).unwrap(), b"new\n");
+    assert_eq!(
+        tree_files(&repair_stage)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
+        [format!("forks/x/support/file-history/{SID}/v1")]
+    );
+    assert!(
+        moved.stdout.contains(
+            "estate-move regularized-links home=claude links=1 files=1 bytes=4 remaining=0"
+        ),
+        "{}",
+        moved.stdout
+    );
+    // The neo-key link folded through: its name gone, its target kept, the
+    // lane's file as it was.
+    assert!(fs::symlink_metadata(neo_key_dir.join(format!("{SID}.jsonl"))).is_err());
+    assert_eq!(
+        fs::read_to_string(archive.join("hand-copy.jsonl")).unwrap(),
+        bytes
+    );
+    assert_eq!(
+        fs::read_to_string(lane_projects.join(format!("{SID}.jsonl"))).unwrap(),
+        bytes
+    );
 }

@@ -66,6 +66,21 @@ fn eventually(deadline: Duration, check: &dyn Fn() -> bool) -> bool {
     }
 }
 
+/// Whether process `pid` still runs its starvation watcher thread (named
+/// `bulkload-starvation`, which `comm` cuts to 15 bytes), Linux. The thread
+/// returns right after it records an escalation.
+#[cfg(target_os = "linux")]
+fn watcher_running(pid: u32) -> bool {
+    std::fs::read_dir(format!("/proc/{pid}/task"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|task| {
+            std::fs::read_to_string(task.path().join("comm"))
+                .is_ok_and(|comm| comm.trim_end().starts_with("bulkload-starv"))
+        })
+}
+
 /// Run `serve` with `flags` and an open, silent stdin; `probe` sees its
 /// PID while it waits. Then close its stdin; its stderr.
 fn idle_serve(flags: &[&str], probe: &dyn Fn(u32)) -> String {
@@ -108,6 +123,14 @@ fn an_idle_background_process_escalates_once_after_the_threshold() {
             assert!(
                 eventually(Duration::from_secs(90), &|| io_class(pid) != 3),
                 "no escalation within 90 s"
+            );
+            // The class moves before the watcher records it: wait for the
+            // escalation event itself, the watcher thread's end after its
+            // counters (bounded), never a fixed time. Closing stdin earlier
+            // races the counters line on a loaded host.
+            assert!(
+                eventually(Duration::from_secs(30), &|| !watcher_running(pid)),
+                "the watcher never recorded its escalation within 30 s"
             );
         }
         #[cfg(not(target_os = "linux"))]
