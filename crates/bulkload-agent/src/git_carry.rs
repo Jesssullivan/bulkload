@@ -273,6 +273,12 @@ fn writing_privately<'a>(command: &'a mut Command, private: &Path) -> &'a mut Co
     command.env("GIT_OBJECT_DIRECTORY", private.join(git_env::WRITE_STORE))
 }
 
+// Point `command`'s object writes (a fetch run in a scratch repository) at
+// `objects`, a live destination store (the streamed capture, B1).
+fn into_store<'a>(command: &'a mut Command, objects: &Path) -> &'a mut Command {
+    command.env("GIT_OBJECT_DIRECTORY", objects)
+}
+
 /// Whether the repository at `repo` is a partial clone.
 ///
 /// That is a promisor remote, a partial-clone filter or

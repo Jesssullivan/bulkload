@@ -249,86 +249,144 @@ fn holds_no_payload(state: &Path, items: u64) {
     );
 }
 
-#[test]
-fn the_source_half_plans_and_refuses_to_stage_its_capture() {
-    let world = World::new("source");
-    world.estate();
-    let ran = world.source();
-    assert!(!ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+fn out(repo: &Path, args: &[&str]) -> String {
+    let ran = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
     assert!(
-        ran.stderr.contains("refused: STATE_PAYLOAD_LEFT"),
-        "{}",
-        ran.stderr
+        ran.status.success(),
+        "git {args:?} in {}: {}",
+        repo.display(),
+        String::from_utf8_lossy(&ran.stderr)
     );
-    assert!(
-        ran.stdout
-            .contains("estate-move-source phase=inventory outcome=ok items=3 new=3 planned=3"),
-        "{}",
-        ran.stdout
-    );
-    assert!(
-        ran.stdout
-            .contains("estate-move-source phase=capture outcome=refused:STATE_PAYLOAD_LEFT"),
-        "{}",
-        ran.stdout
-    );
-    let words = state_line(&ran.stdout, "estate-move-source");
-    assert_eq!(words["outcome"], "ok", "{}", ran.stdout);
-    assert_eq!(words["state_payload_bytes"], "0", "{}", ran.stdout);
-    let state = world.source_state();
-    assert!(state.join("carry/plan.postcard").is_file());
-    // The pass did not finish: the destination half refuses its marks.
-    assert!(!state.join("carry/move-source.done").exists());
-    holds_no_payload(&state, 3);
-    // The plan is a ledger: a second pass appends nothing and refuses the
-    // same way, its state still free of payload.
-    let again = world.source();
-    assert!(!again.ok);
-    assert!(
-        again.stdout.contains("items=3 new=0 planned=3"),
-        "{}",
-        again.stdout
-    );
-    holds_no_payload(&state, 3);
+    String::from_utf8_lossy(&ran.stdout).into_owned()
 }
 
+// The receipt line of `item` on the destination half's stdout.
+fn item_line<'a>(stdout: &'a str, path: &Path) -> &'a str {
+    let live = format!("live={path:?}");
+    stdout
+        .lines()
+        .find(|line| line.starts_with("estate-move item=") && line.ends_with(&live) && line.contains(" outcome="))
+        .unwrap_or_else(|| panic!("no receipt for {live}:\n{stdout}"))
+}
+
+/// B1 (SPEC rule 2 reset, coordinator decision (a)): the streamed capture
+/// lands every item absent at the destination at its live path. The source
+/// half records only ledgers; the objects are fetched by id from the live
+/// source repository into the live store; the seats (dirty, untracked,
+/// ignored) land through the engine; the linked worktree's pointers are
+/// mapped. The landed repositories hold exactly the source's refs, stash
+/// and status, and only their own objects: no custody refs. Neither state
+/// holds payload. A rerun fetches nothing and reads no seat.
 #[test]
-fn the_destination_half_refuses_to_pull_a_corpus_and_touches_no_live_path() {
-    let world = World::new("destination");
+fn a_streamed_pass_lands_every_absent_item_with_no_payload_anywhere() {
+    let world = World::new("streamed");
     world.estate();
-    let _ = world.source();
-    fs::create_dir_all(world.dst().join("other")).unwrap();
-    fs::write(world.dst().join("other/mine.txt"), b"destination's\n").unwrap();
-    let live = tree(&world.dst());
-    for extra in [&[][..], &["--plan-only"][..]] {
-        let mut args = os(&[&"estate-move", &"--label", &LABEL, &"--source", &"neo"]);
-        args.extend(extra.iter().map(OsString::from));
-        args.extend(os(&[&"-", &world.source_state(), &world.state()]));
-        let ran = agent(&args);
-        assert!(!ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    let sourced = world.source();
+    assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
+    assert!(
+        sourced.stdout.contains("items=3 new=3 planned=3"),
+        "{}",
+        sourced.stdout
+    );
+    assert_eq!(
+        sourced.stdout.matches("outcome=captured").count(),
+        3,
+        "{}",
+        sourced.stdout
+    );
+    holds_no_payload(&world.source_state(), 3);
+    let moved = world.moved();
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    assert!(moved.stdout.contains("estate-move phase=pull outcome=ok"), "{both}");
+    assert!(moved.stdout.contains("estate-move phase=apply outcome=ok"), "{both}");
+    let (src, dst) = (world.src(), world.dst());
+    for name in ["land", "land-wt", "other"] {
         assert!(
-            ran.stderr.contains("refused: STATE_PAYLOAD_LEFT"),
-            "{}",
-            ran.stderr
+            item_line(&moved.stdout, &dst.join(name)).contains("outcome=workspace-restored"),
+            "{both}"
         );
-        assert!(
-            ran.stdout
-                .contains("estate-move phase=pull outcome=refused:STATE_PAYLOAD_LEFT"),
-            "{}",
-            ran.stdout
-        );
-        assert!(
-            !ran.stdout.contains("estate-move phase=plan"),
-            "{}",
-            ran.stdout
-        );
-        let words = state_line(&ran.stdout, "estate-move");
-        assert_eq!(words["outcome"], "ok", "{}", ran.stdout);
-        assert_eq!(words["state_payload_bytes"], "0", "{}", ran.stdout);
-        assert_eq!(tree(&world.dst()), live, "a live path changed");
-        holds_no_payload(&world.state(), 3);
-        holds_no_payload(&world.source_state(), 3);
     }
+    // History, refs and stash exactly as on the source; no custody refs.
+    for name in ["land", "other"] {
+        assert_eq!(
+            out(&dst.join(name), &["for-each-ref", "--format=%(objectname) %(refname)"]),
+            out(&src.join(name), &["for-each-ref", "--format=%(objectname) %(refname)"]),
+            "{name}: {both}"
+        );
+        out(&dst.join(name), &["fsck", "--connectivity-only", "--no-dangling"]);
+    }
+    assert_eq!(
+        out(&dst.join("land"), &["stash", "list"]),
+        out(&src.join("land"), &["stash", "list"])
+    );
+    // The working state: dirty, untracked and ignored seats, byte for byte,
+    // and the same status (the index carried).
+    for rel in ["a.txt", "new.txt", "ignored.bin", ".gitignore"] {
+        assert_eq!(
+            fs::read(dst.join("land").join(rel)).unwrap(),
+            fs::read(src.join("land").join(rel)).unwrap(),
+            "{rel}"
+        );
+    }
+    assert_eq!(
+        out(&dst.join("land"), &["status", "--porcelain", "--ignored"]),
+        out(&src.join("land"), &["status", "--porcelain", "--ignored"])
+    );
+    // The linked worktree is linked, at its live path.
+    assert_eq!(
+        out(&dst.join("land-wt"), &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        "wt"
+    );
+    let listed = out(&dst.join("land"), &["worktree", "list", "--porcelain"]);
+    assert!(listed.contains(&format!("worktree {}", dst.join("land-wt").display())), "{listed}");
+    assert!(!listed.contains("prunable"), "{listed}");
+    // Neither state holds payload; the closure line says so.
+    assert_eq!(state_line(&moved.stdout, "estate-move")["state_payload_bytes"], "0", "{both}");
+    assert_eq!(closure(&moved.stdout)["unaccounted"], "0", "{both}");
+    holds_no_payload(&world.state(), 3);
+    holds_no_payload(&world.source_state(), 3);
+    // A rerun of both halves over an unchanged source fetches nothing and
+    // changes no ref.
+    let refs = out(&dst.join("land"), &["for-each-ref"]);
+    assert!(world.source().ok);
+    let again = world.moved();
+    let both = format!("{}\n{}", again.stdout, again.stderr);
+    for name in ["land", "other"] {
+        let line = item_line(&again.stdout, &dst.join(name));
+        assert!(line.contains("object_batches=0 "), "{line}\n{both}");
+    }
+    assert_eq!(out(&dst.join("land"), &["for-each-ref"]), refs);
+    holds_no_payload(&world.state(), 3);
+}
+
+/// B1 holds, typed, a live path that holds another version: nothing is
+/// written there until the consolidate path (B2) decides it.
+#[test]
+fn a_live_path_holding_another_version_is_held_and_untouched() {
+    let world = World::new("held");
+    world.estate();
+    let mine = world.dst().join("other");
+    repo(&mine, "mine.txt");
+    let before = tree(&mine);
+    let head = out(&mine, &["rev-parse", "HEAD"]);
+    assert!(world.source().ok);
+    let moved = world.moved();
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    let line = item_line(&moved.stdout, &mine);
+    assert!(
+        line.contains("outcome=held code=GIT_DESTINATION_OCCUPIED"),
+        "{line}\n{both}"
+    );
+    assert_eq!(tree(&mine), before);
+    assert_eq!(out(&mine, &["rev-parse", "HEAD"]), head);
+    holds_no_payload(&world.state(), 3);
 }
 
 #[test]

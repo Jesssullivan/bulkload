@@ -3184,7 +3184,31 @@ pub fn ledger_with(
         let mut capture = None;
         let mut omitted = None;
         let unknown_because;
-        let journal = if !record_path.try_exists().refuse_at("estate::ledger")? {
+        // The streamed capture (SPEC rule 2 reset, B1) records no corpus
+        // capture: its item snapshot in `carry/`, beside the corpus, binds
+        // the journal instead.
+        let streamed = match corpus.parent() {
+            Some(carry) if !record_path.try_exists().refuse_at("estate::ledger")? => {
+                streamed::recorded(carry, &identity).ok().flatten()
+            }
+            _ => None,
+        };
+        let journal = if let Some(snapshot) = &streamed {
+            unknown_because = None;
+            let digest = snapshot.digest();
+            capture = Some(blake3::Hash::from_bytes(digest).to_hex().as_str().to_owned());
+            let expected = journal_path(Path::new(""), &identity, source, &digest);
+            let name = expected.to_string_lossy().into_owned();
+            let found = states
+                .iter()
+                .rev()
+                .map(|state| state.join(&name))
+                .find(|path| path.is_file());
+            matched.insert(name);
+            found.map_or(JournalState::Absent, |path| {
+                JournalState::Present(read::<String>(&path).unwrap_or_default())
+            })
+        } else if !record_path.try_exists().refuse_at("estate::ledger")? {
             unknown_because = Some("no-capture");
             JournalState::NoCapture
         } else if let Ok(captured) = read::<Capture>(&record_path) {
@@ -3954,6 +3978,9 @@ pub use retarget::{mapped as retarget_mapped, retarget, Moved as Retargeted};
 
 // `estate-move` and `estate-move-source` (M2 item 7).
 pub mod moving;
+
+// The streamed capture of an item (SPEC rule 2 reset, B1).
+pub mod streamed;
 
 // S4 refusal sweep (2026-10-08): #219, #220, #162, #183.
 #[cfg(test)]

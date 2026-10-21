@@ -207,6 +207,82 @@ fn operation_ids(admin: &Path, ids: &mut BTreeSet<String>) -> Result<()> {
 /// Git children's refusals; `GIT_INVENTORY_MALFORMED` for output that does
 /// not parse; IO.
 pub fn snapshot(repo: &Path) -> Result<Snapshot> {
+    let (object_format, refs, worktrees, named) = named(repo)?;
+    let (wants, missing) = partition(repo, &named)?;
+    Ok(Snapshot {
+        object_format,
+        refs,
+        worktrees,
+        wants,
+        missing,
+    })
+}
+
+/// The ids `repo`'s administration names that its object store lacks: what
+/// a landing must still fetch, and what its proof requires to be none.
+///
+/// # Errors
+/// As [`snapshot`].
+pub fn lacking(repo: &Path) -> Result<Vec<String>> {
+    let (_, _, _, named) = named(repo)?;
+    let (_, missing) = partition_ids(repo, &named)?;
+    Ok(missing)
+}
+
+/// `repo`'s object store directory, absolute.
+///
+/// # Errors
+/// Git's refusal.
+pub fn objects_dir(repo: &Path) -> Result<PathBuf> {
+    Ok(PathBuf::from(text(git(repo).args([
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "objects",
+    ]))?))
+}
+
+// What every name in `named` is in `repo`'s store: held, or missing.
+fn partition_ids(repo: &Path, named: &BTreeSet<String>) -> Result<(Vec<String>, Vec<String>)> {
+    let request: String = named.iter().fold(String::new(), |mut all, id| {
+        all.push_str(id);
+        all.push('\n');
+        all
+    });
+    let answered = input(
+        git(repo).args(["cat-file", "--batch-check=%(objectname)"]),
+        request.as_bytes(),
+    )?;
+    let answered =
+        String::from_utf8(answered).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
+    let (mut held, mut missing) = (Vec::new(), Vec::new());
+    for line in answered.lines() {
+        if let Some(id) = line.strip_suffix(" missing") {
+            if !oid(id) {
+                return Err(BulkloadRefusal::GitInventoryMalformed);
+            }
+            missing.push(id.to_owned());
+        } else if oid(line) {
+            held.push(line.to_owned());
+        } else {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        }
+    }
+    held.sort();
+    held.dedup();
+    Ok((held, missing))
+}
+
+fn partition(repo: &Path, named: &BTreeSet<String>) -> Result<(Vec<String>, u64)> {
+    let (held, missing) = partition_ids(repo, named)?;
+    Ok((held, u64::try_from(missing.len()).unwrap_or(u64::MAX)))
+}
+
+type Named = (String, Vec<(String, String)>, Vec<Worktree>, BTreeSet<String>);
+
+// The object format, the refs, the worktrees and every id `repo`'s
+// administration names.
+fn named(repo: &Path) -> Result<Named> {
     let common = super::common_repository(repo)?;
     let object_format = text(git(repo).args(["rev-parse", "--show-object-format"]))?;
     let refs = ref_lines(&text(
@@ -271,41 +347,7 @@ pub fn snapshot(repo: &Path) -> Result<Snapshot> {
             }
         }
     }
-    // Only ids the source holds are wanted; the rest are counted.
-    let request: String = named.iter().fold(String::new(), |mut all, id| {
-        all.push_str(id);
-        all.push('\n');
-        all
-    });
-    let answered = input(
-        git(repo).args(["cat-file", "--batch-check=%(objectname)"]),
-        request.as_bytes(),
-    )?;
-    let answered =
-        String::from_utf8(answered).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
-    let mut wants = Vec::new();
-    let mut missing = 0u64;
-    for line in answered.lines() {
-        if let Some(id) = line.strip_suffix(" missing") {
-            if !oid(id) {
-                return Err(BulkloadRefusal::GitInventoryMalformed);
-            }
-            missing += 1;
-        } else if oid(line) {
-            wants.push(line.to_owned());
-        } else {
-            return Err(BulkloadRefusal::GitInventoryMalformed);
-        }
-    }
-    wants.sort();
-    wants.dedup();
-    Ok(Snapshot {
-        object_format,
-        refs,
-        worktrees,
-        wants,
-        missing,
-    })
+    Ok((object_format, refs, worktrees, named))
 }
 
 /// The source end of a fetch: `git upload-pack` of `repo`, its stdin and
@@ -397,18 +439,55 @@ fn store_bytes(objects: &Path) -> u64 {
     total
 }
 
-/// Fetch `snapshot`'s wants from `url` into the live repository `live`.
+/// A bare repository of its own that a fetch runs in, its objects written
+/// into another store; removed when dropped.
+struct Scratch(PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn scratch(object_format: &str) -> Result<Scratch> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "bulkload-fetch-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let parent = path.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?;
+    let made = Scratch(path.clone());
+    output(
+        git(parent)
+            .args([
+                "init",
+                "--bare",
+                "--quiet",
+                "--template=",
+                &format!("--object-format={object_format}"),
+            ])
+            .arg(&path),
+    )?;
+    Ok(made)
+}
+
+/// Fetch `snapshot`'s wants from `url` into the object store `objects`.
 ///
 /// In batches of [`BATCH`], running `upload_pack` as the source end (`git`
-/// runs it, with the path `url` names, through its shell). Each finished
-/// batch is recorded in `marks` (written durably) before the next starts;
-/// a batch a mark names is skipped. A rerun over a store that holds every
-/// want fetches nothing: Git's negotiation sends what is missing only.
+/// runs it, with the path `url` names, through its shell). The fetch runs in
+/// a scratch bare repository whose objects are written into `objects` (a
+/// live repository's store, whose refs may not exist yet): no ref, no
+/// `FETCH_HEAD`, and Git's quarantine and connectivity check in that store.
+/// Each finished batch is recorded in `marks` (written durably) before the
+/// next starts; a batch a mark names is skipped. A rerun over a store that
+/// holds every want fetches nothing: Git sends what is missing only.
 ///
 /// # Errors
 /// `GIT_CHILD_FAILED` when a fetch fails (its batch stays unmarked); IO.
-pub fn fetch(
-    live: &Path,
+pub fn fetch_into(
+    objects: &Path,
+    object_format: &str,
     url: &str,
     upload_pack: &str,
     snapshot: &Snapshot,
@@ -416,27 +495,27 @@ pub fn fetch(
 ) -> Result<Fetched> {
     let digest = snapshot.digest();
     let mut recorded = read_marks(marks, digest)?;
-    let objects = PathBuf::from(text(git(live).args([
-        "rev-parse",
-        "--path-format=absolute",
-        "--git-path",
-        "objects",
-    ]))?);
-    let before = store_bytes(&objects);
+    let before = store_bytes(objects);
     let mut fetched = Fetched::default();
+    let mut work: Option<Scratch> = None;
     for (index, batch) in snapshot.wants.chunks(BATCH).enumerate() {
         let index = u64::try_from(index).unwrap_or(u64::MAX);
         if recorded.done.contains(&index) {
             fetched.skipped += 1;
             continue;
         }
+        if work.is_none() {
+            work = Some(scratch(object_format)?);
+        }
+        let repo = &work.as_ref().ok_or(BulkloadRefusal::WorkerLost)?.0;
         let request = batch.iter().fold(String::new(), |mut all, id| {
             all.push_str(id);
             all.push('\n');
             all
         });
-        let mut command = git(live);
+        let mut command = git(repo);
         durable(&mut command);
+        super::into_store(&mut command, objects);
         input(
             command
                 .args([
@@ -461,7 +540,7 @@ pub fn fetch(
         )?;
         fetched.batches += 1;
     }
-    fetched.bytes = store_bytes(&objects).saturating_sub(before);
+    fetched.bytes = store_bytes(objects).saturating_sub(before);
     Ok(fetched)
 }
 
@@ -626,7 +705,8 @@ mod tests {
         let marks = root.0.join("marks");
         let upload = format!("git -c {UPLOAD_PACK_CONFIG} upload-pack");
         let url = repo.to_str().unwrap();
-        let first = fetch(&live, url, &upload, &snapshot, &marks).unwrap();
+        let objects = live.join(".git/objects");
+        let first = fetch_into(&objects, "sha1", url, &upload, &snapshot, &marks).unwrap();
         assert_eq!(first.batches, 1);
         assert!(first.bytes > 0);
         for id in snapshot.wants.iter().chain(&named) {
@@ -640,10 +720,10 @@ mod tests {
             .is_empty());
         // The mark skips the batch; with the mark gone, the store's haves
         // make the fetch carry nothing.
-        let marked = fetch(&live, url, &upload, &snapshot, &marks).unwrap();
+        let marked = fetch_into(&objects, "sha1", url, &upload, &snapshot, &marks).unwrap();
         assert_eq!((marked.batches, marked.skipped, marked.bytes), (0, 1, 0));
         fs::remove_file(&marks).unwrap();
-        let negotiated = fetch(&live, url, &upload, &snapshot, &marks).unwrap();
+        let negotiated = fetch_into(&objects, "sha1", url, &upload, &snapshot, &marks).unwrap();
         assert_eq!((negotiated.batches, negotiated.bytes), (1, 0));
     }
 

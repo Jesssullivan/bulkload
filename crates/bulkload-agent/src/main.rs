@@ -67,6 +67,12 @@ SUBCOMMANDS:
                 --file the root the request names is one file or symlink,
                 never followed (pull --file passes it); any other word is
                 refused
+    upload-pack REPO
+                The source end of estate-move's streamed fetch (SPEC rule 2
+                reset): git upload-pack of the absolute REPO on stdin and
+                stdout, read-only, with uploadpack.allowAnySHA1InWant on its
+                command line only, so the destination fetches the ids the
+                capture pinned
     git-export REPO NEW_CAPTURE_DIR [--include-rebuildable]
                 Archive refs/stashes and staged/worktree trees in a bundle
     git-carry-estimate [--state-dir DIR] SOURCE_REPO DEST [SOURCE_REPO DEST ...]
@@ -814,6 +820,7 @@ COUNTERS:
 /// `serve`.
 const SOURCE_SIDE_VERBS: &[&str] = &[
     "serve",
+    "upload-pack",
     "estate-capture",
     "estate-move-source",
     "snapshot",
@@ -950,6 +957,7 @@ fn main() -> ExitCode {
         Some("transfer-expect") => expect_command(&args.collect::<Vec<_>>()),
         Some("estate-reseat") => reseat_command(&args.collect::<Vec<_>>()),
         Some("serve") => serve_command(&args.collect::<Vec<_>>()),
+        Some("upload-pack") => upload_pack_command(&args.collect::<Vec<_>>()),
         Some("help" | "--help" | "-h") => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -1128,6 +1136,20 @@ fn transfer_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
 
 /// `serve [--file]`: one framed session on stdin/stdout. `--file` (#232) is
 /// its one option; another word is refused, where before it was ignored.
+// The source end of a streamed fetch (SPEC rule 2 reset, B1): `git
+// upload-pack REPO` through the sanctioned builder, its stdin and stdout
+// the destination's `git fetch`. Read-only on the source.
+fn upload_pack_command(args: &[std::ffi::OsString]) -> Result<()> {
+    let [repo] = args else {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
+    };
+    let repo = Path::new(repo);
+    if !repo.is_absolute() {
+        return Err(BulkloadRefusal::PathNotAbsolute);
+    }
+    bulkload_agent::git_carry::stream::serve_upload_pack(repo)
+}
+
 fn serve_command(args: &[std::ffi::OsString]) -> Result<()> {
     let (kind, rest) = root_kind(args);
     if !rest.is_empty() {

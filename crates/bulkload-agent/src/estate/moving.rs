@@ -674,11 +674,16 @@ pub fn decide(
     let mut rows = Vec::with_capacity(items.len());
     for item in items {
         let identity = id(item)?;
+        // A corpus capture record, or the streamed capture's item snapshot
+        // beside the corpus (SPEC rule 2 reset, B1).
         let held = inputs
             .corpus
             .join(format!("{identity}.capture"))
             .try_exists()
-            .refuse_at(SITE)?;
+            .refuse_at(SITE)?
+            || inputs.corpus.parent().is_some_and(|carry| {
+                super::streamed::snapshot_path(carry, &identity).is_file()
+            });
         let capture = capture_of(held, inputs.refusals.get(&identity).map(String::as_str));
         let place = item.workspace.as_ref().unwrap_or(&item.repository);
         let now = presence(place);

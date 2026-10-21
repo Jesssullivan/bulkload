@@ -129,13 +129,7 @@ fn the_pass_makes_the_serve_directory_beside_carry_and_private() {
     let world = World::new("serve");
     let state = world.path("state");
     let ran = agent(&os(&[&"estate-move-source", &state, &world.path("live")]));
-    // The capture is refused (SPEC rule 2); the directories are there.
-    assert!(!ran.ok, "{}{}", ran.stdout, ran.stderr);
-    assert!(
-        ran.stderr.contains("refused: STATE_PAYLOAD_LEFT"),
-        "{}",
-        ran.stderr
-    );
+    assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
     for name in ["carry", "serve", "serve/carry"] {
         let dir = state.join(name);
         assert!(dir.is_dir(), "{name} missing:\n{}", ran.stdout);
@@ -158,8 +152,7 @@ fn a_vanished_root_is_a_note_and_the_pass_continues() {
         &gone,
         &world.path("live"),
     ]));
-    // The pass continues to its capture, which is refused (SPEC rule 2).
-    assert!(!ran.ok, "{}{}", ran.stdout, ran.stderr);
+    assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
     let note = format!(
         "estate-move-source note=source-vanished path={gone:?} count=1 code=SOURCE_ROOT_MISSING"
     );
@@ -177,7 +170,7 @@ fn a_vanished_root_is_a_note_and_the_pass_continues() {
     assert!(inventory.contains(" source_vanished=1 "), "{inventory}");
     assert!(
         ran.stdout
-            .contains("estate-move-source phase=capture outcome=refused:STATE_PAYLOAD_LEFT"),
+            .contains("estate-move-source phase=capture outcome=ok captured=1"),
         "{}",
         ran.stdout
     );
@@ -221,9 +214,9 @@ fn fake_ssh(dir: &Path) {
 }
 
 // SPEC rule 2 (reset 2026-10-20), over a transport: the pull lands only
-// the source half's plan and marks. A corpus a source half from before the
-// reset left is never pulled (excluded, its bytes never read), and a plan
-// with Git items refuses `STATE_PAYLOAD_LEFT` until the streamed capture.
+// the source half's plan, marks and item snapshots. A corpus a source half
+// from before the reset left is never pulled (excluded, its bytes never
+// read).
 #[test]
 fn a_remote_pass_pulls_only_ledgers_and_refuses_a_git_plan() {
     let world = World::new("remote");
@@ -254,10 +247,13 @@ fn a_remote_pass_pulls_only_ledgers_and_refuses_a_git_plan() {
     );
     let both = format!("{}\n{}", moved.stdout, moved.stderr);
     assert!(!moved.ok, "{both}");
+    assert!(moved.stdout.contains("estate-move phase=pull outcome=ok"), "{both}");
+    // The streamed fetch over ssh is not relayed yet: each item refuses,
+    // typed, before anything is fetched or landed.
     assert!(
         moved
             .stdout
-            .contains("estate-move phase=pull outcome=refused:STATE_PAYLOAD_LEFT"),
+            .contains("estate-move phase=apply outcome=items-refused first=TRANSPORT_LOST"),
         "{both}"
     );
     assert!(

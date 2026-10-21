@@ -141,6 +141,10 @@ const CARRY_LEDGERS: &[&str] = &[
     "move-source.notes",
 ];
 
+/// The suffix of an item's streamed capture in `carry/` (SPEC rule 2
+/// reset, B1): its object ids and host-path files, a ledger.
+const CARRY_SUFFIXES: &[&str] = &[".snapshot"];
+
 /// The suffixes of an estate item's records in `private/` (each
 /// `IDENTITY[-SOURCE[-DIGEST]].SUFFIX`).
 const PRIVATE_SUFFIXES: &[&str] = &[
@@ -152,6 +156,8 @@ const PRIVATE_SUFFIXES: &[&str] = &[
     ".exclude-union",
     ".done",
     ".carried",
+    // A streamed fetch's resume marks (B1).
+    ".objects",
 ];
 
 /// A ledger's interrupted publication: `estate::write_bytes` writes
@@ -181,7 +187,13 @@ pub fn ledger(rel: &[&OsStr]) -> bool {
     };
     match dirs.as_slice() {
         [] => ROOT_LEDGERS.contains(&name) || pending(name),
-        ["carry"] => CARRY_LEDGERS.contains(&name) || pending(name),
+        ["carry"] => {
+            CARRY_LEDGERS.contains(&name)
+                || CARRY_SUFFIXES
+                    .iter()
+                    .any(|suffix| name.len() > suffix.len() && name.ends_with(suffix))
+                || pending(name)
+        }
         ["private"] => {
             name == "estate.lock"
                 || PRIVATE_SUFFIXES
