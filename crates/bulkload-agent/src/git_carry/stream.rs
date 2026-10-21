@@ -35,7 +35,9 @@ use crate::{BulkloadRefusal, Result};
 const SITE: &str = "git_carry::stream";
 
 /// The configuration the source end runs `upload-pack` with, on its command
-/// line only: any object id the snapshot pinned may be wanted, reachable
+/// line only.
+///
+/// Any object id the snapshot pinned may be wanted, reachable
 /// from a ref now or not (a reflog entry, a moved ref's old value, an
 /// index blob).
 pub const UPLOAD_PACK_CONFIG: &str = "uploadpack.allowAnySHA1InWant=true";
@@ -241,7 +243,10 @@ pub fn snapshot(repo: &Path) -> Result<Snapshot> {
         }
         // The index's blobs (gitlinks name another repository's commits).
         let staged = output(git(&path).args(["ls-files", "-s", "-z"]))?;
-        for entry in staged.split(|byte| *byte == 0).filter(|entry| !entry.is_empty()) {
+        for entry in staged
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+        {
             let mut words = entry.split(|byte| *byte == b' ');
             if let (Some(mode), Some(id)) = (words.next(), words.next()) {
                 if mode != b"160000" {
@@ -392,8 +397,9 @@ fn store_bytes(objects: &Path) -> u64 {
     total
 }
 
-/// Fetch `snapshot`'s wants from `url` into the live repository `live`, in
-/// batches of [`BATCH`], running `upload_pack` as the source end (`git`
+/// Fetch `snapshot`'s wants from `url` into the live repository `live`.
+///
+/// In batches of [`BATCH`], running `upload_pack` as the source end (`git`
 /// runs it, with the path `url` names, through its shell). Each finished
 /// batch is recorded in `marks` (written durably) before the next starts;
 /// a batch a mark names is skipped. A rerun over a store that holds every
@@ -469,7 +475,10 @@ pub fn quarantine_left(objects: &Path) -> Result<Vec<PathBuf>> {
     let mut found = Vec::new();
     for (dir, prefixes) in [
         (objects.to_path_buf(), &["incoming-", "tmp_objdir-"][..]),
-        (objects.join("pack"), &["tmp_pack_", "tmp_idx_", "tmp_rev_"][..]),
+        (
+            objects.join("pack"),
+            &["tmp_pack_", "tmp_idx_", "tmp_rev_"][..],
+        ),
     ] {
         let read = match fs::read_dir(&dir) {
             Ok(read) => read,
@@ -515,7 +524,8 @@ mod tests {
     }
 
     fn scratch(tag: &str) -> Scratch {
-        let path = std::env::temp_dir().join(format!("bulkload-stream-{tag}-{}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("bulkload-stream-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         Scratch(fs::canonicalize(&path).unwrap())
@@ -567,7 +577,10 @@ mod tests {
         g(&repo, &["add", "b"]);
         let staged = g(&repo, &["rev-parse", ":b"]);
         let wt = root.join("wt");
-        g(&repo, &["worktree", "add", "-q", "-b", "side", wt.to_str().unwrap()]);
+        g(
+            &repo,
+            &["worktree", "add", "-q", "-b", "side", wt.to_str().unwrap()],
+        );
         g(&wt, &["commit", "-q", "--allow-empty", "-m", "side work"]);
         let side = g(&wt, &["rev-parse", "HEAD"]);
         fs::write(wt.join("c"), "wt staged\n").unwrap();
@@ -584,7 +597,10 @@ mod tests {
         for id in &named {
             assert!(snapshot.wants.contains(id), "{id} not wanted: {snapshot:?}");
         }
-        assert!(snapshot.refs.iter().any(|(name, _)| name == "refs/notes/commits"));
+        assert!(snapshot
+            .refs
+            .iter()
+            .any(|(name, _)| name == "refs/notes/commits"));
         assert!(snapshot.refs.iter().any(|(name, _)| name == "refs/stash"));
         assert_eq!(snapshot.worktrees.len(), 2);
         assert_eq!(snapshot.missing, 0);
@@ -619,7 +635,9 @@ mod tests {
         // No ref and no FETCH_HEAD written, no quarantine left.
         assert_eq!(g(&live, &["for-each-ref"]), "");
         assert!(!live.join(".git/FETCH_HEAD").exists());
-        assert!(quarantine_left(&live.join(".git/objects")).unwrap().is_empty());
+        assert!(quarantine_left(&live.join(".git/objects"))
+            .unwrap()
+            .is_empty());
         // The mark skips the batch; with the mark gone, the store's haves
         // make the fetch carry nothing.
         let marked = fetch(&live, url, &upload, &snapshot, &marks).unwrap();
@@ -652,7 +670,10 @@ mod tests {
         fs::write(objects.join("pack/pack-1.pack"), b"").unwrap();
         assert_eq!(
             quarantine_left(&objects).unwrap(),
-            vec![objects.join("incoming-abc"), objects.join("pack/tmp_pack_x")]
+            vec![
+                objects.join("incoming-abc"),
+                objects.join("pack/tmp_pack_x")
+            ]
         );
     }
 }
