@@ -1,25 +1,28 @@
-//! P-MOVE-1..3 (M2 item 7, design `2026-10-16-estate-move-design.md`
-//! section 3; operator ruling A-20261018-110): `estate-move-source` then
-//! `estate-move` through the binary, on this host (`-`), over the in-place
-//! lane's shapes:
+//! SPEC rule 2 (reset 2026-10-20) on `estate-move-source` and
+//! `estate-move`, through the binary, on this host (`-`). The operator,
+//! 2026-10-20: "this pattern can never happen again" (every item's private
+//! state held a capture bundle and a repository copy of its live
+//! repository, beside a corpus). Neither machine ever gets a staging copy,
+//! and bulkload's private state holds ledgers and resume marks only:
 //!
-//! - `land` and its linked worktree `land-wt`, absent at the destination:
-//!   landed at their live paths;
-//! - `same`: an equal clone at the destination (adopted in place) whose
-//!   `topic` branch the destination moved: refs-in creates
-//!   `refs/<label>/heads/topic` at the source's value, and the destination's
-//!   `topic` and checkout stay as they were;
-//! - `diverged`: a destination checkout with its own commit: the capture
-//!   lands beside it at `<path>.<label>`, the live checkout untouched;
-//! - `broken` and `broken2`: captures refused (no index): carried as files,
-//!   at the live path (absent) and beside it (occupied);
-//! - `occupied`: a non-Git tree at the live path (a standalone item's):
-//!   refused typed (`GIT_DESTINATION_NONREPO_DIFFERS`), untouched;
-//! - `bare.git`: a bare repository landed refs-only.
+//! - the source half inventories and plans, then refuses its capture
+//!   `STATE_PAYLOAD_LEFT` before it writes: no bundle, repository copy or
+//!   corpus on the source, and its state line measures zero payload within
+//!   the resume-mark bound;
+//! - the destination half refuses its pull of the corpus the same way,
+//!   before any transport, and touches no live path;
+//! - a state holding a retired staging format (a corpus, a capture attempt
+//!   directory with its bundle and repository copy, a landing area) is
+//!   refused `STATE_FORMAT_RETIRED` at startup by either half, each one
+//!   named, and nothing is written;
+//! - any payload a pass leaves in its state is named and refused
+//!   `STATE_PAYLOAD_LEFT`.
 //!
-//! Then: closure accounts for every item; a rerun changes no ref and keeps
-//! every carry where it went (P-MOVE-2); another label refuses
-//! `RECEIPT_BINDING_INVALID`; `--plan-only` writes nothing at a live path.
+//! The P-MOVE-1..3 landing proofs this file held (M2 item 7), and the four
+//! `--sessions` passes over a Git lane below (plan of record 2026-10-19,
+//! C9 to C11), wait for the streamed capture (PR B), which brings them back
+//! over live-store transfers: until then they are `#[ignore]`d with that
+//! reason.
 
 #![allow(
     clippy::unwrap_used,
@@ -29,13 +32,17 @@
     clippy::too_many_lines
 )]
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const LABEL: &str = "neo-20261018";
+use bulkload_agent::state_payload as payload;
+
+const LABEL: &str = "neo-20261020";
 
 struct Ran {
     ok: bool,
@@ -61,7 +68,7 @@ fn os(items: &[&dyn AsRef<std::ffi::OsStr>]) -> Vec<OsString> {
     items.iter().map(|item| item.as_ref().to_owned()).collect()
 }
 
-fn git(repo: &Path, args: &[&str]) -> String {
+fn git(repo: &Path, args: &[&str]) {
     let out = Command::new("git")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -84,7 +91,6 @@ fn git(repo: &Path, args: &[&str]) -> String {
         repo.display(),
         String::from_utf8_lossy(&out.stderr)
     );
-    String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
 fn repo(path: &Path, file: &str) {
@@ -95,12 +101,104 @@ fn repo(path: &Path, file: &str) {
     git(path, &["commit", "--quiet", "-m", "c0"]);
 }
 
-fn refs(repo: &Path) -> String {
-    git(repo, &["for-each-ref", "--format=%(objectname) %(refname)"])
+struct World {
+    base: PathBuf,
+}
+
+impl World {
+    fn new(tag: &str) -> Self {
+        let base = std::env::temp_dir().join(format!("bulkload-move-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("src/git")).unwrap();
+        fs::create_dir_all(base.join("dst/git")).unwrap();
+        Self {
+            base: fs::canonicalize(&base).unwrap(),
+        }
+    }
+
+    fn src(&self) -> PathBuf {
+        self.base.join("src/git")
+    }
+
+    fn dst(&self) -> PathBuf {
+        self.base.join("dst/git")
+    }
+
+    fn source_state(&self) -> PathBuf {
+        self.base.join("move-src")
+    }
+
+    fn state(&self) -> PathBuf {
+        self.base.join("move-dst")
+    }
+
+    /// Two repositories with work in progress (a dirty tracked file, an
+    /// untracked and an ignored one, a stash) and a linked worktree.
+    fn estate(&self) {
+        let src = self.src();
+        let land = src.join("land");
+        repo(&land, "a.txt");
+        fs::write(land.join(".gitignore"), "ignored.bin\n").unwrap();
+        git(&land, &["add", ".gitignore"]);
+        git(&land, &["commit", "--quiet", "-m", "c1"]);
+        fs::write(land.join("a.txt"), "a, edited\n").unwrap();
+        git(&land, &["stash", "push", "--quiet", "-m", "parked"]);
+        fs::write(land.join("a.txt"), "a, dirty\n").unwrap();
+        fs::write(land.join("new.txt"), "untracked\n").unwrap();
+        fs::write(land.join("ignored.bin"), vec![7u8; 4096]).unwrap();
+        git(
+            &land,
+            &["worktree", "add", "--quiet", "-b", "wt", "../land-wt"],
+        );
+        repo(&src.join("other"), "o.txt");
+    }
+
+    fn source(&self) -> Ran {
+        let map = format!("{}={}", self.src().display(), self.dst().display());
+        agent(&os(&[
+            &"estate-move-source",
+            &"--map",
+            &map,
+            &self.source_state(),
+            &self.src(),
+        ]))
+    }
+
+    fn moved(&self) -> Ran {
+        agent(&os(&[
+            &"estate-move",
+            &"--label",
+            &LABEL,
+            &"--source",
+            &"neo",
+            &"-",
+            &self.source_state(),
+            &self.state(),
+        ]))
+    }
+}
+
+impl Drop for World {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.base);
+    }
+}
+
+// The `VERB phase=state` line's `key=value` words.
+fn state_line(stdout: &str, verb: &str) -> BTreeMap<String, String> {
+    let prefix = format!("{verb} phase=state ");
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no {prefix:?} line:\n{stdout}"));
+    line.split(' ')
+        .filter_map(|word| word.split_once('='))
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect()
 }
 
 // The `estate-move closure` line's `key=value` words.
-fn closure(stdout: &str) -> std::collections::BTreeMap<String, String> {
+fn closure(stdout: &str) -> BTreeMap<String, String> {
     let line = stdout
         .lines()
         .find(|line| line.starts_with("estate-move closure "))
@@ -111,361 +209,243 @@ fn closure(stdout: &str) -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
-struct World {
-    base: PathBuf,
+// Every path under `root`, relative, sorted (directories too).
+fn tree(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(read) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read {
+            let path = entry.unwrap().path();
+            found.push(path.strip_prefix(root).unwrap().to_path_buf());
+            if fs::symlink_metadata(&path).unwrap().is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
 }
 
-impl Drop for World {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.base);
+// No staging format anywhere under `state`, and nothing the guard counts
+// as payload; its ledgers within the resume-mark bound for `items`.
+fn holds_no_payload(state: &Path, items: u64) {
+    for rel in tree(state) {
+        let name = rel.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            !name.ends_with(".bundle") && name != "repository.git" && name != "corpus",
+            "{} holds {}",
+            state.display(),
+            rel.display()
+        );
+    }
+    assert!(payload::retired(state).unwrap().is_empty());
+    let measured = payload::measure(state).unwrap();
+    assert_eq!(measured.payload_files, 0, "{measured:?}");
+    assert!(
+        measured.ledger_bytes <= payload::resume_mark_bound(items),
+        "{measured:?}"
+    );
+}
+
+#[test]
+fn the_source_half_plans_and_refuses_to_stage_its_capture() {
+    let world = World::new("source");
+    world.estate();
+    let ran = world.source();
+    assert!(!ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    assert!(
+        ran.stderr.contains("refused: STATE_PAYLOAD_LEFT"),
+        "{}",
+        ran.stderr
+    );
+    assert!(
+        ran.stdout
+            .contains("estate-move-source phase=inventory outcome=ok items=3 new=3 planned=3"),
+        "{}",
+        ran.stdout
+    );
+    assert!(
+        ran.stdout
+            .contains("estate-move-source phase=capture outcome=refused:STATE_PAYLOAD_LEFT"),
+        "{}",
+        ran.stdout
+    );
+    let words = state_line(&ran.stdout, "estate-move-source");
+    assert_eq!(words["outcome"], "ok", "{}", ran.stdout);
+    assert_eq!(words["state_payload_bytes"], "0", "{}", ran.stdout);
+    let state = world.source_state();
+    assert!(state.join("carry/plan.postcard").is_file());
+    // The pass did not finish: the destination half refuses its marks.
+    assert!(!state.join("carry/move-source.done").exists());
+    holds_no_payload(&state, 3);
+    // The plan is a ledger: a second pass appends nothing and refuses the
+    // same way, its state still free of payload.
+    let again = world.source();
+    assert!(!again.ok);
+    assert!(
+        again.stdout.contains("items=3 new=0 planned=3"),
+        "{}",
+        again.stdout
+    );
+    holds_no_payload(&state, 3);
+}
+
+#[test]
+fn the_destination_half_refuses_to_pull_a_corpus_and_touches_no_live_path() {
+    let world = World::new("destination");
+    world.estate();
+    let _ = world.source();
+    fs::create_dir_all(world.dst().join("other")).unwrap();
+    fs::write(world.dst().join("other/mine.txt"), b"destination's\n").unwrap();
+    let live = tree(&world.dst());
+    for extra in [&[][..], &["--plan-only"][..]] {
+        let mut args = os(&[&"estate-move", &"--label", &LABEL, &"--source", &"neo"]);
+        args.extend(extra.iter().map(OsString::from));
+        args.extend(os(&[&"-", &world.source_state(), &world.state()]));
+        let ran = agent(&args);
+        assert!(!ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+        assert!(
+            ran.stderr.contains("refused: STATE_PAYLOAD_LEFT"),
+            "{}",
+            ran.stderr
+        );
+        assert!(
+            ran.stdout
+                .contains("estate-move phase=pull outcome=refused:STATE_PAYLOAD_LEFT"),
+            "{}",
+            ran.stdout
+        );
+        assert!(
+            !ran.stdout.contains("estate-move phase=plan"),
+            "{}",
+            ran.stdout
+        );
+        let words = state_line(&ran.stdout, "estate-move");
+        assert_eq!(words["outcome"], "ok", "{}", ran.stdout);
+        assert_eq!(words["state_payload_bytes"], "0", "{}", ran.stdout);
+        assert_eq!(tree(&world.dst()), live, "a live path changed");
+        holds_no_payload(&world.state(), 3);
+        holds_no_payload(&world.source_state(), 3);
     }
 }
 
 #[test]
-fn one_pass_lands_adopts_besides_carries_and_accounts_for_every_item() {
-    let base = std::env::temp_dir().join(format!("bulkload-move-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&base);
-    fs::create_dir_all(&base).unwrap();
-    let world = World {
-        base: fs::canonicalize(&base).unwrap(),
-    };
-    let base = &world.base;
-    let src = base.join("src/git");
-    let dst = base.join("dst/git");
-    fs::create_dir_all(&src).unwrap();
-    fs::create_dir_all(&dst).unwrap();
-
-    // land + land-wt: absent at the destination.
-    repo(&src.join("land"), "a.txt");
-    git(
-        &src.join("land"),
-        &["worktree", "add", "--quiet", "-b", "wt", "../land-wt"],
-    );
-    // same: an equal clone at the destination, whose topic moved there.
-    repo(&src.join("same"), "s.txt");
-    git(&src.join("same"), &["branch", "topic"]);
-    git(
-        &dst,
-        &[
-            "clone",
-            "--quiet",
-            "--template=",
-            src.join("same").to_str().unwrap(),
-            "same",
-        ],
-    );
-    let same = dst.join("same");
-    git(&same, &["branch", "topic", "origin/topic"]);
-    git(
-        &same,
-        &["commit", "--quiet", "--allow-empty", "-m", "dest topic"],
-    );
-    git(&same, &["branch", "-f", "topic", "HEAD"]);
-    git(&same, &["reset", "--quiet", "--hard", "HEAD~1"]);
-    git(&same, &["remote", "remove", "origin"]);
-    // The source's topic moves on too, so the two differ.
-    git(&src.join("same"), &["checkout", "--quiet", "topic"]);
-    git(
-        &src.join("same"),
-        &["commit", "--quiet", "--allow-empty", "-m", "src topic"],
-    );
-    git(&src.join("same"), &["checkout", "--quiet", "main"]);
-    let src_topic = git(&src.join("same"), &["rev-parse", "topic"]);
-    let dst_topic = git(&same, &["rev-parse", "topic"]);
-    assert_ne!(src_topic, dst_topic);
-    // diverged: the destination committed on its own.
-    repo(&src.join("diverged"), "d.txt");
-    git(
-        &dst,
-        &[
-            "clone",
-            "--quiet",
-            "--template=",
-            src.join("diverged").to_str().unwrap(),
-            "diverged",
-        ],
-    );
-    git(&dst.join("diverged"), &["remote", "remove", "origin"]);
-    git(
-        &dst.join("diverged"),
-        &["commit", "--quiet", "--allow-empty", "-m", "dest only"],
-    );
-    let diverged_head = git(&dst.join("diverged"), &["rev-parse", "HEAD"]);
-    // broken, broken2: no index, so the capture refuses them.
-    for name in ["broken", "broken2"] {
-        repo(&src.join(name), "b.txt");
-        fs::remove_file(src.join(name).join(".git/index")).unwrap();
-    }
-    fs::create_dir_all(dst.join("broken2")).unwrap();
-    fs::write(dst.join("broken2/mine.txt"), b"destination's\n").unwrap();
-    // occupied: a non-Git tree at the live path.
-    repo(&src.join("occupied"), "o.txt");
-    fs::create_dir_all(dst.join("occupied")).unwrap();
-    fs::write(dst.join("occupied/keep.txt"), b"keep\n").unwrap();
-    // bare.git: refs-only.
-    git(
-        base,
-        &[
-            "init",
-            "--quiet",
-            "--template=",
-            "--bare",
-            src.join("bare.git").to_str().unwrap(),
-        ],
-    );
-    git(
-        &src.join("land"),
-        &[
-            "push",
-            "--quiet",
-            src.join("bare.git").to_str().unwrap(),
-            "main",
-        ],
-    );
-    // A plain file in a root is no repository: noted, not moved.
-    fs::write(src.join("README.txt"), b"not in any repository\n").unwrap();
-    let same_refs = refs(&same);
-    let diverged_refs = refs(&dst.join("diverged"));
-
-    let source_state = base.join("move-src");
-    let state = base.join("move-dst");
-    let map = format!("{}={}", src.display(), dst.display());
-    let sourced = agent(&os(&[
-        &"estate-move-source",
-        &"--map",
-        &map,
-        &source_state,
-        &src,
-    ]));
-    assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
-    assert!(
-        sourced
-            .stdout
-            .contains("estate-move-source phase=inventory outcome=ok items=8 new=8"),
-        "{}",
-        sourced.stdout
-    );
-    assert!(
-        sourced
-            .stdout
-            .contains("phase=capture outcome=items-refused")
-            && sourced.stdout.contains("captured=6 refused=2"),
-        "{}",
-        sourced.stdout
-    );
-    assert!(source_state.join("carry/move-source.done").is_file());
-
-    let move_args = |extra: &[&str], label: &str| {
-        let mut args = os(&[&"estate-move", &"--label", &label, &"--source", &"neo"]);
-        args.extend(extra.iter().map(OsString::from));
-        args.extend(os(&[&"-", &source_state, &state]));
-        args
-    };
-
-    // --plan-only: the plan and the preview, nothing at a live path.
-    let planned = agent(&move_args(&["--plan-only"], LABEL));
-    assert!(planned.ok, "{}\n{}", planned.stdout, planned.stderr);
-    assert!(
-        planned.stdout.contains(
-            "estate-move plan items=8 land=3 adopt=2 refs-only=0 carry-live=1 carry-beside=1 refuse=1"
+fn a_retired_staging_format_is_named_and_refused_at_startup() {
+    let world = World::new("retired");
+    world.estate();
+    let source_state = world.source_state();
+    for (rel, bytes) in [
+        ("carry/corpus/item-head.bundle", &b"bundle"[..]),
+        ("carry/corpus/item.capture", b"record"),
+        ("private/item-key-0/capture.bundle", b"bundle"),
+        (
+            "private/item-key-0/repository.git/HEAD",
+            b"ref: refs/heads/main\n",
         ),
+    ] {
+        let path = source_state.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+    let before = tree(&source_state);
+    let ran = world.source();
+    assert!(!ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    assert!(
+        ran.stderr.contains("refused: STATE_FORMAT_RETIRED"),
         "{}",
-        planned.stdout
+        ran.stderr
     );
-    assert!(planned.stdout.contains("estate-move diff classes="));
-    assert!(!dst.join("land").exists());
-    assert!(!dst.join("broken").exists());
+    for rel in ["carry/corpus", "private/item-key-0"] {
+        let line = format!(
+            "estate-move-source state=retired path={:?}",
+            source_state.join(rel)
+        );
+        assert!(ran.stdout.contains(&line), "want {line}:\n{}", ran.stdout);
+    }
+    assert!(!ran.stdout.contains("phase=inventory"), "{}", ran.stdout);
+    // Nothing written, reused or grown: not even the lock or the plan.
+    assert_eq!(tree(&source_state), before);
 
-    // One pass.
-    let moved = agent(&move_args(&[], LABEL));
-    // Pending review: `occupied` is refused, so the gate holds.
+    // The destination half names both states' (its own and, on this host,
+    // the source half's) and refuses before anything else.
+    let state = world.state();
+    let landing = state.join("landing/.claude/projects/p/s.jsonl");
+    fs::create_dir_all(landing.parent().unwrap()).unwrap();
+    fs::write(&landing, b"{}\n").unwrap();
+    let moved = world.moved();
     assert!(!moved.ok, "{}\n{}", moved.stdout, moved.stderr);
     assert!(
-        moved.stderr.contains("CLOSURE_UNACCOUNTED"),
+        moved.stderr.contains("refused: STATE_FORMAT_RETIRED"),
         "{}",
         moved.stderr
     );
-    let first = closure(&moved.stdout);
-    assert_eq!(first["unaccounted"], "0", "{}", moved.stdout);
-    assert_eq!(first["applied_beside"], "1", "{}", moved.stdout);
-    assert_eq!(first["carried"], "2", "{}", moved.stdout);
-    assert_eq!(first["refused_pending_review"], "1", "{}", moved.stdout);
-    assert_eq!(first["not_moved"], "1", "{}", moved.stdout);
-    assert!(
-        moved.stdout.contains("estate-move gate=fail"),
-        "{}",
-        moved.stdout
-    );
-
-    // Landed.
-    assert_eq!(
-        git(&dst.join("land"), &["rev-parse", "HEAD"]),
-        git(&src.join("land"), &["rev-parse", "HEAD"])
-    );
-    assert!(dst.join("land-wt/a.txt").is_file());
-    assert!(dst.join("bare.git/HEAD").is_file());
-    // Adopted, refs in: the destination's topic and checkout as they were.
-    assert_eq!(git(&same, &["rev-parse", "topic"]), dst_topic);
-    assert_eq!(
-        git(&same, &["rev-parse", &format!("refs/{LABEL}/heads/topic")]),
-        src_topic
-    );
-    for line in same_refs.lines() {
-        assert!(refs(&same).contains(line), "native ref moved: {line}");
-    }
-    // Beside: the live checkout untouched.
-    assert_eq!(
-        git(&dst.join("diverged"), &["rev-parse", "HEAD"]),
-        diverged_head
-    );
-    for line in diverged_refs.lines() {
+    for path in [
+        state.join("landing"),
+        source_state.join("carry/corpus"),
+        source_state.join("private/item-key-0"),
+    ] {
+        let line = format!("estate-move state=retired path={path:?}");
         assert!(
-            refs(&dst.join("diverged")).contains(line),
-            "native ref moved: {line}"
+            moved.stdout.contains(&line),
+            "want {line}:\n{}",
+            moved.stdout
         );
     }
-    assert!(dst.join(format!("diverged.{LABEL}/d.txt")).is_file());
-    // Carried as files, live and beside; the destination's file kept.
-    assert!(dst.join("broken/b.txt").is_file());
-    assert!(dst.join(format!("broken2.{LABEL}/b.txt")).is_file());
-    assert_eq!(
-        fs::read(dst.join("broken2/mine.txt")).unwrap(),
-        b"destination's\n"
-    );
-    // Refused: untouched.
-    assert!(!dst.join("occupied/.git").exists());
-    assert_eq!(fs::read(dst.join("occupied/keep.txt")).unwrap(), b"keep\n");
+    assert!(!state.join("move.ledger").exists());
+    assert!(!state.join("move.lock").exists());
+}
 
-    // P-MOVE-2: a rerun keeps every carry where it went and moves no ref.
-    let refs_before = (
-        refs(&same),
-        refs(&dst.join("diverged")),
-        refs(&dst.join("land")),
-    );
-    let again = agent(&move_args(&[], LABEL));
-    assert!(!again.ok);
-    let mut second = closure(&again.stdout);
-    // The bytes the move state holds grow with each pass's records.
-    let mut first = first;
-    second.remove("move_state_bytes");
-    first.remove("move_state_bytes");
-    assert_eq!(second, first, "{}", again.stdout);
-    assert_eq!(
-        (
-            refs(&same),
-            refs(&dst.join("diverged")),
-            refs(&dst.join("land"))
-        ),
-        refs_before
-    );
-    let kept = again
-        .stdout
-        .lines()
-        .filter(|line| line.starts_with("estate-move item=") && line.contains(" kept=true"))
-        .count();
-    assert_eq!(kept, 2, "{}", again.stdout);
-    assert!(!dst.join(format!("broken.{LABEL}")).exists());
-
-    // A converge pass after the source moved `topic` again: refs-in keeps
-    // the ref it made (never moves it), counts it kept, and the item stays
-    // applied; nothing native moves.
-    git(&src.join("same"), &["checkout", "--quiet", "topic"]);
-    git(
-        &src.join("same"),
-        &["commit", "--quiet", "--allow-empty", "-m", "src topic 2"],
-    );
-    git(&src.join("same"), &["checkout", "--quiet", "main"]);
-    // The source re-stamps `diverged`'s file, its bytes unchanged: its stat
-    // identity moves, so this pass captures `diverged` again whatever the
-    // clock did. The mtime is set explicitly, an hour before the old one,
-    // so it differs and is never in the future; the ctime moves with it.
-    // Without this, `diverged` was recaptured only while its first capture
-    // was racy (seats stamped within the 2 s racy allowance of that pass's
-    // start), which held only when the fixture and the first pass ran
-    // inside two seconds: under load the pass below reused the capture and
-    // never reached the beside converge it is here to prove.
-    let restamped = src.join("diverged/d.txt");
-    let stamp = fs::symlink_metadata(&restamped)
-        .unwrap()
-        .modified()
-        .unwrap();
-    fs::File::open(&restamped)
-        .unwrap()
-        .set_modified(stamp - std::time::Duration::from_hours(1))
-        .unwrap();
-    let resourced = agent(&os(&[
-        &"estate-move-source",
-        &"--map",
-        &map,
-        &source_state,
-        &src,
-    ]));
-    assert!(resourced.ok, "{}\n{}", resourced.stdout, resourced.stderr);
-    let converged = agent(&move_args(&[], LABEL));
-    assert!(
-        converged.stdout.contains("refs-in-kept=1"),
-        "{}",
-        converged.stdout
-    );
-    // The new pass recaptured `diverged` too (re-stamped above), and its
-    // beside landing converges to the new capture (gap C12, A-115: a beside landing used
-    // to refuse every later pass `GIT_DESTINATION_OCCUPIED`): the live
-    // checkout and its refs as they were, the beside checkout still
-    // detached at the captured head. Everything accounts as before.
-    assert!(
-        converged.stdout.contains("beside-converged=1"),
-        "{}",
-        converged.stdout
-    );
-    let mut want = first;
-    let mut got = closure(&converged.stdout);
-    assert!(
-        got.remove("refusals")
-            .is_some_and(|codes| codes.contains("GIT_DESTINATION_NONREPO_DIFFERS:1")),
-        "{}",
-        converged.stdout
-    );
-    want.remove("refusals");
-    got.remove("move_state_bytes");
-    assert_eq!(got, want, "{}", converged.stdout);
-    assert_eq!(
-        git(&dst.join("diverged"), &["rev-parse", "HEAD"]),
-        diverged_head
-    );
-    for line in diverged_refs.lines() {
-        assert!(
-            refs(&dst.join("diverged")).contains(line),
-            "native ref moved: {line}"
-        );
+#[test]
+fn payload_a_pass_leaves_in_its_state_is_named_and_refused() {
+    let world = World::new("left");
+    // No repository under the root: the pass plans nothing and completes,
+    // so only the stray file can fail it.
+    let plain = world.src().join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    fs::write(plain.join("f.txt"), b"f\n").unwrap();
+    let state = world.source_state();
+    let stray = state.join("carry/seat-copy.bin");
+    fs::create_dir_all(stray.parent().unwrap()).unwrap();
+    // The state's directories as the verb makes them: private (0700).
+    for dir in [&state, &state.join("carry")] {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
     }
-    let beside = dst.join(format!("diverged.{LABEL}"));
-    assert!(beside.join("d.txt").is_file());
-    assert_eq!(
-        git(&beside, &["rev-parse", "HEAD"]),
-        git(&src.join("diverged"), &["rev-parse", "HEAD"])
-    );
-    assert_eq!(git(&beside, &["rev-parse", "--abbrev-ref", "HEAD"]), "HEAD");
-    assert_eq!(
-        git(&same, &["rev-parse", &format!("refs/{LABEL}/heads/topic")]),
-        src_topic
-    );
-    assert_eq!(git(&same, &["rev-parse", "topic"]), dst_topic);
-
-    // Another label for the same state refuses before anything runs; a
-    // label naming one of Git's namespaces is refused outright.
-    let rebound = agent(&move_args(&[], "neo-20261019"));
-    assert!(!rebound.ok);
+    fs::write(&stray, vec![1u8; 1000]).unwrap();
+    let ran = world.source();
+    assert!(!ran.ok, "{}\n{}", ran.stdout, ran.stderr);
     assert!(
-        rebound.stderr.contains("RECEIPT_BINDING_INVALID"),
+        ran.stderr.contains("refused: STATE_PAYLOAD_LEFT"),
         "{}",
-        rebound.stderr
+        ran.stderr
     );
-    let reserved = agent(&move_args(&[], "heads"));
     assert!(
-        reserved.stderr.contains("FIELD_DOMAIN_VIOLATION"),
+        ran.stdout
+            .contains("estate-move-source phase=capture outcome=ok captured=0 refused=0"),
         "{}",
-        reserved.stderr
+        ran.stdout
     );
+    assert!(
+        ran.stdout
+            .contains(&format!("estate-move-source state=payload path={stray:?}")),
+        "{}",
+        ran.stdout
+    );
+    let words = state_line(&ran.stdout, "estate-move-source");
+    assert_eq!(words["outcome"], "refused:STATE_PAYLOAD_LEFT");
+    assert_eq!(words["state_payload_bytes"], "1000");
+    assert_eq!(words["state_payload_files"], "1");
+    // Removed by literal path, the next pass completes.
+    fs::remove_file(&stray).unwrap();
+    let clean = world.source();
+    assert!(clean.ok, "{}\n{}", clean.stdout, clean.stderr);
+    assert_eq!(
+        state_line(&clean.stdout, "estate-move-source")["state_payload_bytes"],
+        "0"
+    );
+    holds_no_payload(&state, 0);
 }
 
 // ---- plan of record 2026-10-19, Step C gaps C9, C10, C11 -------------------
@@ -551,6 +531,115 @@ fn thread_cwds(path: &Path) -> Vec<(String, String)> {
     rows
 }
 
+/// The homes pass under SPEC rule 2: `estate-move --sessions` over a source
+/// half that planned no Git item runs, landing `.claude` and `.codex` at
+/// the LIVE destination home (no landing area), with only the plan and
+/// marks pulled into `MOVE_STATE` and no payload in either state.
+#[test]
+fn a_sessions_only_pass_lands_the_live_home_with_no_payload_in_state() {
+    let world = World::new("homes");
+    let base = world.base.clone();
+    let (src_home, dst_home) = (base.join("src/home"), base.join("dst/home"));
+    let (src_git, dst_git) = (src_home.join("git"), dst_home.join("git"));
+    fs::create_dir_all(src_git.join("notes")).unwrap();
+    fs::write(src_git.join("notes/todo.txt"), b"not a repository\n").unwrap();
+    fs::create_dir_all(&dst_git).unwrap();
+    let lane = src_git.join("lab");
+    let projects = src_home.join(".claude/projects").join(key(&lane));
+    fs::create_dir_all(&projects).unwrap();
+    let neo = transcript(SID, &lane, "NEO");
+    fs::write(projects.join(format!("{SID}.jsonl")), &neo).unwrap();
+    fs::write(
+        src_home.join(".claude/history.jsonl"),
+        b"{\"display\":\"p\"}\n",
+    )
+    .unwrap();
+    let rollout_rel = format!("sessions/2026/10/20/rollout-2026-10-20T10-00-00-{THREAD}.jsonl");
+    let rollout = src_home.join(".codex").join(&rollout_rel);
+    fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+    fs::write(&rollout, b"{\"type\":\"session_meta\"}\n").unwrap();
+    codex_index(
+        &src_home.join(".codex/state_5.sqlite"),
+        THREAD,
+        rollout.to_str().unwrap(),
+        &lane,
+    );
+    fs::create_dir_all(dst_home.join(".claude")).unwrap();
+    fs::write(dst_home.join(".claude/settings.json"), b"{}\n").unwrap();
+    let source_state = base.join("move-src");
+    let state = base.join("move-dst");
+    let map = format!("{}={}", src_git.display(), dst_git.display());
+    let sourced = agent(&os(&[
+        &"estate-move-source",
+        &"--map",
+        &map,
+        &source_state,
+        &src_git,
+    ]));
+    assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
+    let moved = agent(&os(&[
+        &"estate-move",
+        &"--label",
+        &LABEL,
+        &"--source",
+        &"neo",
+        &"--sessions",
+        &src_home,
+        &"--dest-home",
+        &dst_home,
+        &"--map",
+        &map,
+        &"-",
+        &source_state,
+        &state,
+    ]));
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    assert!(
+        moved.stdout.contains("estate-move phase=pull outcome=ok"),
+        "{both}"
+    );
+    // The Codex store is held for its row union (#297), typed; everything
+    // else lands.
+    assert!(
+        moved
+            .stdout
+            .contains("estate-move phase=sessions-pull outcome=ok")
+            || moved
+                .stdout
+                .contains("estate-move phase=sessions-pull outcome=refused:ITEMS_REFUSED"),
+        "{both}"
+    );
+    assert_eq!(
+        fs::read_to_string(
+            dst_home
+                .join(".claude/projects")
+                .join(key(&lane))
+                .join(format!("{SID}.jsonl"))
+        )
+        .unwrap(),
+        neo,
+        "the transcript landed live, byte for byte"
+    );
+    assert_eq!(
+        fs::read(dst_home.join(".codex").join(&rollout_rel)).unwrap(),
+        b"{\"type\":\"session_meta\"}\n"
+    );
+    assert_eq!(
+        fs::read(dst_home.join(".claude/settings.json")).unwrap(),
+        b"{}\n"
+    );
+    assert!(!state.join("landing").exists(), "no landing area");
+    let words = state_line(&moved.stdout, "estate-move");
+    assert_eq!(words["state_payload_bytes"], "0", "{both}");
+    assert_eq!(closure(&moved.stdout)["state_payload_bytes"], "0", "{both}");
+    holds_no_payload(&state, 0);
+    holds_no_payload(&source_state, 0);
+}
+
+/// `estate-move --sessions` lands the source's `.claude` and `.codex` at the
+/// LIVE destination home with `--beside .LABEL` (C9: no landing stage):
+/// nothing there is overwritten, a differing settings file and the live
+/// Codex index's snapshot land beside, new transcripts and rollouts land in
 /// `estate-move --sessions` consolidates the source's `.claude` and
 /// `.codex` into the LIVE destination home (operator ruling 2026-10-20;
 /// C9: no landing stage, no beside).
@@ -564,6 +653,7 @@ fn thread_cwds(path: &Path) -> Vec<(String, String)> {
 /// - The closure counts the session transfers and the re-seat (C11).
 /// - An unchanged rerun rewrites nothing.
 #[test]
+#[ignore = "waits for the streamed capture (PR B): SPEC rule 2 refuses the git capture and corpus pull this pass needs"]
 fn sessions_are_consolidated_into_the_live_home_and_the_gate_reads_them() {
     let base = std::env::temp_dir().join(format!("bulkload-move-home-{}", std::process::id()));
     let _ = fs::remove_dir_all(&base);
@@ -895,6 +985,7 @@ fn sessions_are_consolidated_into_the_live_home_and_the_gate_reads_them() {
 /// (N1), the rollout lands in place, and a destination session with no
 /// `cwd` under a destination key is in place and holds nothing.
 #[test]
+#[ignore = "waits for the streamed capture (PR B): SPEC rule 2 refuses the git capture and corpus pull this pass needs"]
 fn sessions_into_a_destination_with_no_codex_index_hold_the_store() {
     let base = std::env::temp_dir().join(format!("bulkload-move-fresh-{}", std::process::id()));
     let _ = fs::remove_dir_all(&base);
@@ -1133,6 +1224,7 @@ fn sessions_into_a_destination_with_no_codex_index_hold_the_store() {
 /// - A source session with no lane is `RESEAT_LANE_UNMAPPED`, typed, and
 ///   holds the gate.
 #[test]
+#[ignore = "waits for the streamed capture (PR B): SPEC rule 2 refuses the git capture and corpus pull this pass needs"]
 fn archive_links_follow_a106_and_destination_links_stay() {
     const SID_FORK: &str = "5e5e5e5e-3333-4222-8333-444444444444";
     const SID_NEO_KEY: &str = "5e5e5e5e-4444-4222-8333-444444444444";
@@ -1480,6 +1572,7 @@ fn archive_links_follow_a106_and_destination_links_stay() {
 /// extended in place under the mapped key; an unchanged pass reads nothing;
 /// the report-only proof lists the source-key directory left behind.
 #[test]
+#[ignore = "waits for the streamed capture (PR B): SPEC rule 2 refuses the git capture and corpus pull this pass needs"]
 fn sessions_land_once_under_the_mapped_key_and_a_shared_key_stays_typed() {
     const SID_AB: &str = "5e5e5e5e-7777-4222-8333-444444444444";
     const SID_RESUMED: &str = "5e5e5e5e-8888-4222-8333-444444444444";
@@ -1797,10 +1890,7 @@ fn sessions_land_once_under_the_mapped_key_and_a_shared_key_stays_typed() {
 /// records neo lacks), never a beside copy; the re-seat finds it in place,
 /// the closure names the consolidation, and the gate passes.
 #[test]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "the process check proves nothing off Linux: every consolidation is unsettled"
-)]
+#[ignore = "waits for the streamed capture (PR B): SPEC rule 2 refuses the git capture and corpus pull this pass needs"]
 fn a_session_both_sides_continued_is_consolidated_into_one_file() {
     const SID_BOTH: &str = "5e5e5e5e-aaaa-4222-8333-444444444444";
     let base = std::env::temp_dir().join(format!("bulkload-move-both-{}", std::process::id()));
@@ -1900,6 +1990,7 @@ fn a_session_both_sides_continued_is_consolidated_into_one_file() {
 /// re-seat ledger recorded it as neo's): never `in-place`, the gate never
 /// passes on it, and its refused ledger row is never overwritten.
 #[test]
+#[ignore = "waits for the streamed capture (PR B): SPEC rule 2 refuses the git capture and corpus pull this pass needs"]
 fn listed_then_pruned_sessions_with_no_lane_stay_typed() {
     const SID_PRUNED: &str = "5e5e5e5e-8888-4222-8333-444444444444";
     const T_LANE: &str = "019a0000-0000-7000-8000-00000000000b";
@@ -2124,6 +2215,7 @@ fn tree_files(root: &Path) -> Vec<(String, Vec<u8>)> {
 /// lists every file of the homes with its class, its action and the sizes
 /// on both sides before anything lands, and writes nothing to them.
 #[test]
+#[ignore = "waits for the streamed capture (PR B): SPEC rule 2 refuses the git capture and corpus pull this pass needs"]
 fn the_homes_plan_lists_every_file_and_writes_nothing() {
     let base = std::env::temp_dir().join(format!("bulkload-move-plan-{}", std::process::id()));
     let _ = fs::remove_dir_all(&base);

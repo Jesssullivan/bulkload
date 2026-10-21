@@ -267,14 +267,23 @@ SUBCOMMANDS:
                 reports it not moved. New items are appended to
                 MOVE_STATE/carry/plan.postcard (estate-add-batch; existing
                 ones never change, and a source planned at another live path
-                refuses RECEIPT_BINDING_INVALID), then the plan is captured
-                (estate-capture, jobs N, default 2) into
-                MOVE_STATE/carry/corpus, private state in MOVE_STATE/private.
-                Item refusals are written to move-source.refusals and do not
-                fail the verb; a refusal before every item answered does.
-                Each pass writes its mark to move-source.started first and,
-                once every item answered, to move-source.done. MOVE_STATE is
-                0700 and flocked
+                refuses RECEIPT_BINDING_INVALID). SPEC rule 2 (reset
+                2026-10-20): MOVE_STATE holds ledgers and resume marks only.
+                A retired staging format in it (a capture bundle, a
+                repository.git copy, a private/ capture attempt directory,
+                carry/corpus, landing) is named on an estate-move-source
+                state=retired line each and refused STATE_FORMAT_RETIRED
+                before anything is read or written. The capture (it wrote
+                bundles and repository copies into MOVE_STATE) is refused
+                STATE_PAYLOAD_LEFT before it writes, for any non-empty plan,
+                until the streamed capture replaces it; an empty plan
+                completes. Each pass writes its mark to move-source.started
+                first and, once every item answered, to move-source.done,
+                and ends with an estate-move-source phase=state line
+                (state_payload_bytes= state_payload_files=
+                state_ledger_bytes=, each payload file named on a
+                state=payload line), refusing STATE_PAYLOAD_LEFT when any
+                payload is left. MOVE_STATE is 0700 and flocked
     estate-move --label LABEL --source SOURCE [--plan-only] [--exclude-union] [--no-hand-off]
                 [--activate-origin PREFIX]... [--side-root ROOT]... [--jobs N] [--dispositions LEDGER]
                 [--sessions SOURCE_HOME [--codex-source-root DIR] [--dest-home DIR]
@@ -295,7 +304,18 @@ SUBCOMMANDS:
                 SSH; serve's state is SOURCE_MOVE_STATE/serve/NAME. Global
                 flags (--min-free-percent=N, --priority=, --durability=) apply
                 to every phase; --sqlite is always snapshot here.
-                1 pull: SOURCE_MOVE_STATE/carry into MOVE_STATE/carry;
+                SPEC rule 2 (reset 2026-10-20): MOVE_STATE (and
+                SOURCE_MOVE_STATE, for HOST -) holds ledgers and resume
+                marks only: a retired staging format in either is named
+                (estate-move state=retired) and refused STATE_FORMAT_RETIRED
+                at startup; 1 pulls only the source half's plan and marks
+                (a corpus there is excluded, never landed or read), and a
+                plan with Git items refuses STATE_PAYLOAD_LEFT there until
+                the streamed capture replaces the corpus apply, while a plan
+                with none (the homes pass, --sessions) goes on; every pass ends with an estate-move phase=state
+                line (state_payload_bytes=, refusing STATE_PAYLOAD_LEFT for
+                any payload left), and the closure line carries the same
+                words. 1 pull: SOURCE_MOVE_STATE/carry into MOVE_STATE/carry;
                 SOURCE_CHANGED_AFTER_SNAPSHOT when its marks show a source
                 pass that has not finished (rerun once it has). 2 plan: per
                 item, the live path's presence (absent, empty, git, not-git,

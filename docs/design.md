@@ -3177,6 +3177,18 @@ of its target and ran `git worktree repair` by hand
 > (destination half) plus `estate-apply --refs-in`, superseding "not
 > built" above; what was built and where it differs from this sketch is in
 > `docs/agent-notes/2026-10-18-estate-move.md` (A-20261018-110, R-N13).
+>
+> 2026-10-20 (SPEC rule 2, reset; operator: "this pattern can never happen
+> again"): neither machine gets a staging copy, and the move's state
+> directories hold ledgers and resume marks only. Both halves now refuse a
+> retired staging format in their state at startup (`STATE_FORMAT_RETIRED`,
+> each one named), refuse the capture into `carry/corpus` and the pulls of
+> the corpus and session trees into `MOVE_STATE` before they write
+> (`STATE_PAYLOAD_LEFT`), and end every pass with a `phase=state` line
+> (`state_payload_bytes=`, also on the closure line), refusing
+> `STATE_PAYLOAD_LEFT` for any payload left (`state_payload`). Steps 3, 6
+> and 9 above therefore refuse until the streamed capture replaces them;
+> `docs/agent-notes/2026-10-20-no-staging-guards.md` (R-N13).
 
 Design: `docs/agent-notes/2026-10-16-estate-move-design.md`. One verb on
 the destination, `estate-move [--plan-only] [--date YYYYMMDD] [--map

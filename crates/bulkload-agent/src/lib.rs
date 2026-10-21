@@ -114,6 +114,9 @@ pub mod refuse;
 pub mod reseat;
 pub mod space;
 pub mod sqlite_union;
+// The move verbs' guard on their state directories (SPEC rule 2, reset
+// 2026-10-20): ledgers and resume marks only, never payload.
+pub mod state_payload;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod transfer;
