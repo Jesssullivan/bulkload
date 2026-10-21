@@ -66,10 +66,14 @@ bulkload is a live-host estate consolidator in Rust, separate from TCFS
 
 ## Validation
 
-Merge gate (OI-1003-Q199, 2026-10-16, Linear TIN-4543 comment `b208cbae`):
-a PR merges on a local receipt from sting, not on runner CI (since the
-operator's 2026-10-17 ruling the gate's build and test half runs on honey on
-the exact head; the receipt names the host).
+Merge gate (operator ruling, 2026-10-21, verbatim: "honey load is a
+self-fulfillling failiure, cut that gate."): a PR merges on the lane's
+targeted tests on honey, `cargo fmt` and `cargo clippy`, gitleaks, and, when
+`just darwin-touched` flags it, `just darwin-check` on pzm with no new
+failures. The full `just local-gate` described below stays available but is
+not required. (Before that ruling, OI-1003-Q199, 2026-10-16, Linear TIN-4543
+comment `b208cbae`: a PR merged on a local receipt from sting, not on runner
+CI, the build and test half running on honey from 2026-10-17.)
 `just local-gate-receipt --pr N --post` (`scripts/local-gate-receipt.sh`)
 runs, from the repository root, exactly what the CI action runs:
 `nix flake check --no-build --no-write-lock-file`, then
