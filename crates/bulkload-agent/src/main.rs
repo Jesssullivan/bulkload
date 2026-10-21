@@ -2636,7 +2636,7 @@ fn pull_recorded_kind(
         &bulkload_agent::transfer_outcome::stable(path(2)?),
         "transfer::pull",
         || bulkload_agent::transfer::receive_roots_apart_kind(path(2)?, path(4)?, kind),
-        || pull_command(kind, args),
+        || pull_tree(kind, args),
     )
     .and_then(|stats| {
         keep_listed(&stats);
@@ -2677,7 +2677,7 @@ fn carry_files_command(args: &[std::ffi::OsString]) -> Result<()> {
             // parser requires the one with the other.
             args.extend(self.remote.iter().cloned());
             args.extend(self.config.iter().cloned());
-            pull_command(bulkload_agent::transfer::RootKind::Tree, &args)
+            pull_tree(bulkload_agent::transfer::RootKind::Tree, &args)
         }
     }
     let mut options = CarryOptions::default();
@@ -2810,11 +2810,11 @@ fn expect_command(args: &[std::ffi::OsString]) -> Result<()> {
     Ok(())
 }
 
-fn pull_command(
+fn pull_tree(
     kind: bulkload_agent::transfer::RootKind,
     args: &[std::ffi::OsString],
 ) -> Result<bulkload_agent::transfer::TransferStats> {
-    remote_command(Remote::Serve(kind), args)?.ok_or(BulkloadRefusal::ProtocolStateViolation)
+    pull_command(Remote::Serve(kind), args)?.ok_or(BulkloadRefusal::ProtocolStateViolation)
 }
 
 /// What the remote `bulkload-agent` an ssh session starts runs.
@@ -2831,7 +2831,7 @@ enum Remote<'a> {
 // relayed `upload-pack`. ARGS are pull's: HOST, then (a pull's) SOURCE,
 // DEST, SOURCE_STATE and DEST_STATE, then REMOTE_EXECUTABLE and SSH_CONFIG.
 #[allow(clippy::too_many_lines)] // One builder, its two remote words.
-fn remote_command(
+fn pull_command(
     mode: Remote<'_>,
     args: &[std::ffi::OsString],
 ) -> Result<Option<bulkload_agent::transfer::TransferStats>> {
@@ -2959,7 +2959,7 @@ fn relay_upload_pack_command(args: &[std::ffi::OsString]) -> Result<()> {
     if config != "-" {
         pull.push(config.clone());
     }
-    remote_command(Remote::UploadPack(repo), &pull).map(drop)
+    pull_command(Remote::UploadPack(repo), &pull).map(drop)
 }
 
 fn steps(value: Option<&std::ffi::OsString>) -> Result<u32> {

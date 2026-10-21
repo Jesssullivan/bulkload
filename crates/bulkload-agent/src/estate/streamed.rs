@@ -39,6 +39,9 @@ use crate::{BulkloadRefusal, Result};
 
 const SITE: &str = "estate::streamed";
 
+/// The administration's configuration file, a host-path file.
+const CONFIG: &str = "config";
+
 /// One item's streamed capture: what the source half records in `carry/`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemSnapshot {
@@ -92,14 +95,19 @@ fn rel_bytes(path: &Path) -> Vec<u8> {
     path.as_os_str().as_bytes().to_vec()
 }
 
-/// Read `item`'s streamed capture on the source. Refused, typed, before
-/// anything is read further: a partial clone (`GIT_SOURCE_PARTIAL_CLONE`),
+/// Read `item`'s streamed capture on the source.
+///
+/// Refused, typed, before anything is read further: a partial clone (`GIT_SOURCE_PARTIAL_CLONE`),
 /// a shallow repository (`GIT_HAVES_UNPROVABLE`) or one that borrows
 /// objects (`GIT_SOURCE_ALTERNATES`): each is a hold until it has a test.
 ///
 /// # Errors
 /// As above, and the snapshot's refusals.
-pub fn capture_source(item: &Item, started_ns: i128, include_rebuildable: bool) -> Result<ItemSnapshot> {
+pub fn capture_source(
+    item: &Item,
+    started_ns: i128,
+    include_rebuildable: bool,
+) -> Result<ItemSnapshot> {
     let source = &item.source;
     crate::git_carry::refuse_partial_clone(source)?;
     let common = crate::git_carry::common_repository(source)?;
@@ -127,14 +135,15 @@ pub fn capture_source(item: &Item, started_ns: i128, include_rebuildable: bool) 
     match &admin {
         Some(admin) => {
             excluded.push(rel_bytes(&admin.join("objects")));
-            for name in ["config"] {
-                let rel = admin.join(name);
-                host_files.push((rel_bytes(&rel), read_file(&source.join(&rel))?));
-            }
+            let config = admin.join(CONFIG);
+            host_files.push((rel_bytes(&config), read_file(&source.join(&config))?));
             if let Ok(read) = fs::read_dir(common.join("worktrees")) {
                 for entry in read {
                     let entry = entry.refuse_at(SITE)?;
-                    let rel = admin.join("worktrees").join(entry.file_name()).join("gitdir");
+                    let rel = admin
+                        .join("worktrees")
+                        .join(entry.file_name())
+                        .join("gitdir");
                     if let Ok(bytes) = fs::read(source.join(&rel)) {
                         host_files.push((rel_bytes(&rel), bytes));
                     }
@@ -283,7 +292,10 @@ pub fn land(
 ) -> Result<Landed> {
     let item = &snapshot.item;
     let identity = id(item)?;
-    let live = item.workspace.clone().unwrap_or_else(|| item.repository.clone());
+    let live = item
+        .workspace
+        .clone()
+        .unwrap_or_else(|| item.repository.clone());
     let source_url = item
         .source
         .to_str()
@@ -426,6 +438,31 @@ fn read_journal(path: &Path) -> Result<String> {
     read(path)
 }
 
+/// Record `item`'s outcome in the apply's private state, as every estate
+/// verb does (`ITEM.outcome`).
+///
+/// # Errors
+/// IO; an outcome the record cannot hold.
+pub fn record_outcome(
+    state: &Path,
+    item: &Item,
+    outcome: &'static str,
+    refusal: Option<&BulkloadRefusal>,
+    reason: Option<String>,
+) -> Result<()> {
+    let record = crate::outcome::OutcomeRecord::of_receipt(
+        item.source.clone(),
+        outcome,
+        refusal,
+        reason,
+        SITE,
+    )?;
+    super::write(
+        &state.join(format!("{}.outcome", id(item)?)),
+        &record.persisted(),
+    )
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
@@ -434,7 +471,10 @@ mod tests {
     #[test]
     fn host_paths_map_at_path_ends_only_longest_first() {
         let map = vec![
-            (b"/Users/me/git/lab-wt".to_vec(), b"/home/me/git/lab-wt".to_vec()),
+            (
+                b"/Users/me/git/lab-wt".to_vec(),
+                b"/home/me/git/lab-wt".to_vec(),
+            ),
             (b"/Users/me/git/lab".to_vec(), b"/home/me/git/lab".to_vec()),
         ];
         let config = b"[core]\n\tworktree = /Users/me/git/lab\n[remote \"o\"]\n\turl = /Users/me/git/lab-wt/.git\n\tpushurl = /Users/me/git/labX\n";
@@ -442,7 +482,10 @@ mod tests {
             mapped(config, &map),
             b"[core]\n\tworktree = /home/me/git/lab\n[remote \"o\"]\n\turl = /home/me/git/lab-wt/.git\n\tpushurl = /Users/me/git/labX\n".to_vec()
         );
-        assert_eq!(mapped(b"gitdir: /Users/me/git/lab/.git/worktrees/w\n", &map), b"gitdir: /home/me/git/lab/.git/worktrees/w\n".to_vec());
+        assert_eq!(
+            mapped(b"gitdir: /Users/me/git/lab/.git/worktrees/w\n", &map),
+            b"gitdir: /home/me/git/lab/.git/worktrees/w\n".to_vec()
+        );
     }
 
     #[test]
@@ -472,29 +515,4 @@ mod tests {
             ]
         );
     }
-}
-
-/// Record `item`'s outcome in the apply's private state, as every estate
-/// verb does (`ITEM.outcome`).
-///
-/// # Errors
-/// IO; an outcome the record cannot hold.
-pub fn record_outcome(
-    state: &Path,
-    item: &Item,
-    outcome: &'static str,
-    refusal: Option<&BulkloadRefusal>,
-    reason: Option<String>,
-) -> Result<()> {
-    let record = crate::outcome::OutcomeRecord::of_receipt(
-        item.source.clone(),
-        outcome,
-        refusal,
-        reason,
-        SITE,
-    )?;
-    super::write(
-        &state.join(format!("{}.outcome", id(item)?)),
-        &record.persisted(),
-    )
 }

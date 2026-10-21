@@ -150,27 +150,28 @@ const BYPASSES: &[Bypass] = &[
     Bypass {
         id: "agent::main::pull_command(\"ssh\")",
         shape: Some(
-            "Command::new(\"ssh\");ssh.args([\"-T\",\"-oBatchMode=yes\",\
-             \"-oConnectTimeout=15\"]);ifletSome(config)=args.get(6){\
-             if!Path::new(config).is_absolute(){\
-             returnErr(BulkloadRefusal::PathNotAbsolute);}\
-             ssh.arg(\"-F\").arg(config);}ssh.arg(\"--\").arg(host).arg(remote);\
-             ifbulkload_agent::durable::durability()==\
-             bulkload_agent::durable::Durability::Strict{\
-             ssh.arg(\"--durability=strict\");}\
-             ifbulkload_agent::durable::ledger_sync()==\
-             bulkload_agent::durable::LedgerSync::Full{\
-             ssh.arg(\"--source-ledger-sync=full\");}\
-             ssh.arg(\"serve\");\
-             ifkind==bulkload_agent::transfer::RootKind::File{\
-             ssh.arg(\"--file\");}\
-             letmutchild=ssh\
-             .stdin(Stdio::piped()).stdout(Stdio::piped())\
-             .stderr(Stdio::inherit()).spawn()",
+            "Command::new(\"ssh\");\
+             ssh.args([\"-T\",\"-oBatchMode=yes\",\"-oConnectTimeout=15\"]);\
+             ifletSome(config)=args.get(6){if!Path::new(config).is_absolute(){returnErr(BulkloadRefusal::PathNotAbsolute);\
+             }ssh.arg(\"-F\").arg(config);\
+             }ssh.arg(\"--\").arg(host).arg(remote);\
+             ifbulkload_agent::durable::durability()==bulkload_agent::durable::Durability::Strict{ssh.arg(\"--durability=strict\");\
+             }ifbulkload_agent::durable::ledger_sync()==bulkload_agent::durable::LedgerSync::Full{ssh.arg(\"--source-ledger-sync=full\");\
+             }letrelay=matchmode{Remote::Serve(_)=>false,Remote::UploadPack(repo)=>{ifrepo.contains('\\'')||!repo.starts_with('/'){returnErr(BulkloadRefusal::PathNotPortable);\
+             }ssh.arg(\"upload-pack\").arg(format!(\"'{repo}'\"));true}};\
+             if!relay{ssh.arg(\"serve\");\
+             }ifkind==bulkload_agent::transfer::RootKind::File{ssh.arg(\"--file\");\
+             }let(wire_in,wire_out)=ifrelay{(Stdio::inherit(),Stdio::inherit())}else{(Stdio::piped(),Stdio::piped())};\
+             letmutchild=ssh.stdin(wire_in).stdout(wire_out).stderr(Stdio::inherit()).spawn()",
         ),
         callers: &[],
         why: "Starts the remote `bulkload-agent serve`, which is the source \
-              reader and enters background priority itself (OI-1003-Q25). The \
+              reader and enters background priority itself (OI-1003-Q25), \
+              or (SPEC rule 2 reset, B1) the remote `bulkload-agent \
+              upload-pack REPO` a streamed fetch relays to, its stdio the \
+              local `git fetch`'s, REPO an absolute path, single-quoted and \
+              refused if it holds a quote; upload-pack is a read and also \
+              enters background priority. The \
               remote word is `bulkload-agent` or a validated absolute path, \
               and the ssh child touches no local source. The three mode flags \
               it may pass (`--durability=strict`, WP0(g)'s \

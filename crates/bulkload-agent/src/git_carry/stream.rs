@@ -278,7 +278,12 @@ fn partition(repo: &Path, named: &BTreeSet<String>) -> Result<(Vec<String>, u64)
     Ok((held, u64::try_from(missing.len()).unwrap_or(u64::MAX)))
 }
 
-type Named = (String, Vec<(String, String)>, Vec<Worktree>, BTreeSet<String>);
+type Named = (
+    String,
+    Vec<(String, String)>,
+    Vec<Worktree>,
+    BTreeSet<String>,
+);
 
 // The object format, the refs, the worktrees and every id `repo`'s
 // administration names.
@@ -456,19 +461,22 @@ fn scratch(object_format: &str) -> Result<Scratch> {
         std::process::id(),
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    let parent = path.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?;
     let made = Scratch(path.clone());
-    output(
-        git(parent)
-            .args([
-                "init",
-                "--bare",
-                "--quiet",
-                "--template=",
-                &format!("--object-format={object_format}"),
-            ])
-            .arg(&path),
-    )?;
+    // A bare repository's administration, written whole: a HEAD, its
+    // configuration and empty ref and object directories. Its objects are
+    // never written here (see `into_store`).
+    for dir in ["refs/heads", "refs/tags", "objects/info", "objects/pack"] {
+        fs::create_dir_all(path.join(dir)).refuse_at(SITE)?;
+    }
+    fs::write(path.join("HEAD"), b"ref: refs/heads/main\n").refuse_at(SITE)?;
+    let config = match object_format {
+        "sha1" => "[core]\n\trepositoryformatversion = 0\n\tbare = true\n".to_owned(),
+        format if format.bytes().all(|byte| byte.is_ascii_alphanumeric()) => format!(
+            "[core]\n\trepositoryformatversion = 1\n\tbare = true\n[extensions]\n\tobjectformat = {format}\n"
+        ),
+        _ => return Err(BulkloadRefusal::GitInventoryMalformed),
+    };
+    fs::write(path.join("config"), config).refuse_at(SITE)?;
     Ok(made)
 }
 

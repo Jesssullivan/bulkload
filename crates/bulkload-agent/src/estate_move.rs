@@ -868,7 +868,10 @@ fn move_pass(run: &Move) -> Result<()> {
     let mut first_refusal: Option<BulkloadRefusal> = None;
     // Mains first: a linked worktree's administration lands with its main.
     let mut order: Vec<&moving::Row> = rows.iter().collect();
-    order.sort_by_key(|row| row.item.source != row.item.repository && row.item.workspace.as_ref() != Some(&row.item.repository));
+    order.sort_by_key(|row| {
+        row.item.source != row.item.repository
+            && row.item.workspace.as_ref() != Some(&row.item.repository)
+    });
     for row in order {
         let Some(snapshot) = estate::streamed::recorded(&carry, &row.id)? else {
             continue;
@@ -923,7 +926,13 @@ fn move_pass(run: &Move) -> Result<()> {
                 landed.push(row.id.clone());
             }
             Err(refusal) => {
-                estate::streamed::record_outcome(&private, &row.item, "refused", Some(&refusal), None)?;
+                estate::streamed::record_outcome(
+                    &private,
+                    &row.item,
+                    "refused",
+                    Some(&refusal),
+                    None,
+                )?;
                 out(&format!(
                     "estate-move item={} outcome=refused code={} live={place:?}",
                     row.id,
@@ -933,9 +942,10 @@ fn move_pass(run: &Move) -> Result<()> {
             }
         }
     }
-    let outcome = first_refusal
-        .as_ref()
-        .map_or_else(|| "ok".to_owned(), |refusal| format!("items-refused first={}", refusal.code()));
+    let outcome = first_refusal.as_ref().map_or_else(
+        || "ok".to_owned(),
+        |refusal| format!("items-refused first={}", refusal.code()),
+    );
     reached(&mut ledger, &ledger_path, "apply", outcome)?;
     let _ = (&suffix, &corpus);
 
