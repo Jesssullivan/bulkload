@@ -1420,6 +1420,8 @@ const SQLITE_PENDING: &str = "sqlite: the row union (#278) has not landed";
 /// the union into the one live file is the #294 lane's.
 const ELSEWHERE_PENDING: &str =
     "append-log: the destination holds this session under another key, and the JSONL union (#294) has not landed";
+/// Why a file too large to gather in memory is held.
+const OVER_MEMORY: &str = "over the 64 MiB a union gathers in memory";
 /// Why a live path of another kind is held.
 const OTHER_KIND: &str = "the live path is a link or another kind";
 
@@ -4789,18 +4791,60 @@ fn fold_failure(failure: &mut Option<Failure>, found: Failure) {
 /// that write it: the bytes placed so far, which time its write-back kicks
 /// (item 1a), and whether a write has failed, after which none is tried.
 struct WriteTarget {
-    file: Arc<std::fs::File>,
+    sink: Sink,
     placed: AtomicU64,
     failed: std::sync::atomic::AtomicBool,
 }
 
 impl WriteTarget {
     fn new(file: &Arc<std::fs::File>, placed: u64) -> Arc<Self> {
+        Self::of(Sink::File(Arc::clone(file)), placed)
+    }
+
+    fn of(sink: Sink, placed: u64) -> Arc<Self> {
         Arc::new(Self {
-            file: Arc::clone(file),
+            sink,
             placed: AtomicU64::new(placed),
             failed: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+}
+
+/// Where an entry's chunks are written: its staged file, or (a
+/// consolidation, operator ruling 2026-10-20) a buffer in memory, so the
+/// source's bytes are never on disk on either machine (SPEC rule 2).
+#[derive(Clone)]
+enum Sink {
+    File(Arc<std::fs::File>),
+    Memory(Arc<Mutex<Vec<u8>>>),
+}
+
+impl Sink {
+    /// Write `data` at each of `offsets`.
+    fn place(&self, data: &[u8], offsets: &[u64]) -> Result<()> {
+        match self {
+            Self::File(file) => place(file, data, offsets),
+            Self::Memory(buffer) => {
+                let mut buffer = buffer.lock().map_err(|_| BulkloadRefusal::WorkerLost)?;
+                for offset in offsets {
+                    let start =
+                        usize::try_from(*offset).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
+                    buffer
+                        .get_mut(start..start.saturating_add(data.len()))
+                        .ok_or(BulkloadRefusal::DigestMismatch)?
+                        .copy_from_slice(data);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Kick write-back after `placed` more bytes (a file only).
+    fn kick(&self, before: u64, placed: u64) -> Result<()> {
+        match self {
+            Self::File(file) => kick_after(file, before, placed),
+            Self::Memory(_) => Ok(()),
+        }
     }
 }
 
@@ -4877,10 +4921,16 @@ fn place_counted(
     if target.failed.load(Ordering::Relaxed) {
         return Ok(());
     }
-    place(&target.file, data, offsets).map_err(|refusal| (Step::Place, refusal))?;
+    target
+        .sink
+        .place(data, offsets)
+        .map_err(|refusal| (Step::Place, refusal))?;
     let placed = (data.len() as u64).saturating_mul(offsets.len() as u64);
     let before = target.placed.fetch_add(placed, Ordering::Relaxed);
-    kick_after(&target.file, before, placed).map_err(|refusal| (Step::Kick, refusal))
+    target
+        .sink
+        .kick(before, placed)
+        .map_err(|refusal| (Step::Kick, refusal))
 }
 
 /// One data frame's verify and write, for a receive worker or inline.
@@ -6859,6 +6909,16 @@ impl<W: Write> Inbound<'_, W> {
                     Some(WriteTarget::new(staging.staged.file(), staging.placed)),
                 )
             }
+            Plan::Gather(gather) => {
+                self.open += 1;
+                (
+                    gather.missing.clone(),
+                    Some(WriteTarget::of(
+                        Sink::Memory(Arc::clone(&gather.bytes)),
+                        gather.placed,
+                    )),
+                )
+            }
             Plan::Refuse(_)
             | Plan::Adopt(..)
             | Plan::NoExchange(_)
@@ -7406,21 +7466,20 @@ impl<W: Write> Inbound<'_, W> {
         Ok(())
     }
 
-    /// `--consolidate`: merge the received bytes in `staged` (in memory)
-    /// into the live file by `class`'s union, then drop them. A held union
-    /// is remembered under the live file's identity; any other outcome
-    /// records the seat consolidated and answers it at once.
-    fn consolidate_staged(
+    /// `--consolidate`: merge the source's `bytes` (in memory) into the live
+    /// file in `parent` by `class`'s union. A held union is remembered under
+    /// the live file's identity; any other outcome records the seat
+    /// consolidated and answers it at once.
+    fn consolidate_bytes(
         &mut self,
-        staged: StagedFile,
+        bytes: &[u8],
+        parent: &std::fs::File,
         row: &RowSchema,
         key: &[u8],
         class: crate::consolidate::Class,
         racy: bool,
     ) -> Result<()> {
-        let ran = self.run_union(&staged, row, class);
-        let _ = staged.discard();
-        let (outcome, before) = ran?;
+        let (outcome, before) = self.run_union(bytes, parent, row, class)?;
         match outcome.action {
             crate::consolidate::Action::Held(reason) => {
                 self.stats.held.push((row.rel_path.clone(), reason));
@@ -7441,15 +7500,15 @@ impl<W: Write> Inbound<'_, W> {
         }
     }
 
-    /// Run `class`'s union of `staged` into the live file, with the live
-    /// file's identity before it (what a hold is remembered under).
+    /// Run `class`'s union of `bytes` into the live file in `parent`, with
+    /// the live file's identity before it (what a hold is remembered under).
     fn run_union(
         &mut self,
-        staged: &StagedFile,
+        bytes: &[u8],
+        parent: &std::fs::File,
         row: &RowSchema,
         class: crate::consolidate::Class,
     ) -> Result<(crate::consolidate::Outcome, Option<StatIdentity>)> {
-        use std::os::fd::AsRawFd as _;
         use std::os::unix::ffi::OsStrExt as _;
         let settings = self
             .consolidate
@@ -7488,20 +7547,20 @@ impl<W: Write> Inbound<'_, W> {
             .target
             .path()
             .join(std::ffi::OsStr::from_bytes(&row.rel_path));
-        // An in-memory file has no name: a union that opens by path opens
-        // this one.
-        let source_path = PathBuf::from(format!("/proc/self/fd/{}", staged.file().as_raw_fd()));
+        let name = row
+            .rel_path
+            .rsplit(|byte| *byte == b'/')
+            .next()
+            .unwrap_or(&row.rel_path);
         let outcome = union(
             &crate::consolidate::Live {
-                dir: staged.parent(),
-                name: staged.leaf(),
+                dir: parent,
+                name,
                 path: &live_path,
                 rel: &row.rel_path,
             },
             &crate::consolidate::Source {
-                file: staged.file(),
-                path: &source_path,
-                size: row.size,
+                bytes,
                 mtime_ns: row.mtime_ns,
                 maps: &settings.maps,
             },
@@ -7582,8 +7641,17 @@ impl<W: Write> Inbound<'_, W> {
             return self.covered(row, &key, racy);
         }
         match (class, staged) {
-            (Class::Config(_), Some(staged)) => {
-                self.consolidate_staged(staged, row, &key, class, racy)
+            (Class::Config(_), Some(staged)) if row.size <= crate::consolidate::IN_MEMORY_LIMIT => {
+                // Streamed whole, its copy is staged as a stream is: read
+                // into memory, removed, then merged from the bytes.
+                let mut bytes = vec![0_u8; usize::try_from(row.size).unwrap_or(0)];
+                let read = crate::io::sys::pread_full(&**staged.file(), &mut bytes, 0)
+                    .refuse_at("transfer::end_streamed_consolidating");
+                let _ = staged.discard();
+                if read? as u64 != row.size {
+                    return Err(BulkloadRefusal::DigestMismatch);
+                }
+                self.consolidate_bytes(&bytes, &parent, row, &key, class, racy)
             }
             (_, staged) => {
                 drop_staged(staged);
@@ -7670,6 +7738,20 @@ impl<W: Write> Inbound<'_, W> {
                 self.answered_now = Some(false);
                 Ok(())
             }
+            Plan::Gather(gather) => {
+                self.open -= 1;
+                if let Some(failure) = failure {
+                    return Err(failure.refusal);
+                }
+                fault_point!(ReceiveAfterChunks);
+                let bytes = std::mem::take(
+                    &mut *gather
+                        .bytes
+                        .lock()
+                        .map_err(|_| BulkloadRefusal::WorkerLost)?,
+                );
+                self.consolidate_bytes(&bytes, &gather.parent, &row, &key, gather.class, racy)
+            }
             Plan::Write(mut staging) => {
                 self.open -= 1;
                 if let Some(failure) = failure {
@@ -7677,9 +7759,6 @@ impl<W: Write> Inbound<'_, W> {
                     return Err(failure.refusal);
                 }
                 fault_point!(ReceiveAfterChunks);
-                if let Some(class) = staging.consolidate {
-                    return self.consolidate_staged(staging.staged, &row, &key, class, racy);
-                }
                 if let Some(extend) = staging.extend.take() {
                     return self.finish_extend(
                         staging.staged,
@@ -8156,6 +8235,22 @@ enum Plan {
     /// `--plan-only`: the seat's planned action; nothing staged, asked for
     /// or written.
     Dry(PlannedSeat),
+    /// `--consolidate`: the seat's bytes are gathered in memory, never on
+    /// disk (SPEC rule 2), and merged into the live file by its class's
+    /// union when they are complete.
+    Gather(Box<Gather>),
+}
+
+/// A consolidation's bytes, gathered in memory ([`Plan::Gather`]).
+struct Gather {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    /// The live file's directory, open.
+    parent: Arc<std::fs::File>,
+    class: crate::consolidate::Class,
+    /// Chunk indices to request.
+    missing: Vec<u32>,
+    /// Bytes filled locally.
+    placed: u64,
 }
 
 /// A decided plan, boxed.
@@ -8168,8 +8263,8 @@ enum Consolidating {
     /// The entry's plan.
     Done(Box<Plan>),
     /// The seat's bytes are received in memory and merged by the class's
-    /// union when they are complete.
-    Stage(crate::consolidate::Class),
+    /// union when they are complete, into the file in this directory.
+    Stage(crate::consolidate::Class, Arc<std::fs::File>),
     /// No live file: landed as any new path is.
     Land,
 }
@@ -8228,9 +8323,6 @@ struct Staging {
     /// staged file holds bytes `[base, size)` and is appended from, never
     /// published.
     extend: Option<Box<Extend>>,
-    /// `--consolidate`: the staged file is in memory, and its bytes are
-    /// merged into the live file by this class's union, never published.
-    consolidate: Option<crate::consolidate::Class>,
 }
 
 /// An existing destination file with no owning record whose first
@@ -8304,30 +8396,6 @@ struct Planned<'p> {
     snapshot: bool,
 }
 
-/// Whether the first `size` bytes of `a` and `b` are the same, read in 1
-/// MiB pieces (`read_dest_verify_existing_bytes`).
-pub(crate) fn same_bytes(a: &std::fs::File, b: &std::fs::File, size: u64) -> Result<bool> {
-    const PIECE: u64 = 1 << 20;
-    let mut mine = vec![0_u8; usize::try_from(PIECE).unwrap_or(usize::MAX)];
-    let mut theirs = vec![0_u8; mine.len()];
-    let mut at = 0_u64;
-    while at < size {
-        let length = usize::try_from((size - at).min(PIECE)).unwrap_or(usize::MAX);
-        let (Some(left), Some(right)) = (mine.get_mut(..length), theirs.get_mut(..length)) else {
-            return Err(BulkloadRefusal::BudgetExceeded);
-        };
-        let read_left =
-            crate::io::sys::pread_full(a, left, at).refuse_at("transfer::same_bytes")?;
-        let read_right =
-            crate::io::sys::pread_full(b, right, at).refuse_at("transfer::same_bytes")?;
-        counters::add_len(Counter::DestVerifyRead, length);
-        if read_left != length || read_right != length || left != right {
-            return Ok(false);
-        }
-        at += length as u64;
-    }
-    Ok(true)
-}
 
 /// Validate a manifest against its row, adopt an existing output, or stage a
 /// new one and fill every chunk this destination already holds. Every
@@ -8384,21 +8452,16 @@ fn plan_file(
     }
     // `--consolidate` (operator ruling 2026-10-20): the seat is judged by
     // its class against the live file; merged ones are staged in memory.
-    let mut consolidate_into = None;
     if let Some(settings) = context.consolidate {
         match plan_consolidating(context, planned, manifest, settings, salvaged_from) {
             Consolidating::Done(plan) => return *plan,
-            Consolidating::Stage(class) => consolidate_into = Some(class),
+            Consolidating::Stage(class, parent) => {
+                return gather(context, (row, &placements, order), class, parent, salvaged_from)
+            }
             Consolidating::Land => {}
         }
     }
-    // A consolidation never supersedes the live file: its union writes it.
-    let existing = if consolidate_into.is_some() {
-        Ok(None)
-    } else {
-        context.target.existing(row)
-    };
-    let supersede = match existing {
+    let supersede = match context.target.existing(row) {
         Ok(Some((file, parent))) => {
             match owned_output(context.store, context.authority, row, &file) {
                 Ok(Some(owned)) => {
@@ -8437,14 +8500,7 @@ fn plan_file(
         Ok(None) => None,
         Err(refusal) => return Plan::Refuse(refusal),
     };
-    // A consolidation's bytes are received in memory, never on disk (SPEC
-    // rule 2).
-    let staged = if consolidate_into.is_some() {
-        context.target.stage_in_memory(row)
-    } else {
-        context.target.stage(row)
-    };
-    let staged = match staged {
+    let staged = match context.target.stage(row) {
         Ok(staged) => staged,
         Err(refusal) => return Plan::Refuse(refusal),
     };
@@ -8494,8 +8550,49 @@ fn plan_file(
         hints,
         placed,
         extend: None,
-        consolidate: consolidate_into,
     })
+}
+
+/// `--consolidate`: gather the seat's bytes in memory ([`Plan::Gather`]),
+/// filled from every chunk this destination holds, the rest asked for.
+fn gather(
+    context: &ReceiveContext<'_>,
+    (row, placements, order): (
+        &RowSchema,
+        &HashMap<[u8; 32], (u64, Vec<u64>)>,
+        Vec<([u8; 32], u32)>,
+    ),
+    class: crate::consolidate::Class,
+    parent: Arc<std::fs::File>,
+    salvaged_from: &mut Vec<usize>,
+) -> Plan {
+    let Ok(size) = usize::try_from(row.size) else {
+        return Plan::Refuse(BulkloadRefusal::BudgetExceeded);
+    };
+    let bytes = Arc::new(Mutex::new(vec![0_u8; size]));
+    let sink = Sink::Memory(Arc::clone(&bytes));
+    let mut missing = Vec::new();
+    let mut outputs = HashMap::new();
+    let mut placed = 0_u64;
+    for (digest, index) in order {
+        let Some((chunk, offsets)) = placements.get(&digest) else {
+            continue;
+        };
+        let filled = local_chunk(context, &mut outputs, &digest, *chunk, salvaged_from)
+            .and_then(|data| data.map(|data| sink.place(&data, offsets)).transpose());
+        match filled {
+            Ok(Some(())) => placed = placed.saturating_add(chunk.saturating_mul(offsets.len() as u64)),
+            Ok(None) => missing.push(index),
+            Err(refusal) => return Plan::Refuse(refusal),
+        }
+    }
+    Plan::Gather(Box::new(Gather {
+        bytes,
+        parent,
+        class,
+        missing,
+        placed,
+    }))
 }
 
 /// `--consolidate` (operator ruling 2026-10-20): what the live file is to
@@ -8576,17 +8673,25 @@ fn plan_consolidating(
                     Err(refusal) => done(Plan::Refuse(refusal)),
                 };
             }
+            let kept = Arc::clone(&parent);
             match plan_extend(context, row, manifest, (file, parent), salvaged_from) {
-                Plan::Adopt(..) | Plan::NotPrefix(_) if union.is_some() => {
-                    Consolidating::Stage(class)
+                Plan::Adopt(..) | Plan::NotPrefix(_)
+                    if union.is_some() && row.size <= crate::consolidate::IN_MEMORY_LIMIT =>
+                {
+                    Consolidating::Stage(class, kept)
                 }
                 Plan::Adopt(..) => held(settled, live_size, APPEND_LOG_PENDING),
                 Plan::NotPrefix(identity) => held(Some(identity), live_size, APPEND_LOG_PENDING),
                 other => done(other),
             }
         }
+        // A file too large to gather in memory is held: memory never
+        // balloons.
+        Class::Config(_) if row.size > crate::consolidate::IN_MEMORY_LIMIT => {
+            held(settled, live_size, OVER_MEMORY)
+        }
         Class::Config(_) if plan => dry("consolidate", live_size, None),
-        Class::Config(_) => Consolidating::Stage(class),
+        Class::Config(_) => Consolidating::Stage(class, parent),
         Class::Sqlite => held(settled, live_size, SQLITE_PENDING),
         Class::Opaque => held(settled, live_size, "opaque: the bytes differ"),
     }
@@ -8720,7 +8825,6 @@ fn plan_extend(
             hints,
             straddle,
         })),
-        consolidate: None,
     })
 }
 

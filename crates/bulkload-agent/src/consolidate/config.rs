@@ -276,10 +276,10 @@ pub fn consolidate(
 }
 
 /// The structured-config [`super::Union`]: [`consolidate`] with the
-/// source's staged bytes, the format by the live file's name.
+/// source's bytes, the format by the live file's name.
 ///
 /// # Errors
-/// As [`consolidate`]; the staged file's read refusal.
+/// As [`consolidate`].
 pub fn union(live: &Live<'_>, source: &Source<'_>, ledger: &Ledger) -> Result<super::Outcome> {
     let Some(format) = Format::of(live.name) else {
         return Ok(super::Outcome {
@@ -288,18 +288,12 @@ pub fn union(live: &Live<'_>, source: &Source<'_>, ledger: &Ledger) -> Result<su
             recorded: 0,
         });
     };
-    if source.size > SIZE_LIMIT {
+    if source.bytes.len() as u64 > SIZE_LIMIT {
         return Ok(super::Outcome {
             action: Action::Held("config: over the size limit"),
             written: 0,
             recorded: 0,
         });
-    }
-    let mut bytes = vec![0_u8; usize::try_from(source.size).unwrap_or(0)];
-    let read =
-        sys::pread_full(source.file, &mut bytes, 0).refuse_at("consolidate::config::source")?;
-    if read as u64 != source.size {
-        return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
     }
     let outcome = consolidate(
         &Target {
@@ -309,7 +303,7 @@ pub fn union(live: &Live<'_>, source: &Source<'_>, ledger: &Ledger) -> Result<su
         },
         format,
         Contents {
-            bytes: &bytes,
+            bytes: source.bytes,
             mtime_ns: source.mtime_ns,
         },
         source.maps,

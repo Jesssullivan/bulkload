@@ -833,20 +833,3 @@ pub(super) fn get_xattr_raw(
     }
 }
 
-/// An anonymous file in memory (`memfd_create`, close-on-exec): the
-/// received bytes of a file the homes consolidation merges, which never
-/// land on any disk (operator ruling 2026-10-20; SPEC rule 2, no payload
-/// copy on either machine).
-///
-/// # Errors
-/// Returns the `memfd_create` failure.
-pub fn memory_file() -> io::Result<std::os::fd::OwnedFd> {
-    use std::os::fd::FromRawFd as _;
-    // SAFETY: the name is a NUL-terminated literal; the flags are valid.
-    let fd = unsafe { libc::memfd_create(c"bulkload-consolidate".as_ptr(), libc::MFD_CLOEXEC) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `fd` was just returned by `memfd_create` and nothing else owns it.
-    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
-}

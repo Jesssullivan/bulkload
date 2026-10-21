@@ -1445,32 +1445,9 @@ impl Destination {
             file: Arc::new(file),
             sealed: false,
             sqlite: false,
-            in_memory: false,
         })
     }
 
-    /// Stage `row` in memory, never on disk (operator ruling 2026-10-20;
-    /// SPEC rule 2): a consolidation's received bytes, which its union
-    /// reads and which are dropped with the file. It is filled as any
-    /// staged file is and never published.
-    ///
-    /// # Errors
-    /// `HOMES_CONSOLIDATE_UNSUPPORTED` where no in-memory file exists
-    /// (Darwin); an unsafe ancestor.
-    pub(crate) fn stage_in_memory(&self, row: &RowSchema) -> Result<StagedFile> {
-        let (parent, leaf) = self.shared_parent(&row.rel_path)?;
-        let file = crate::io::sys::memory_file()
-            .map_err(|_| BulkloadRefusal::HomesConsolidateUnsupported)?;
-        Ok(StagedFile {
-            parent,
-            temporary: CString::default(),
-            leaf,
-            file: Arc::new(File::from(file)),
-            sealed: false,
-            sqlite: false,
-            in_memory: true,
-        })
-    }
 
     /// Whether a `-wal`, `-journal` or `-shm` of any kind sits beside the
     /// path `rel_path` names (#218, review R5). `SQLite` would apply a stale
@@ -1595,9 +1572,6 @@ pub(crate) struct StagedFile {
     /// superseding exchange, first checks once more that no `-wal`,
     /// `-journal` or `-shm` sits beside the leaf (OI-1003-Q146).
     sqlite: bool,
-    /// Staged in memory ([`Destination::stage_in_memory`]): no temporary
-    /// name, never published.
-    in_memory: bool,
 }
 
 impl StagedFile {
@@ -1640,28 +1614,12 @@ impl StagedFile {
     /// # Errors
     /// Returns a failed unlink.
     pub(crate) fn discard(self) -> Result<()> {
-        if self.in_memory {
-            return Ok(());
-        }
         unlink(&self.parent, &self.temporary)
-    }
-
-    /// The directory the file was staged for, open.
-    pub(crate) const fn parent(&self) -> &Arc<File> {
-        &self.parent
-    }
-
-    /// The name it was staged for.
-    pub(crate) fn leaf(&self) -> &[u8] {
-        self.leaf.as_bytes()
     }
 
     /// Seal the data, then rename into place without replacing anything.
     /// The identity is taken from the open file after the rename.
     fn publish(mut self) -> Result<(StatIdentity, Arc<File>)> {
-        if self.in_memory {
-            return Err(BulkloadRefusal::ProtocolStateViolation);
-        }
         if let Err(error) = self.seal() {
             let _ = unlink(&self.parent, &self.temporary);
             return Err(error);
