@@ -350,10 +350,83 @@ same report, totals and gate:
   nothing written. `--beside` on `copy` and `pull` is retired (SPEC rule
   3, "no beside copies"): an **applied-beside** row of a record written
   while it existed still decodes and stays accounted.
+  - **Append logs** (`*.jsonl`) take the #294 lane's union,
+    `consolidate::append_log::union`. The result is one file at the path:
+    the source's bytes whole, then the live file's records the source
+    lacks, in the live file's order. A Claude transcript record is matched
+    by its `uuid`, any other line by its exact bytes, counted, so both
+    branches of a session continued on both hosts are kept.
+  - A live log that already holds every source record, in any order, is
+    `covered` and is never rewritten (SPEC rule 7).
+  - A live log that is a prefix of the source's is extended in place: the
+    missing tail is appended to the same inode through `O_APPEND`, so a
+    session writing through an open handle never loses a turn. Only a
+    true union (the live log holds records the source lacks) is traded in
+    by the crash-safe swap, and only while no process holds the file. Both
+    are checked against the live file as it was read and ledgered in
+    `consolidate.sqlite` (`append_log_union`: both inputs' and the
+    output's BLAKE3, and the record counts).
+  - A live transcript that is a link into a `--replace-archived-dest`
+    root is unioned with its archived file and regularized: the union is
+    written as a regular file at the live name in place of the link, and
+    the archive copy stays (A-055, `append_log::union_link`).
+  - With `--map-prefix`, the same session that the destination holds at a
+    map's source key (`projects/<S>/<name>`) is folded into the mapped key
+    (`projects/<D>/<name>`). If absent there it is moved (renamed, never
+    copied); otherwise it is unioned. The source-key name is removed once
+    the merged bytes are durable, ledgered (`key_fold`) and reported on
+    `key-fold` lines. The same holds for every file of the session under
+    the source key (its `<id>/` subdirectory: subagent logs, tool results).
+    An append log is moved or unioned; any other file is moved when
+    absent, its source-key copy removed when the mapped key holds the same
+    bytes, and held (`HOMES_CONSOLIDATE_UNSUPPORTED`, both kept) when it
+    holds other bytes. `--plan-only` lists `fold-move`, `fold-union`,
+    `fold-remove` and `fold-hold`; `--key-map-proof` gives each file a
+    `fold` field (`move`, `union`, `remove`, `hold`, `none`).
+  - A log that a process holds open, or that ends inside a line, is
+    `HOMES_CONSOLIDATE_RACED`, retryable, with nothing written.
+    Whether a process holds the file is read from `/proc`, so off Linux
+    (sting is Linux) a union that would write is held as
+    `HOMES_CONSOLIDATE_HOLDER_UNKNOWN`, with nothing written.
+- one **mapped** row per `--map-prefix SRC_REL=DST_REL` a `copy` or `pull`
+  landed entries through (#280 finding 9, "no duplicates"; accounted like
+  `applied`, the row printing `mapped`, the destination path). The map is a
+  receive-side rename, the wire unchanged: an entry at `SRC_REL` or under
+  `SRC_REL/` (whole components, the longest source wins) is decided, keyed
+  (`row_key` over the mapped row), recorded and published at `DST_REL` plus
+  the rest of its path, once. A path that would reach a map's destination
+  any other way is refused `DESTINATION_MAP_CONFLICT` with everything under
+  it (the owner rule: a destination path lands only through the map whose
+  destination is the deepest holding it), so no two seats of a session
+  meet at one name and nothing merges. A set with an invalid side, one
+  source or destination twice, or a destination whose parent is not where
+  its source's parent lands, refuses `FIELD_DOMAIN_VIOLATION` before
+  either store exists. `estate-move --sessions` pulls the Claude tree with
+  the project-key map of the re-seat's own lanes:
+  `projects/<key(S)>=projects/<key(D)>` for each lane `S -> D`, `D` at its
+  real path on the destination and keyed exactly as Claude Code keys it
+  (`reseat::key`). A key two lane sources share (keys are lossy), two keys
+  whose destination key is one, and a lane that does not resolve stay
+  unmapped, named on typed `estate-move key-map-held` lines. A mapped
+  session lands where Claude Code lists it and the re-seat finds it in
+  place; the source-key directories earlier passes left are never removed,
+  and `estate-move --key-map-proof` lists, report only, how the destination
+  key holds each of their files. A derived map whose lane's sessions the
+  source keyed otherwise is named on a typed `estate-move key-map-unused`
+  line.
+- **Race copies.** A copy of a transcript that a re-seat race leaves
+  behind is unioned into the live file (the archive target) and removed
+  once the merged bytes are durable (`reseat::fold`, SPEC rules 3 and 4).
+  This covers an A-106 swap-back copy that a writer appended to, and a
+  Q198 regularization copy. Only a refusing union holds: the copy is
+  renamed to `.<name>.<token>.kept-<inode>.bulkload-reseat` (the same file,
+  never a new copy) with nothing written, and every later pass retries it
+  first. While it refuses, the path is `held-written` (placement) or
+  `kept-held` (regularization), and `reseat_copy_folded` counts the folds.
 
 A transfer row's identity (`item`, 64 hex) is a digest of the transfer's
 source (`SOURCE`, or `HOST:SOURCE` for `pull`), its destination, the path
-and the code (or `covered`, `applied-beside`); its refusal `instance` digests the row's
+and the code (or `covered`, `applied-beside`, `consolidated`, `mapped`); its refusal `instance` digests the row's
 record, so a rerun that refuses identically keeps its review and any other
 record is a new instance. `closure-dispose --transfer DEST_STATE` reviews a
 transfer row as it reviews a planned item, in the same plan-bound ledger.
@@ -2260,6 +2333,134 @@ specified how a caller retries carry_v2's ingest locks
 `GIT_DESTINATION_FILESYSTEM_UNSUPPORTED` refusals that only they raised. Tag
 `carry-v2-final` holds the code and the contract's text. A future receiver
 for these frames needs a contract of its own.
+
+## SQLite row union: `sqlite-union` (operator ruling 2026-10-20)
+
+SPEC, "How each kind of data is consolidated", the Codex SQLite row: "rows
+merged into sting's live database by primary key, streamed from neo's held
+read snapshot; no database copy is written; a key with two versions takes
+the later one, and the other is kept in the ledger". Rule 4 also applies
+("the result contains both"). Operator ruling 2026-10-20: "they must be
+consoldiated" and "no dupes, no duplciated besides, no stage dupes".
+
+**Transport.** `sqlite-union` runs over `pull`'s ssh child (the P76
+registry's `pull_command`). `serve_flags` adds the fixed literal
+`--sqlite-rows`, and the remote `serve` then speaks the row stream
+(`bulkload_proto::rows`, `ROWS_VERSION` 1, its own schema id); the transfer
+wire stays v6. The database path crosses in the request on stdin. `--local`
+runs both halves in one process. No database copy exists on either host at
+any point.
+
+**Read side** (`sqlite_union::serve_rows`, with `sqlite_union::hold`):
+
+- The store is opened read-only with a zero busy timeout. One WAL read
+  snapshot is held for the pass (operator ruling 2026-10-19 "Hold one read
+  snapshot"). It is released at the wall (the base, or
+  `--sqlite-carry-wall`, plus three reads of the store at 32 MiB/s, at most
+  30 min) or under the source's free-space floor, either way
+  `BUDGET_EXCEEDED`.
+- A rollback-journal store is `SQLITE_UNION_SOURCE_NOT_WAL`.
+- A store `SQLite` finds corrupt or not a database is
+  `SQLITE_UNION_SOURCE_UNREADABLE`: held, listed, nothing written. The
+  operator rules on it.
+- A store whose `stat` (the database and a non-empty `-wal`) is the one
+  recorded at the last completed pass is not opened.
+- `--clock STATE_DB` names the home's store with `threads`. It is attached
+  read-only before the snapshot is taken.
+
+**Schema.** An absent destination store is **created**. Only its schema is
+written, under a private name beside the path, from the source's tables,
+indexes, triggers, views and `user_version`. It is linked in only if the
+path is still free, then set to WAL, and its rows (`_sqlx_migrations`
+included) go in by the union. Otherwise the destination's schema must equal
+the source's entry for entry (`SQLITE_SCHEMA_MISMATCH`, nothing written). A
+virtual table, or a generated or hidden column, is
+`SQLITE_UNION_SCHEMA_UNSUPPORTED`. The live store must be this user's
+regular file. Its `(dev, ino)` and `schema_version` are checked again before
+every write batch.
+
+**Write side** (`sqlite_union::consolidate`). Tables are merged parents
+first, with `threads` before every thread-scoped table. Each batch is a
+`BEGIN IMMEDIATE` of at most 256 rows or 20 ms, under a 5 s busy timeout
+with backoff up to 5 min, `synchronous=FULL`, foreign keys enforced.
+
+- **Threads decide.** Merging `threads` records each thread's winner for
+  the source host in the ledger (`row_union_threads`): the side whose
+  `updated_at_ms` (or `updated_at`) is later, or `same`.
+- **Thread-scoped rows** (a natural-key table with `thread_id`, in any
+  store of the home) follow their thread:
+  - A key both sides hold takes the winner's version. The loser's version
+    is ledgered (`thread-newer` or `thread-older`).
+  - A key the destination lacks is inserted, whichever thread is later
+    (rule 4: the result contains both). If such an extra row would reuse
+    one of its thread's ordinals (`*ordinal`, not `updated_at_ordinal`) for
+    another row, the thread is **held**: it is ledgered `thread-held`,
+    listed (`held_threads`), recorded `held`, and nothing more is written
+    for it until the operator rules.
+- **Other natural-key rows:** absent rows are inserted, and equal rows are
+  adopted with nothing written. A differing row is replaced only by a
+  strictly later version column (`updated_at_ms`, `updated_at`,
+  `updated_at_ordinal`). A replacement is an `UPDATE`, so no cascade fires.
+- **Surrogate keys** (`AUTOINCREMENT`, such as `logs.id`): new keys here. A
+  `UNIQUE` match is adopted when equal and kept as the destination's
+  otherwise. An insert batch is ledgered as pending before its commit and
+  confirmed after it, so a row is never inserted twice.
+- **Constraints:** a row a constraint refuses is ledgered, not written.
+- **Paths:** `cwd`, `path` and `*_path` values are re-spelled through
+  `--map` (A-055).
+
+**Ledger.** The `row_union_*` tables live in the homes' consolidation
+ledger, `STATE/consolidate.sqlite`, on `consolidate::Ledger::connection()`
+(#297). They hold every row not in
+the destination's final state: its key as JSON, its reason, its BLAKE3 and
+its JSON. A displaced row is ledgered durably before the commit that
+replaces it.
+
+**Rerun** (SPEC rule 8, "reads only what changed"). Per table the source
+reads `rowid > r OR <changed> >= t`, in rowid order:
+
+- `<changed>` is the table's own time column. For a thread-scoped table
+  with no time column of its own (`thread_items`), it is the row's thread's
+  `updated_at` in the clock store. A changed thread therefore has all its
+  rows read again, and no other thread's are.
+- `t` is the high value at the start of the scan that last reached the
+  table's end. A row changed after a scan started has a time at least that
+  high, so the rowid mark is saved every 32 batches without losing it.
+- Surrogate tables are read by rowid mark only, even under `--full`.
+- `--full` reads every natural-key row again.
+
+After a pass, `integrity_check` must say `ok`, and `foreign_key_check` rows
+are counted.
+
+**Order and gaps.**
+
+- A thread-scoped row of a thread with no recorded winner keeps per-row
+  later-wins.
+
+**Dispatch** (`copy`/`pull --consolidate`, #297). The receive skips a
+`SQLite` store and its `-wal`, `-shm` and `-journal` on the file path,
+with nothing read (`TransferStats::sqlite_routed`). After the session,
+`sqlite_union::union_routed` merges each store by the row union, one serve
+session per store: `pull` uses its ssh child with `--sqlite-rows`, and
+`copy` runs in process. A home's `state_*.sqlite` goes first in each
+directory and is the clock of that directory's other stores. Each outcome
+joins the session's transfer record before it is written
+(`sqlite_union::fold`):
+
+- `consolidate`, `covered` (the store was unchanged) or `created`;
+- a hold, with the union's typed code;
+- the refusal, for example `HOMES_CONSOLIDATE_RACED` when the live store
+  stayed locked past the batch wall or was replaced (retryable).
+
+A sidecar the source reports beside a routed store is routed with it
+rather than refused, and the store's sidecars follow its outcome.
+`--plan-only` asks each store's source for its header only: a plain
+100-byte read, no `SQLite` lock. It lists the store `row-union`, or `hold`
+with `SQLITE_UNION_SOURCE_NOT_WAL` (a rollback-journal store, whose read
+would need a shared lock its writer waits on, SPEC rule 6) or
+`SQLITE_UNION_SOURCE_UNREADABLE`. Each store also gets one
+`planned-sqlite STORE WORD` line.
+- `>=` re-reads the rows at the old time mark itself; they are adopted.
 
 ## Durability
 

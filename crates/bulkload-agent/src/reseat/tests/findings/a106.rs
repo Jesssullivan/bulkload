@@ -512,14 +512,21 @@ fn a106_a_target_written_under_the_swap_is_put_back() {
 /// Merge-gate review of #280 (2026-10-19, a probe with this hook): a
 /// destination writer appends through the live name while the landed copy
 /// stands there, and the archive target is written in the same window, so
-/// the swap is put back. The copy then holds the writer's line, the only
-/// copy of it: it is never removed, but kept aside create-only beside the
-/// live name, `kept-aside`, held for review. The link is back as it was.
+/// the swap is put back. The copy then holds the writer's line. Under SPEC
+/// #298 (rules 3 and 4) it is no second copy: it is unioned into the live
+/// file (the archive target), ledgered, and removed once the merged bytes
+/// are durable. Nothing stays beside the live name (no dot-name at all in
+/// its directory).
 #[test]
-fn a106_a_copy_written_through_the_live_name_is_kept_aside_on_swap_back() {
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "a union that writes needs the open-file check (Linux only; elsewhere HOMES_CONSOLIDATE_HOLDER_UNKNOWN)"
+)]
+fn a106_a_copy_written_through_the_live_name_is_unioned_into_the_live_file() {
     let _serial = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let before = crate::counters::Counters::snapshot();
     let world = World::new();
     let archive = world.archive();
     let cwd = "/Users/jess/git/lab";
@@ -543,7 +550,7 @@ fn a106_a_copy_written_through_the_live_name_is_kept_aside_on_swap_back() {
     let options = world.replacing();
     let (summary, lines, _) = run(&options);
     set_replace_hook(None);
-    assert_eq!(summary.files_of("claude", "kept-aside"), 1, "{lines:?}");
+    assert_eq!(summary.files_of("claude", "held-written"), 0, "{lines:?}");
     assert_eq!(
         summary.files_of("claude", "replaced-archived"),
         0,
@@ -551,17 +558,37 @@ fn a106_a_copy_written_through_the_live_name_is_kept_aside_on_swap_back() {
     );
     let dest = world.dest_transcript(SID);
     assert_eq!(fs::read_link(&dest).unwrap(), target, "the link is back");
-    let mut kept = dest.as_os_str().to_owned();
-    kept.push(".bulkload-kept");
-    let kept = PathBuf::from(kept);
+    let dir = dest.parent().unwrap();
+    let listed: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with('.'))
+        .collect();
+    assert!(
+        listed.is_empty(),
+        "no copy beside the live name: {listed:?}"
+    );
     let mut want = neo;
     want.extend_from_slice(b"{\"sting\":\"next turn\"}\n");
-    assert_eq!(
-        fs::read(&kept).unwrap(),
-        want,
-        "the writer's line survives in the copy kept aside"
+    let unioned = fs::read(&target).unwrap();
+    assert!(
+        unioned.starts_with(&want),
+        "the copy's bytes, the writer's line among them, first"
     );
-    assert!(fs::read(&target).unwrap().ends_with(b"{\"live\":1}\n"));
+    assert!(
+        unioned.ends_with(b"{\"live\":1}\n"),
+        "the archive's own line kept"
+    );
     let ledger = Ledger::open_read_only(&options.state).unwrap().unwrap();
     assert!(ledger.regular(&dest).unwrap().is_none());
+    drop(ledger);
+    let conn = rusqlite::Connection::open(options.state.join("consolidate.sqlite")).unwrap();
+    let unions: i64 = conn
+        .query_row("SELECT count(*) FROM append_log_union", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(unions, 1, "the union ledgered");
+    let counted = crate::counters::Counters::snapshot().since(before);
+    assert_eq!(counted.get(crate::counters::Counter::ReseatCopyFolded), 1);
 }
