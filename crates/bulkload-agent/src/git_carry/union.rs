@@ -150,8 +150,9 @@ fn update(repo: &Path, name: &str, new: &str, old: Option<&str>) -> Result<()> {
     .map(drop)
 }
 
-/// Union `source_refs` (the source's refs, `(name, value)`, every object
-/// already in the store) into the live repository `repo`; the source's
+/// Union `source_refs` into the live repository `repo`.
+///
+/// The refs are `(name, value)`, every object already in the store; the source's
 /// label is `source` (its remote-tracking namespace). `refs/stash` is the
 /// stash's ([`stash`]), never a ref here.
 ///

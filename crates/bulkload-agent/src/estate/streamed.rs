@@ -477,8 +477,9 @@ pub struct Converged {
     pub seats_held: bool,
 }
 
-/// Consolidate `snapshot`'s item into its live path, which holds a related
-/// repository of the destination's own (B2): the refs, stash and reflogs
+/// Consolidate `snapshot`'s item into a related repository at its live path.
+///
+/// The live path holds a repository of the destination's own (B2): the refs, stash and reflogs
 /// unioned ([`crate::git_carry::union`]), then the worktree's seats through
 /// the engine with #297's unions (equal adopted, new created, a differing
 /// file held typed), the destination's administration and index its own.

@@ -381,8 +381,9 @@ fn named(repo: &Path) -> Result<Named> {
     Ok((object_format, refs, worktrees, named))
 }
 
-/// What a consolidation needs of the source's history beside its objects
-/// (B2): the stash, newest first, each entry's commit and message; every
+/// What a consolidation needs of the source's history beside its objects.
+///
+/// For B2: the stash, newest first, each entry's commit and message; every
 /// reflog, by ref, as its file's lines; and the root commits, so a
 /// destination can tell a related repository from an unrelated one.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
