@@ -18,11 +18,8 @@
 //! - any payload a pass leaves in its state is named and refused
 //!   `STATE_PAYLOAD_LEFT`.
 //!
-//! The P-MOVE-1..3 landing proofs this file held (M2 item 7), and the four
-//! `--sessions` passes over a Git lane below (plan of record 2026-10-19,
-//! C9 to C11), wait for the streamed capture (PR B), which brings them back
-//! over live-store transfers: until then they are `#[ignore]`d with that
-//! reason.
+//! The `--sessions` passes over a Git lane below land the lane through the
+//! streamed capture and consolidate the homes (#297).
 
 #![allow(
     clippy::unwrap_used,
@@ -250,86 +247,254 @@ fn holds_no_payload(state: &Path, items: u64) {
     );
 }
 
-#[test]
-fn the_source_half_plans_and_refuses_to_stage_its_capture() {
-    let world = World::new("source");
-    world.estate();
-    let ran = world.source();
-    assert!(!ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+// A read of `repo` that never refreshes its index (`status` otherwise
+// rewrites it), so a later pass sees the landed seats as it left them.
+fn out(repo: &Path, args: &[&str]) -> String {
+    let ran = Command::new("git")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
     assert!(
-        ran.stderr.contains("refused: STATE_PAYLOAD_LEFT"),
-        "{}",
-        ran.stderr
+        ran.status.success(),
+        "git {args:?} in {}: {}",
+        repo.display(),
+        String::from_utf8_lossy(&ran.stderr)
     );
-    assert!(
-        ran.stdout
-            .contains("estate-move-source phase=inventory outcome=ok items=3 new=3 planned=3"),
-        "{}",
-        ran.stdout
-    );
-    assert!(
-        ran.stdout
-            .contains("estate-move-source phase=capture outcome=refused:STATE_PAYLOAD_LEFT"),
-        "{}",
-        ran.stdout
-    );
-    let words = state_line(&ran.stdout, "estate-move-source");
-    assert_eq!(words["outcome"], "ok", "{}", ran.stdout);
-    assert_eq!(words["state_payload_bytes"], "0", "{}", ran.stdout);
-    let state = world.source_state();
-    assert!(state.join("carry/plan.postcard").is_file());
-    // The pass did not finish: the destination half refuses its marks.
-    assert!(!state.join("carry/move-source.done").exists());
-    holds_no_payload(&state, 3);
-    // The plan is a ledger: a second pass appends nothing and refuses the
-    // same way, its state still free of payload.
-    let again = world.source();
-    assert!(!again.ok);
-    assert!(
-        again.stdout.contains("items=3 new=0 planned=3"),
-        "{}",
-        again.stdout
-    );
-    holds_no_payload(&state, 3);
+    String::from_utf8_lossy(&ran.stdout).into_owned()
 }
 
+// The receipt line of `item` on the destination half's stdout (receipts
+// print paths escaped and quoted).
+#[allow(clippy::unnecessary_debug_formatting)]
+fn item_line<'a>(stdout: &'a str, path: &Path) -> &'a str {
+    let live = format!("live={path:?}");
+    stdout
+        .lines()
+        .find(|line| {
+            line.starts_with("estate-move item=")
+                && line.ends_with(&live)
+                && line.contains(" outcome=")
+        })
+        .unwrap_or_else(|| panic!("no receipt for {live}:\n{stdout}"))
+}
+
+/// B1 (SPEC rule 2 reset, coordinator decision (a)): the streamed capture
+/// lands every item absent at the destination at its live path. The source
+/// half records only ledgers; the objects are fetched by id from the live
+/// source repository into the live store; the seats (dirty, untracked,
+/// ignored) land through the engine; the linked worktree's pointers are
+/// mapped. The landed repositories hold exactly the source's refs, stash
+/// and status, and only their own objects: no custody refs. Neither state
+/// holds payload. A rerun fetches nothing and reads no seat.
 #[test]
-fn the_destination_half_refuses_to_pull_a_corpus_and_touches_no_live_path() {
-    let world = World::new("destination");
+fn a_streamed_pass_lands_every_absent_item_with_no_payload_anywhere() {
+    let world = World::new("streamed");
     world.estate();
-    let _ = world.source();
-    fs::create_dir_all(world.dst().join("other")).unwrap();
-    fs::write(world.dst().join("other/mine.txt"), b"destination's\n").unwrap();
-    let live = tree(&world.dst());
-    for extra in [&[][..], &["--plan-only"][..]] {
-        let mut args = os(&[&"estate-move", &"--label", &LABEL, &"--source", &"neo"]);
-        args.extend(extra.iter().map(OsString::from));
-        args.extend(os(&[&"-", &world.source_state(), &world.state()]));
-        let ran = agent(&args);
-        assert!(!ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    let untouched = admin_digest(&world.src().join("land/.git"));
+    let sourced = world.source();
+    assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
+    assert!(
+        sourced.stdout.contains("items=3 new=3 planned=3"),
+        "{}",
+        sourced.stdout
+    );
+    assert_eq!(
+        sourced.stdout.matches("outcome=captured").count(),
+        3,
+        "{}",
+        sourced.stdout
+    );
+    holds_no_payload(&world.source_state(), 3);
+    let moved = world.moved();
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    // The source repository is as it was, byte for byte: no ref, lock,
+    // reflog, index or configuration write by either half.
+    assert_eq!(
+        admin_digest(&world.src().join("land/.git")),
+        untouched,
+        "{both}"
+    );
+    assert!(
+        moved.stdout.contains("estate-move phase=pull outcome=ok"),
+        "{both}"
+    );
+    assert!(
+        moved.stdout.contains("estate-move phase=apply outcome=ok"),
+        "{both}"
+    );
+    let (src, dst) = (world.src(), world.dst());
+    for name in ["land", "land-wt", "other"] {
         assert!(
-            ran.stderr.contains("refused: STATE_PAYLOAD_LEFT"),
-            "{}",
-            ran.stderr
+            item_line(&moved.stdout, &dst.join(name)).contains("outcome=workspace-restored"),
+            "{both}"
         );
-        assert!(
-            ran.stdout
-                .contains("estate-move phase=pull outcome=refused:STATE_PAYLOAD_LEFT"),
-            "{}",
-            ran.stdout
-        );
-        assert!(
-            !ran.stdout.contains("estate-move phase=plan"),
-            "{}",
-            ran.stdout
-        );
-        let words = state_line(&ran.stdout, "estate-move");
-        assert_eq!(words["outcome"], "ok", "{}", ran.stdout);
-        assert_eq!(words["state_payload_bytes"], "0", "{}", ran.stdout);
-        assert_eq!(tree(&world.dst()), live, "a live path changed");
-        holds_no_payload(&world.state(), 3);
-        holds_no_payload(&world.source_state(), 3);
     }
+    // History, refs and stash exactly as on the source; no custody refs.
+    for name in ["land", "other"] {
+        assert_eq!(
+            out(
+                &dst.join(name),
+                &["for-each-ref", "--format=%(objectname) %(refname)"]
+            ),
+            out(
+                &src.join(name),
+                &["for-each-ref", "--format=%(objectname) %(refname)"]
+            ),
+            "{name}: {both}"
+        );
+        out(
+            &dst.join(name),
+            &["fsck", "--connectivity-only", "--no-dangling"],
+        );
+    }
+    assert_eq!(
+        out(&dst.join("land"), &["stash", "list"]),
+        out(&src.join("land"), &["stash", "list"])
+    );
+    // The working state: dirty, untracked and ignored seats, byte for byte,
+    // and the same status (the index carried).
+    for rel in ["a.txt", "new.txt", "ignored.bin", ".gitignore"] {
+        assert_eq!(
+            fs::read(dst.join("land").join(rel)).unwrap(),
+            fs::read(src.join("land").join(rel)).unwrap(),
+            "{rel}"
+        );
+    }
+    // The same status, but the hand-off notes the move wrote (R0.5).
+    let landed_status: String = out(&dst.join("land"), &["status", "--porcelain", "--ignored"])
+        .lines()
+        .filter(|line| *line != "?? AGENTS.md" && *line != "?? CLAUDE.md")
+        .fold(String::new(), |mut all, line| {
+            all.push_str(line);
+            all.push('\n');
+            all
+        });
+    assert_eq!(
+        landed_status,
+        out(&src.join("land"), &["status", "--porcelain", "--ignored"])
+    );
+    assert!(
+        moved
+            .stdout
+            .contains("estate-move phase=hand-off outcome=ok"),
+        "{both}"
+    );
+    assert!(dst.join("land/AGENTS.md").is_file(), "{both}");
+    // The linked worktree is linked, at its live path.
+    assert_eq!(
+        out(&dst.join("land-wt"), &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        "wt"
+    );
+    let listed = out(&dst.join("land"), &["worktree", "list", "--porcelain"]);
+    assert!(
+        listed.contains(&format!("worktree {}", dst.join("land-wt").display())),
+        "{listed}"
+    );
+    assert!(!listed.contains("prunable"), "{listed}");
+    // Neither state holds payload; the closure line says so.
+    assert_eq!(
+        state_line(&moved.stdout, "estate-move")["state_payload_bytes"],
+        "0",
+        "{both}"
+    );
+    assert_eq!(closure(&moved.stdout)["unaccounted"], "0", "{both}");
+    holds_no_payload(&world.state(), 3);
+    holds_no_payload(&world.source_state(), 3);
+    // A rerun of both halves over an unchanged source fetches nothing and
+    // changes no ref.
+    let refs = out(&dst.join("land"), &["for-each-ref"]);
+    assert!(world.source().ok);
+    let again = world.moved();
+    let both = format!("{}\n{}", again.stdout, again.stderr);
+    for name in ["land", "other"] {
+        let line = item_line(&again.stdout, &dst.join(name));
+        assert!(line.contains("object_batches=0 "), "{line}\n{both}");
+    }
+    assert_eq!(out(&dst.join("land"), &["for-each-ref"]), refs);
+    holds_no_payload(&world.state(), 3);
+}
+
+/// A shallow source is a typed hold until it has a test: refused on the
+/// source half, nothing recorded for it to land.
+#[test]
+fn a_shallow_source_is_held_typed() {
+    let world = World::new("shallow");
+    world.estate();
+    let src = world.src();
+    let from = format!("file://{}", src.join("other").display());
+    let ran = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .args(["clone", "--quiet", "--depth=1", &from])
+        .arg(src.join("shallow"))
+        .output()
+        .unwrap();
+    assert!(
+        ran.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    let sourced = world.source();
+    assert!(
+        sourced.stdout.lines().any(|line| line
+            .contains("outcome=refused code=GIT_HAVES_UNPROVABLE")
+            && line.contains("shallow")),
+        "{}",
+        sourced.stdout
+    );
+}
+
+// Every file under `admin` (a repository's administration), by path and
+// bytes: what a pass must never change on the source.
+fn admin_digest(admin: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    tree(admin)
+        .into_iter()
+        .filter(|rel| fs::symlink_metadata(admin.join(rel)).unwrap().is_file())
+        .map(|rel| {
+            let bytes = fs::read(admin.join(&rel)).unwrap();
+            (rel, bytes)
+        })
+        .collect()
+}
+
+/// B1 holds, typed, a live path that holds another version: nothing is
+/// written there until the consolidate path (B2) decides it.
+#[test]
+fn a_live_path_holding_another_version_is_held_and_untouched() {
+    let world = World::new("held");
+    world.estate();
+    let mine = world.dst().join("other");
+    repo(&mine, "mine.txt");
+    let before = tree(&mine);
+    let head = out(&mine, &["rev-parse", "HEAD"]);
+    assert!(world.source().ok);
+    // A fetch scratch a crashed pass left is swept at startup.
+    let left = world.state().join("scratch/bulkload-fetch-1-0");
+    fs::create_dir_all(&left).unwrap();
+    fs::write(left.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+    for dir in [world.state(), world.state().join("scratch")] {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let moved = world.moved();
+    assert!(
+        moved.stdout.contains("estate-move swept="),
+        "{}",
+        moved.stdout
+    );
+    assert!(!left.exists());
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    let line = item_line(&moved.stdout, &mine);
+    assert!(
+        line.contains("outcome=held code=GIT_DESTINATION_OCCUPIED"),
+        "{line}\n{both}"
+    );
+    assert_eq!(tree(&mine), before);
+    assert_eq!(out(&mine, &["rev-parse", "HEAD"]), head);
+    holds_no_payload(&world.state(), 3);
 }
 
 #[test]
@@ -653,7 +818,6 @@ fn a_sessions_only_pass_lands_the_live_home_with_no_payload_in_state() {
 /// - The closure counts the session transfers and the re-seat (C11).
 /// - An unchanged rerun rewrites nothing.
 #[test]
-#[ignore = "waits for the streamed capture (PR B): SPEC rule 2 refuses the git capture and corpus pull this pass needs"]
 fn sessions_are_consolidated_into_the_live_home_and_the_gate_reads_them() {
     let base = std::env::temp_dir().join(format!("bulkload-move-home-{}", std::process::id()));
     let _ = fs::remove_dir_all(&base);
@@ -985,7 +1149,6 @@ fn sessions_are_consolidated_into_the_live_home_and_the_gate_reads_them() {
 /// (N1), the rollout lands in place, and a destination session with no
 /// `cwd` under a destination key is in place and holds nothing.
 #[test]
-#[ignore = "waits for the streamed capture (PR B): SPEC rule 2 refuses the git capture and corpus pull this pass needs"]
 fn sessions_into_a_destination_with_no_codex_index_hold_the_store() {
     let base = std::env::temp_dir().join(format!("bulkload-move-fresh-{}", std::process::id()));
     let _ = fs::remove_dir_all(&base);
@@ -1224,7 +1387,6 @@ fn sessions_into_a_destination_with_no_codex_index_hold_the_store() {
 /// - A source session with no lane is `RESEAT_LANE_UNMAPPED`, typed, and
 ///   holds the gate.
 #[test]
-#[ignore = "waits for the streamed capture (PR B): SPEC rule 2 refuses the git capture and corpus pull this pass needs"]
 fn archive_links_follow_a106_and_destination_links_stay() {
     const SID_FORK: &str = "5e5e5e5e-3333-4222-8333-444444444444";
     const SID_NEO_KEY: &str = "5e5e5e5e-4444-4222-8333-444444444444";
@@ -1572,7 +1734,6 @@ fn archive_links_follow_a106_and_destination_links_stay() {
 /// extended in place under the mapped key; an unchanged pass reads nothing;
 /// the report-only proof lists the source-key directory left behind.
 #[test]
-#[ignore = "waits for the streamed capture (PR B): SPEC rule 2 refuses the git capture and corpus pull this pass needs"]
 fn sessions_land_once_under_the_mapped_key_and_a_shared_key_stays_typed() {
     const SID_AB: &str = "5e5e5e5e-7777-4222-8333-444444444444";
     const SID_RESUMED: &str = "5e5e5e5e-8888-4222-8333-444444444444";
@@ -1890,7 +2051,10 @@ fn sessions_land_once_under_the_mapped_key_and_a_shared_key_stays_typed() {
 /// records neo lacks), never a beside copy; the re-seat finds it in place,
 /// the closure names the consolidation, and the gate passes.
 #[test]
-#[ignore = "waits for the streamed capture (PR B): SPEC rule 2 refuses the git capture and corpus pull this pass needs"]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the process check proves nothing off Linux: every consolidation is unsettled"
+)]
 fn a_session_both_sides_continued_is_consolidated_into_one_file() {
     const SID_BOTH: &str = "5e5e5e5e-aaaa-4222-8333-444444444444";
     let base = std::env::temp_dir().join(format!("bulkload-move-both-{}", std::process::id()));
@@ -1990,7 +2154,6 @@ fn a_session_both_sides_continued_is_consolidated_into_one_file() {
 /// re-seat ledger recorded it as neo's): never `in-place`, the gate never
 /// passes on it, and its refused ledger row is never overwritten.
 #[test]
-#[ignore = "waits for the streamed capture (PR B): SPEC rule 2 refuses the git capture and corpus pull this pass needs"]
 fn listed_then_pruned_sessions_with_no_lane_stay_typed() {
     const SID_PRUNED: &str = "5e5e5e5e-8888-4222-8333-444444444444";
     const T_LANE: &str = "019a0000-0000-7000-8000-00000000000b";
@@ -2215,7 +2378,6 @@ fn tree_files(root: &Path) -> Vec<(String, Vec<u8>)> {
 /// lists every file of the homes with its class, its action and the sizes
 /// on both sides before anything lands, and writes nothing to them.
 #[test]
-#[ignore = "waits for the streamed capture (PR B): SPEC rule 2 refuses the git capture and corpus pull this pass needs"]
 fn the_homes_plan_lists_every_file_and_writes_nothing() {
     let base = std::env::temp_dir().join(format!("bulkload-move-plan-{}", std::process::id()));
     let _ = fs::remove_dir_all(&base);

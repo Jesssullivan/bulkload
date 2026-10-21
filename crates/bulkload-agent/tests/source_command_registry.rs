@@ -150,28 +150,29 @@ const BYPASSES: &[Bypass] = &[
     Bypass {
         id: "agent::main::pull_command(\"ssh\")",
         shape: Some(
-            "Command::new(\"ssh\");ssh.args([\"-T\",\"-oBatchMode=yes\",\
-             \"-oConnectTimeout=15\"]);ifletSome(config)=args.get(6){\
-             if!Path::new(config).is_absolute(){\
-             returnErr(BulkloadRefusal::PathNotAbsolute);}\
-             ssh.arg(\"-F\").arg(config);}ssh.arg(\"--\").arg(host).arg(remote);\
-             ifbulkload_agent::durable::durability()==\
-             bulkload_agent::durable::Durability::Strict{\
-             ssh.arg(\"--durability=strict\");}\
-             ifbulkload_agent::durable::ledger_sync()==\
-             bulkload_agent::durable::LedgerSync::Full{\
-             ssh.arg(\"--source-ledger-sync=full\");}\
-             forflaginbulkload_agent::transfer::serve_flags(){ssh.arg(flag);}\
-             ssh.arg(\"serve\");\
-             ifkind==bulkload_agent::transfer::RootKind::File{\
-             ssh.arg(\"--file\");}\
-             letmutchild=ssh\
-             .stdin(Stdio::piped()).stdout(Stdio::piped())\
-             .stderr(Stdio::inherit()).spawn()",
+            "Command::new(\"ssh\");\
+             ssh.args([\"-T\",\"-oBatchMode=yes\",\"-oConnectTimeout=15\"]);\
+             ifletSome(config)=args.get(6){if!Path::new(config).is_absolute(){returnErr(BulkloadRefusal::PathNotAbsolute);\
+             }ssh.arg(\"-F\").arg(config);\
+             }ssh.arg(\"--\").arg(host).arg(remote);\
+             ifbulkload_agent::durable::durability()==bulkload_agent::durable::Durability::Strict{ssh.arg(\"--durability=strict\");\
+             }ifbulkload_agent::durable::ledger_sync()==bulkload_agent::durable::LedgerSync::Full{ssh.arg(\"--source-ledger-sync=full\");\
+             }letrelay=matchmode{Remote::Serve(_)=>false,Remote::UploadPack(repo)=>{ifrepo.contains('\\'')||!repo.starts_with('/'){returnErr(BulkloadRefusal::PathNotPortable);\
+             }ssh.arg(\"upload-pack\").arg(format!(\"'{repo}'\"));true}};\
+             if!relay{forflaginbulkload_agent::transfer::serve_flags(){ssh.arg(flag);\
+             }ssh.arg(\"serve\");\
+             }ifkind==bulkload_agent::transfer::RootKind::File{ssh.arg(\"--file\");\
+             }let(wire_in,wire_out)=ifrelay{(Stdio::inherit(),Stdio::inherit())}else{(Stdio::piped(),Stdio::piped())};\
+             letmutchild=ssh.stdin(wire_in).stdout(wire_out).stderr(Stdio::inherit()).spawn()",
         ),
         callers: &[],
         why: "Starts the remote `bulkload-agent serve`, which is the source \
-              reader and enters background priority itself (OI-1003-Q25). The \
+              reader and enters background priority itself (OI-1003-Q25), \
+              or (SPEC rule 2 reset, B1) the remote `bulkload-agent \
+              upload-pack REPO` a streamed fetch relays to, its stdio the \
+              local `git fetch`'s, REPO an absolute path, single-quoted and \
+              refused if it holds a quote; upload-pack is a read and also \
+              enters background priority. The \
               remote word is `bulkload-agent` or a validated absolute path, \
               and the ssh child touches no local source. The three mode flags \
               it may pass (`--durability=strict`, WP0(g)'s \
@@ -415,6 +416,7 @@ const READS: &[&str] = &[
     "show-ref",
     "status",
     "symbolic-ref",
+    "upload-pack",
     "var",
     "verify-pack",
     "version",
@@ -480,11 +482,15 @@ const WRITERS: &[(&str, usize, &str)] = &[
     ),
     (
         "fetch",
-        5,
+        6,
         "From a bundle file into the capture's private repository, a chain's \
-         scratch repository or a destination. Never from a source repository. \
-         Five since #199: chain::flatten also fetches each bound plan base, a \
-         digest-checked private copy, into the chain's scratch repository.",
+         scratch repository or a destination; always aimed at the repository \
+         that takes the objects, never at a source. Five since #199: \
+         chain::flatten also fetches each bound plan base, a digest-checked \
+         private copy, into the chain's scratch repository. Six since the \
+         streamed capture (SPEC rule 2 reset, 2026-10-20): `stream::fetch` \
+         takes a snapshot's ids into the live destination repository from \
+         the source's `upload-pack`, which only reads the source.",
     ),
     (
         "hash-object",
@@ -710,6 +716,13 @@ const EXTRA_CONFIG: &[(&str, &str)] = &[
     (
         "pack.useBitmaps=false",
         "The estimate's pack-objects: no bitmap is read or written.",
+    ),
+    (
+        "uploadpack.allowAnySHA1InWant=true",
+        "stream::serve_upload_pack (SPEC rule 2 reset): the source end of a \
+         fetch by id answers any id the snapshot pinned (a reflog entry, an \
+         index blob), on the command line only; the source's configuration \
+         is never written.",
     ),
 ];
 

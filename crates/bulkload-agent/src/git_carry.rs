@@ -66,6 +66,7 @@ pub mod shared;
     clippy::unwrap_used
 )]
 mod source_inert_tests;
+pub mod stream;
 
 /// The one Git hardening table (WP1 PR 1, S2; OI-1003-Q16). Every Git child
 /// the v1 carry and the estimate spawn is built from it by [`git`], and the
@@ -270,6 +271,12 @@ fn git_writer(private: &Path) -> Command {
 // Point `command`'s object writes at `private`'s write store; see [`git_writer`].
 fn writing_privately<'a>(command: &'a mut Command, private: &Path) -> &'a mut Command {
     command.env("GIT_OBJECT_DIRECTORY", private.join(git_env::WRITE_STORE))
+}
+
+// Point `command`'s object writes (a fetch run in a scratch repository) at
+// `objects`, a live destination store (the streamed capture, B1).
+fn into_store(command: &mut Command, objects: &Path) {
+    command.env("GIT_OBJECT_DIRECTORY", objects);
 }
 
 /// Whether the repository at `repo` is a partial clone.

@@ -292,61 +292,49 @@ fn source_pass(
         noted("source-vanished"),
         noted("not-in-census"),
     ))?;
-    let policy = if rebuildable {
-        bulkload_agent::git_carry::CapturePolicy::including_rebuildable()
-    } else {
-        bulkload_agent::git_carry::CapturePolicy::default()
-    };
     // Each refused item's code, and each nest its capture holds only as
     // custody (its content is not carried: M2r2 item 5), for the
     // destination.
     let refusals = std::sync::Mutex::new(std::collections::BTreeMap::new());
     let nests = std::sync::Mutex::new(Vec::new());
     let receipts = AtomicU64::new(0);
-    // SPEC rule 2: a capture writes its bundles and repository copies into
-    // the state (`private/`, `carry/corpus`), so it is refused before it
-    // writes; an empty plan captures nothing. The streamed capture replaces
-    // it.
-    let staged = || {
-        bulkload_agent::state_payload::refuse_staging(state, &carry.join("corpus"))?;
-        bulkload_agent::state_payload::refuse_staging(state, &state.join("private"))
-    };
-    let capture = if planned == 0 {
-        Ok(())
-    } else {
-        staged().and_then(|()| {
-            estate::capture_with_policy(
-                &plan,
-                &state.join("private"),
-                &carry.join("corpus"),
-                count,
-                policy,
-                &|row| {
-                    receipts.fetch_add(1, Ordering::Relaxed);
-                    if row.outcome == "refused" {
-                        let code = row.refusal.as_ref().map_or("IO", BulkloadRefusal::code);
-                        refusals
-                            .lock()
-                            .map_err(|_| BulkloadRefusal::WorkerLost)?
-                            .insert(row.item.clone(), code.to_owned());
-                    }
-                    for line in &row.nested {
-                        if line.contains("kind=Directory") && !line.contains("seats=own-item") {
-                            nests.lock().map_err(|_| BulkloadRefusal::WorkerLost)?.push(
-                                moving::Note {
-                                    path: row.source.clone(),
-                                    what: "nested",
-                                    count: 1,
-                                    code: None,
-                                },
-                            );
-                        }
-                    }
-                    super::print_receipt(row)
-                },
-            )
-        })
-    };
+    // SPEC rule 2 (reset 2026-10-20): the streamed capture. Each item's
+    // capture is one small ledger in `carry/` (its object ids, the paths
+    // its seat transfer leaves out, its host-path files); nothing is
+    // bundled, copied or staged. The destination fetches the objects from
+    // the live repository and lands the seats from the live files.
+    let _ = count;
+    let capture = (|| -> Result<()> {
+        let mut first = None;
+        for item in estate::inspect(&plan)? {
+            let identity = estate::item_id(&item)?;
+            receipts.fetch_add(1, Ordering::Relaxed);
+            match estate::streamed::capture_source(&item, now_ns(), rebuildable)
+                .and_then(|snapshot| estate::streamed::record(&carry, &snapshot).map(|()| snapshot))
+            {
+                Ok(snapshot) => out(&format!(
+                    "estate-move-source item={identity} outcome=captured wants={} missing={} excluded={} source={:?}",
+                    snapshot.snapshot.wants.len(),
+                    snapshot.snapshot.missing,
+                    snapshot.excluded.len(),
+                    item.source,
+                ))?,
+                Err(refusal) => {
+                    out(&format!(
+                        "estate-move-source item={identity} outcome=refused code={} source={:?}",
+                        refusal.code(),
+                        item.source,
+                    ))?;
+                    refusals
+                        .lock()
+                        .map_err(|_| BulkloadRefusal::WorkerLost)?
+                        .insert(identity, refusal.code().to_owned());
+                    first.get_or_insert(refusal);
+                }
+            }
+        }
+        first.map_or(Ok(()), Err)
+    })();
     let refusals = refusals
         .into_inner()
         .map_err(|_| BulkloadRefusal::WorkerLost)?;
@@ -798,6 +786,33 @@ impl Move {
     }
 }
 
+// The `upload-pack` program a streamed fetch runs (SPEC rule 2 reset, B1):
+// this agent's `upload-pack` verb for HOST `-`, else its relay to the
+// remote one.
+fn upload_pack_program(run: &Move) -> Result<String> {
+    let quoted = |word: &std::ffi::OsStr| -> Result<String> {
+        let word = word.to_str().ok_or(BulkloadRefusal::PathNotPortable)?;
+        if word.contains('\'') {
+            return Err(BulkloadRefusal::PathNotPortable);
+        }
+        Ok(format!("'{word}'"))
+    };
+    let exe = std::env::current_exe().refuse_at("estate_move::upload_pack")?;
+    let exe = quoted(exe.as_os_str())?;
+    if run.local() {
+        return Ok(format!("{exe} upload-pack"));
+    }
+    // A remote source: `git fetch` runs this agent's relay, which reaches
+    // the remote `upload-pack` over the one ssh session builder.
+    let dash = std::ffi::OsString::from("-");
+    Ok(format!(
+        "{exe} relay-upload-pack {} {} {}",
+        quoted(&run.host)?,
+        quoted(run.remote.as_ref().unwrap_or(&dash))?,
+        quoted(run.config.as_ref().unwrap_or(&dash))?,
+    ))
+}
+
 // Record a phase's end in the ledger (written durably) and print it.
 fn reached(ledger: &mut moving::Ledger, path: &Path, phase: &str, outcome: String) -> Result<()> {
     out(&format!("estate-move phase={phase} outcome={outcome}"))?;
@@ -850,6 +865,16 @@ fn move_pass(run: &Move) -> Result<()> {
     }
     moving::private_dir(&run.state)?;
     let _lock = moving::lock(&run.state)?;
+    // The streamed fetches' scratch repositories: under this state, swept
+    // here (one a crash left), and counted by the state guard if a pass
+    // leaves one.
+    let scratch = run.state.join("scratch");
+    match std::fs::remove_dir_all(&scratch) {
+        Ok(()) => out(&format!("estate-move swept={scratch:?}"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).refuse_at("estate_move::scratch"),
+    }
+    bulkload_agent::git_carry::stream::set_scratch_root(Some(scratch));
     let ledger_path = moving::ledger_path(&run.state);
     let mut ledger = moving::Ledger::open(
         &ledger_path,
@@ -883,13 +908,6 @@ fn move_pass(run: &Move) -> Result<()> {
     // goes on.
     let pulled = run
         .transfer_ledgers(&run.source_state.join("carry"), &carry, "plan")
-        .and_then(|()| {
-            if estate::inspect(&plan)?.is_empty() {
-                Ok(())
-            } else {
-                bulkload_agent::state_payload::refuse_staging(&run.state, &carry.join("corpus"))
-            }
-        })
         .and_then(|()| finished_pass(&carry));
     reached(&mut ledger, &ledger_path, "pull", word(&pulled))?;
     pulled?;
@@ -917,58 +935,154 @@ fn move_pass(run: &Move) -> Result<()> {
     ledger.items = decided.items;
     reached(&mut ledger, &ledger_path, "plan", "ok".to_owned())?;
 
-    // 3. Land absent, adopt equal, beside what differs, refs in.
-    let receipts = AtomicU64::new(0);
-    // The items whose planned workspace this pass landed, adopted or
-    // converged: the hand-off's (a beside landing, a carry or a refusal
-    // leaves the planned workspace without this landing).
-    let landed = std::sync::Mutex::new(Vec::new());
-    let applied = estate::apply_reporting(
-        &plan,
-        &corpus,
-        &private,
-        &run.source,
-        (
-            run.jobs,
-            &estate::ApplyOptions {
-                adopt: true,
-                activate_origin: run.origins.clone(),
-                side_roots: run.side_roots.clone(),
-                exclude_union: run.exclude_union,
-                beside: Some(suffix),
-                refs_in: true,
-            },
-        ),
-        &|row| {
-            receipts.fetch_add(1, Ordering::Relaxed);
-            if matches!(
-                row.outcome,
-                "workspace-restored" | "previous-workspace-restoration-not-revalidated"
-            ) {
-                landed
-                    .lock()
-                    .map_err(|_| BulkloadRefusal::WorkerLost)?
-                    .push(row.item.clone());
-            }
-            super::print_receipt(row)
-        },
-        &mut |line| out(line),
-    );
-    let landed = landed
-        .into_inner()
-        .map_err(|_| BulkloadRefusal::WorkerLost)?;
-    // Item refusals (every planned item answered) are each item's,
-    // recorded for closure, and the pass goes on to carry, hand off and
-    // account for them. A refusal that cut the apply short stops it.
-    let answered = receipts.into_inner() == u64::try_from(items.len()).unwrap_or(u64::MAX);
-    let outcome = match &applied {
-        Err(refusal) if answered => format!("items-refused first={}", refusal.code()),
-        other => word(other),
+    // 3. The streamed landing (SPEC rule 2 reset, B1): each item with a
+    // streamed capture whose live path is absent, empty or this item's own
+    // earlier landing is landed there: its objects fetched by id from the
+    // live source repository into the live store, its seats through the
+    // engine into the live path. A live path holding anything else is held,
+    // typed, for the consolidate path (B2): nothing is written there.
+    moving::private_dir(&private)?;
+    let map = estate::streamed::path_map(&items);
+    let upload_pack = upload_pack_program(run);
+    let transfer = |from: &Path, to: &Path| -> Result<()> {
+        let name = format!(
+            "item-{}",
+            blake3::hash(std::os::unix::ffi::OsStrExt::as_bytes(to.as_os_str())).to_hex()
+        );
+        run.transfer_into(from, to, &name)
     };
-    reached(&mut ledger, &ledger_path, "apply", outcome)?;
-    if !answered {
-        applied?;
+    let reach = estate::streamed::Reach {
+        upload_pack: upload_pack.as_deref().unwrap_or_default(),
+        transfer: &transfer,
+    };
+    let mut landed = Vec::new();
+    let mut first_refusal: Option<BulkloadRefusal> = None;
+    // Mains first: a linked worktree's administration lands with its main.
+    let mut order: Vec<&moving::Row> = rows.iter().collect();
+    order.sort_by_key(|row| {
+        row.item.source != row.item.repository
+            && row.item.workspace.as_ref() != Some(&row.item.repository)
+    });
+    // Which items land: a held one is recorded and left untouched.
+    let mut landing = Vec::new();
+    for row in order {
+        let Some(snapshot) = estate::streamed::recorded(&carry, &row.id)? else {
+            continue;
+        };
+        let place = row.item.workspace.as_ref().unwrap_or(&row.item.repository);
+        let ours = estate::streamed::landed_before(&private, &row.id, &run.source)?;
+        let clear = matches!(
+            moving::presence(place),
+            moving::Presence::Absent | moving::Presence::Empty
+        );
+        if !(clear || ours) {
+            let refusal = BulkloadRefusal::GitDestinationOccupied;
+            estate::streamed::record_outcome(
+                &private,
+                &row.item,
+                "refused",
+                Some(&refusal),
+                Some("held: the live path holds another version (consolidate, B2)".to_owned()),
+            )?;
+            out(&format!(
+                "estate-move item={} outcome=held code={} live={place:?}",
+                row.id,
+                refusal.code()
+            ))?;
+            first_refusal.get_or_insert(refusal);
+            continue;
+        }
+        landing.push((row, snapshot));
     }
+    // The objects first, every item's fetch in parallel (`--jobs`), each
+    // timed for the race against rclone.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(run.jobs.max(1))
+        .build()
+        .map_err(|_| BulkloadRefusal::WorkerLost)?;
+    let fetched: Vec<(Result<bulkload_agent::git_carry::stream::Fetched>, u128)> =
+        pool.install(|| {
+            use rayon::prelude::*;
+            landing
+                .par_iter()
+                .map(|(_, snapshot)| {
+                    let started = std::time::Instant::now();
+                    let fetched = upload_pack
+                        .as_ref()
+                        .map_err(Clone::clone)
+                        .and_then(|program| {
+                            estate::streamed::fetch_objects(snapshot, &private, program)
+                        });
+                    (fetched, started.elapsed().as_millis())
+                })
+                .collect()
+        });
+    // The landings' racy instant: every print a landing's ledger takes is
+    // judged against it.
+    let landing_ns = bulkload_agent::git_carry::pass_start_ns();
+    // Then each item's seats, host-path files and proof, mains first.
+    for ((row, snapshot), (fetched, fetch_ms)) in landing.iter().zip(fetched) {
+        let place = row.item.workspace.as_ref().unwrap_or(&row.item.repository);
+        let started = std::time::Instant::now();
+        let landing = fetched
+            .and_then(|fetched| estate::streamed::land(snapshot, &private, &map, &reach, fetched));
+        match landing {
+            Ok(done) => {
+                estate::streamed::journal(&private, snapshot, &run.source)?;
+                if row.item.workspace.is_some() {
+                    // The workspace ledger the hand-off and later passes
+                    // read.
+                    bulkload_agent::git_carry::converge::record_streamed(
+                        place,
+                        &row.id,
+                        snapshot.digest(),
+                        (snapshot.started_ns, landing_ns),
+                        &snapshot.excluded,
+                        &run.source,
+                    )?;
+                }
+                let outcome = if row.item.workspace.is_some() {
+                    "workspace-restored"
+                } else {
+                    "refs-imported"
+                };
+                estate::streamed::record_outcome(&private, &row.item, outcome, None, None)?;
+                out(&format!(
+                    "estate-move item={} outcome={outcome} object_batches={} object_batches_skipped={} object_bytes={} fetch_ms={fetch_ms} topped_up={} missing_at_source={} unreachable_not_carried={} land_ms={} live={place:?}",
+                    row.id,
+                    done.batches,
+                    done.skipped,
+                    done.object_bytes,
+                    done.topped_up,
+                    done.missing_at_source,
+                    snapshot.snapshot.unreachable,
+                    started.elapsed().as_millis(),
+                ))?;
+                landed.push(row.id.clone());
+            }
+            Err(refusal) => {
+                estate::streamed::record_outcome(
+                    &private,
+                    &row.item,
+                    "refused",
+                    Some(&refusal),
+                    None,
+                )?;
+                out(&format!(
+                    "estate-move item={} outcome=refused code={} live={place:?}",
+                    row.id,
+                    refusal.code()
+                ))?;
+                first_refusal.get_or_insert(refusal);
+            }
+        }
+    }
+    let outcome = first_refusal.as_ref().map_or_else(
+        || "ok".to_owned(),
+        |refusal| format!("items-refused first={}", refusal.code()),
+    );
+    reached(&mut ledger, &ledger_path, "apply", outcome)?;
+    let _ = (&suffix, &corpus);
 
     // 4. What the capture refused for good, carried as files: at the live
     // path when it is still absent or empty, else beside it. A carry is
@@ -1096,13 +1210,22 @@ fn move_pass(run: &Move) -> Result<()> {
         .join(",");
     let not_moved: u64 = notes.values().sum();
     let measured = bulkload_agent::state_payload::measure_all(&run.states())?;
+    // Objects no name reaches on the source: counted, never carried.
+    let mut unreachable = 0u64;
+    let mut missing_at_source = 0u64;
+    for row in &rows {
+        if let Some(snapshot) = estate::streamed::recorded(&carry, &row.id)? {
+            unreachable = unreachable.saturating_add(snapshot.snapshot.unreachable);
+            missing_at_source = missing_at_source.saturating_add(snapshot.snapshot.missing);
+        }
+    }
     let held = reseat_held
         .iter()
         .map(|(word, count)| format!("{word}:{count}"))
         .collect::<Vec<_>>()
         .join(",");
     out(&format!(
-        "estate-move closure planned={} applied={} applied_beside={} carried={} referenced_only={} refused={} refused_pending_review={} unaccounted={} not_moved={not_moved} refusals={} sessions={} transfer_rows={} reseat_unaccounted={reseat_unaccounted} reseat_held={} key_maps={} key_maps_held={} key_maps_unused={} diverged={} move_state_bytes={} pull_payload_bytes={} {} report={report_path:?}",
+        "estate-move closure planned={} applied={} applied_beside={} carried={} referenced_only={} refused={} refused_pending_review={} unaccounted={} not_moved={not_moved} refusals={} sessions={} transfer_rows={} reseat_unaccounted={reseat_unaccounted} reseat_held={} key_maps={} key_maps_held={} key_maps_unused={} diverged={} move_state_bytes={} pull_payload_bytes={} objects_unreachable_not_carried={unreachable} objects_missing_at_source={missing_at_source} {} report={report_path:?}",
         rows.len(),
         report.applied,
         report.applied_beside,

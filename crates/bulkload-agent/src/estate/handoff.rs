@@ -153,7 +153,14 @@ fn planned(plan: &Plan, corpus: &Path, state: &Path) -> Result<Vec<Planned>> {
                     crate::outcome::Outcome::Refused(refusal) => Some(refusal.code().to_owned()),
                     _ => None,
                 });
-        let current = captured.map(|captured| captured.digest);
+        // The streamed capture (SPEC rule 2 reset, B1): its item snapshot,
+        // beside the corpus, is the item's current capture.
+        let current = captured.map(|captured| captured.digest).or_else(|| {
+            corpus
+                .parent()
+                .and_then(|carry| super::streamed::recorded(carry, &identity).ok().flatten())
+                .map(|snapshot| snapshot.digest())
+        });
         items.push(Planned {
             records: facts_digest(current.as_ref(), omitted.as_ref(), refused.as_deref())?,
             id: identity,

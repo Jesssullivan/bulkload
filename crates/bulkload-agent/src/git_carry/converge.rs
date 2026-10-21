@@ -373,6 +373,77 @@ fn read_exclude(common: &Path) -> Result<Vec<u8>> {
     }
 }
 
+/// Record the workspace ledger of a streamed landing (B1/B2).
+///
+/// It is the record the hand-off and every later converge read, as a
+/// restore writes it.
+/// Every seat under `worktree` is printed, but `excluded` (relative paths,
+/// whole subtrees) and the administration. `recorded_ns` dates the prints:
+/// a print stamped within the racy allowance of it stays racy.
+///
+/// # Errors
+/// IO; a Git child's refusal.
+pub fn record_streamed(
+    worktree: &Path,
+    item: &str,
+    capture: [u8; 32],
+    (observed_ns, recorded_ns): (i128, i128),
+    excluded: &[Vec<u8>],
+    source: &str,
+) -> Result<()> {
+    let git_dir = landed::worktree_git_dir(worktree)?.ok_or(BulkloadRefusal::HandoffNotLanded)?;
+    let common = landed::common_dir(&git_dir)?;
+    let mut seats = Vec::new();
+    let mut pending = vec![worktree.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir).refuse_at("git_carry::converge::record_streamed")? {
+            let path = entry
+                .refuse_at("git_carry::converge::record_streamed")?
+                .path();
+            let rel = path
+                .strip_prefix(worktree)
+                .map_err(|_| BulkloadRefusal::PathEscapesRoot)?
+                .as_os_str()
+                .as_bytes()
+                .to_vec();
+            let skip = rel == b".git"
+                || excluded.iter().any(|path| {
+                    rel.strip_prefix(path.as_slice())
+                        .is_some_and(|rest| rest.is_empty() || rest.first() == Some(&b'/'))
+                });
+            if skip {
+                continue;
+            }
+            let Some(meta) = lstat(&path)? else {
+                continue;
+            };
+            if meta.is_dir() {
+                pending.push(path.clone());
+            }
+            if let Some(print) = SeatPrint::of(&rel, &meta) {
+                seats.push(print);
+            }
+        }
+    }
+    seats.sort_by(|a, b| a.path.cmp(&b.path));
+    let head = head_of(worktree)?;
+    let ledger = LandedWorkspace {
+        item: item.to_owned(),
+        capture,
+        observed_ns,
+        instance: String::new(),
+        intended_branch: head.symbolic.clone(),
+        head,
+        index: index_digest(worktree, None)?,
+        exclude: exclude_digest(&read_exclude(&common)?),
+        recorded_ns,
+        fsid: landed::fsid(worktree)?,
+        seats,
+    };
+    let dir = landed::ensure_dir(&git_dir, source)?;
+    landed::write(&dir.join(landed::WORKSPACE_LANDED), &ledger)
+}
+
 /// Each worktree of `repo` as `worktree list --porcelain` lists it: its
 /// path and the branch its HEAD names, if any.
 fn worktrees(repo: &Path) -> Result<Vec<(PathBuf, Option<String>)>> {

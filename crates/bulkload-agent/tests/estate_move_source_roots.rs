@@ -129,13 +129,7 @@ fn the_pass_makes_the_serve_directory_beside_carry_and_private() {
     let world = World::new("serve");
     let state = world.path("state");
     let ran = agent(&os(&[&"estate-move-source", &state, &world.path("live")]));
-    // The capture is refused (SPEC rule 2); the directories are there.
-    assert!(!ran.ok, "{}{}", ran.stdout, ran.stderr);
-    assert!(
-        ran.stderr.contains("refused: STATE_PAYLOAD_LEFT"),
-        "{}",
-        ran.stderr
-    );
+    assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
     for name in ["carry", "serve", "serve/carry"] {
         let dir = state.join(name);
         assert!(dir.is_dir(), "{name} missing:\n{}", ran.stdout);
@@ -158,8 +152,7 @@ fn a_vanished_root_is_a_note_and_the_pass_continues() {
         &gone,
         &world.path("live"),
     ]));
-    // The pass continues to its capture, which is refused (SPEC rule 2).
-    assert!(!ran.ok, "{}{}", ran.stdout, ran.stderr);
+    assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
     let note = format!(
         "estate-move-source note=source-vanished path={gone:?} count=1 code=SOURCE_ROOT_MISSING"
     );
@@ -177,7 +170,7 @@ fn a_vanished_root_is_a_note_and_the_pass_continues() {
     assert!(inventory.contains(" source_vanished=1 "), "{inventory}");
     assert!(
         ran.stdout
-            .contains("estate-move-source phase=capture outcome=refused:STATE_PAYLOAD_LEFT"),
+            .contains("estate-move-source phase=capture outcome=ok captured=1"),
         "{}",
         ran.stdout
     );
@@ -208,31 +201,41 @@ fn a_pass_with_no_usable_root_refuses_typed() {
 }
 
 /// An `ssh` stand-in: drops ssh's own options and the host, then runs the
-/// remote command here, its stdin and stdout the session's.
+/// remote command here through a shell, as ssh hands it to the remote
+/// one, its stdin and stdout the session's.
 fn fake_ssh(dir: &Path) {
     fs::create_dir_all(dir).unwrap();
     let ssh = dir.join("ssh");
     fs::write(
         &ssh,
-        "#!/bin/sh\nwhile [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\nshift 2\nexec \"$@\"\n",
+        "#!/bin/sh\nwhile [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\nshift 2\nexec sh -c \"$*\"\n",
     )
     .unwrap();
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 // SPEC rule 2 (reset 2026-10-20), over a transport: the pull lands only
-// the source half's plan and marks. A corpus a source half from before the
-// reset left is never pulled (excluded, its bytes never read), and a plan
-// with Git items refuses `STATE_PAYLOAD_LEFT` until the streamed capture.
+// the source half's plan, marks and item snapshots. A corpus a source half
+// from before the reset left is never pulled (excluded, its bytes never
+// read), and the item lands over the same transport.
 #[test]
-fn a_remote_pass_pulls_only_ledgers_and_refuses_a_git_plan() {
+fn a_remote_pass_pulls_only_ledgers_and_lands_over_ssh() {
     let world = World::new("remote");
     let src = world.path("src");
     fs::create_dir_all(&src).unwrap();
     fs::rename(world.path("live/repo"), src.join("land")).unwrap();
     let source_state = world.path("move-src");
     let state = world.path("move-dst");
-    let _ = agent(&os(&[&"estate-move-source", &source_state, &src]));
+    let dst = world.path("dst");
+    fs::create_dir_all(&dst).unwrap();
+    let map = format!("{}={}", src.display(), dst.display());
+    let _ = agent(&os(&[
+        &"estate-move-source",
+        &"--map",
+        &map,
+        &source_state,
+        &src,
+    ]));
     let old = source_state.join("carry/corpus/old-head.bundle");
     fs::create_dir_all(old.parent().unwrap()).unwrap();
     fs::write(&old, vec![9u8; 2048]).unwrap();
@@ -253,13 +256,28 @@ fn a_remote_pass_pulls_only_ledgers_and_refuses_a_git_plan() {
         Some(&world.path("fake-bin")),
     );
     let both = format!("{}\n{}", moved.stdout, moved.stderr);
-    assert!(!moved.ok, "{both}");
     assert!(
-        moved
-            .stdout
-            .contains("estate-move phase=pull outcome=refused:STATE_PAYLOAD_LEFT"),
+        moved.stdout.contains("estate-move phase=pull outcome=ok"),
         "{both}"
     );
+    // The streamed fetch relayed over ssh: the item lands from the live
+    // source repository, its objects fetched through the remote
+    // `upload-pack`.
+    assert!(
+        moved.stdout.contains("estate-move phase=apply outcome=ok"),
+        "{both}"
+    );
+    let head = |repo: &Path| {
+        let out = Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert_eq!(head(&dst.join("land")), head(&src.join("land")), "{both}");
     assert!(
         moved
             .stdout
