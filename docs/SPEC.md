@@ -83,6 +83,13 @@ Each rule is testable, and a change that breaks one is a defect.
 1. **One mover.** Estate bytes move only through bulkload. No rsync, rclone,
    cp, scp, tar, hand git or lane scripts. When bulkload cannot do something,
    the gap is fixed in bulkload or the operator is asked.
+   An agent never checks a lane by hand (comparing checkouts, transcripts,
+   worktrees or sessions between hosts) and never offers the operator a
+   checkout, switch, copy or other manual step to make a lane usable; the
+   lane's state is whatever bulkload's plan and closure report. Operator,
+   2026-10-21: "the manually checking and offering to hceckout is a
+   dangerous antipatterhn that has been recurring for months and must never
+   happen again, this is the whole asdkfjasdjlk point of bulkload".
 2. **In place, copy once, streaming, on both machines.** Bytes go from
    neo's live paths straight over the wire into sting's live paths, through
    the path maps. Neither machine ever gets a staging copy: no capture
