@@ -225,7 +225,10 @@ fn a_remote_pass_pulls_only_ledgers_and_refuses_a_git_plan() {
     fs::rename(world.path("live/repo"), src.join("land")).unwrap();
     let source_state = world.path("move-src");
     let state = world.path("move-dst");
-    let _ = agent(&os(&[&"estate-move-source", &source_state, &src]));
+    let dst = world.path("dst");
+    fs::create_dir_all(&dst).unwrap();
+    let map = format!("{}={}", src.display(), dst.display());
+    let _ = agent(&os(&[&"estate-move-source", &"--map", &map, &source_state, &src]));
     let old = source_state.join("carry/corpus/old-head.bundle");
     fs::create_dir_all(old.parent().unwrap()).unwrap();
     fs::write(&old, vec![9u8; 2048]).unwrap();
