@@ -94,8 +94,8 @@ use crate::counters::{self, Counter};
 use crate::freshness::StatIdentity;
 use crate::io::durable::{Committer, LedgerSync};
 use crate::materialize::{
-    owned_beside, owned_output, verify_existing, Destination, Displaced, OwnedOutput,
-    PendingOutput, Publication, PublishSink, SharedDisplaced, StagedFile,
+    owned_output, verify_existing, Destination, Displaced, OwnedOutput, PendingOutput, Publication,
+    PublishSink, SharedDisplaced, StagedFile,
 };
 use crate::transfer_store::{
     row_key, sqlite_key, ChunkHint, LedgerItem, LedgerRecord, LedgerSink, Manifest, OutputRecord,
@@ -340,49 +340,22 @@ pub struct TransferStats {
     /// source's sessions from the destination's own by (independent review
     /// of #280, N4).
     pub listed: Vec<Vec<u8>>,
-    /// Seats whose bytes were published, reused or adopted beside a
-    /// differing live destination file under `--beside SUFFIX`
-    /// ([`set_beside_suffix`]): `(source path, beside path)`. Each is
-    /// reported `applied-beside` and is an `applied-beside` row of the
-    /// session's transfer record, accounted in closure.
-    pub applied_beside: Vec<(Vec<u8>, Vec<u8>)>,
+    /// `--consolidate`: seats whose bytes are now in a differing live file,
+    /// by path, with the action: `consolidate` (merged by the class's
+    /// union) or `covered` (the live file already held them). Each is a
+    /// `consolidated` row of the session's transfer record, accounted.
+    pub consolidated: Vec<(Vec<u8>, String)>,
+    /// `--consolidate`: seats held `HOMES_CONSOLIDATE_UNSUPPORTED`, nothing
+    /// written, with why. Each is also in [`Self::refusals`].
+    pub held: Vec<(Vec<u8>, &'static str)>,
+    /// `--plan-only`: every seat's planned action.
+    pub planned: Vec<PlannedSeat>,
     /// `--map-prefix SRC_REL=DST_REL` ([`set_map_prefixes`]): each map an
     /// entry of the session was landed through, `(source path, destination
     /// path)`, as first used. Each is a `mapped` row of the session's
     /// transfer record, accounted like `applied`; every other path this
     /// report names is the destination's (the mapped path).
     pub mapped: Vec<(Vec<u8>, Vec<u8>)>,
-    /// `--beside` (#280 finding 9): seats whose live destination file is
-    /// not this store's and holds the seat's bytes and more (an append-only
-    /// file the destination continued: a session resumed there), by path.
-    /// Nothing is written for one, beside or in place; each is a
-    /// `dest-ahead` row of the session's transfer record, accounted
-    /// (covered by the live file).
-    pub dest_ahead: Vec<Vec<u8>>,
-    /// Append logs consolidated in place under `--beside` with
-    /// consolidation on ([`set_consolidate`], operator ruling 2026-10-20):
-    /// the seat's bytes and the live file's records the seat lacks, one file
-    /// at the path, never a beside copy. Each is a `consolidated` row of the
-    /// session's transfer record (the ledger: both inputs' and the output's
-    /// BLAKE3, and the counts), accounted.
-    pub consolidated: Vec<Consolidated>,
-}
-
-/// One append log consolidated in place ([`TransferStats::consolidated`]).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Consolidated {
-    /// The destination path.
-    pub path: Vec<u8>,
-    /// BLAKE3 of the seat's bytes, of the live file as read, and of the
-    /// consolidated file.
-    pub seat_blake3: [u8; 32],
-    pub live_blake3: [u8; 32],
-    pub output_blake3: [u8; 32],
-    /// The seat's records, and the live file's records kept after them.
-    pub seat_records: u64,
-    pub live_extra: u64,
-    /// The consolidated file's size.
-    pub output_size: u64,
 }
 
 impl TransferStats {
@@ -1365,224 +1338,109 @@ fn prefix_extend_scope(root: &Path) -> PrefixExtend {
         )
 }
 
-/// `--beside SUFFIX` on `pull` and `copy` (plan of record 2026-10-19, Step
-/// C gaps C1 and C2; SPEC R2.2, C10: a lossless union that never clobbers
-/// DEST). Without it an existing destination file bulkload did not write
-/// and whose bytes are not the seat's is refused `DESTINATION_OCCUPIED` and
-/// nothing is placed. With it the staged bytes are published at
-/// `<path><SUFFIX>` instead, the live file untouched, and the entry is
-/// accounted `applied-beside` in the session's transfer record, so
-/// `closure-report --transfer` counts it as carried, not pending review.
-/// A byte-identical file is still adopted, a verified byte prefix is still
-/// extended ([`PREFIX_EXTEND_ENV`]), and a symlink that differs is created
-/// beside too. A database with a live `-wal`, `-journal` or `-shm` beside
-/// it (which no snapshot may land on, OI-1003-Q146) lands its snapshot at
-/// `<db><SUFFIX>` under the same flag. A beside path that holds something
-/// of its own is refused `DESTINATION_OCCUPIED` as before: nothing is ever
-/// replaced but this store's own earlier beside output, by the exchange
-/// that supersedes any output of this store (WP0(d)). A later pass reuses
-/// or adopts the beside output under its own row, so an unchanged seat
-/// reads nothing (S3).
+/// `--consolidate`: land into a live destination by union, never beside.
 ///
-/// The suffix is appended verbatim: `.neo-20261019` gives
-/// `settings.json.neo-20261019`. It is one name component (not empty, no
-/// `/`, no NUL, not `.` or `..`).
-static BESIDE_SUFFIX: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+/// Operator ruling 2026-10-20: the agent homes are consolidated, never
+/// landed beside (SPEC RUL-10, C10). A live destination
+/// file that differs from the seat is merged by its class's union
+/// ([`crate::consolidate::union_of`]); a class with no union yet, or a file
+/// its union cannot carry, is held `HOMES_CONSOLIDATE_UNSUPPORTED` with
+/// nothing written. The source's bytes are received in memory, never staged
+/// on disk (SPEC rule 2).
+#[derive(Debug, Clone)]
+pub struct Consolidation {
+    /// The `--map` set: a source host path is compared and written as the
+    /// destination's.
+    pub maps: crate::consolidate::Maps,
+    /// The directory of the consolidation ledger.
+    pub ledger: PathBuf,
+    /// `--plan-only`: every seat is decided and reported
+    /// ([`TransferStats::planned`]); nothing is staged, written or recorded.
+    pub plan_only: bool,
+}
 
-/// The beside suffix by canonical destination root, for tests that run
+static CONSOLIDATE: Mutex<Option<Arc<Consolidation>>> = Mutex::new(None);
+
+/// The consolidation by canonical destination root, for tests that run
 /// sessions with and without it in one process.
-static BESIDE_OVERRIDE: Mutex<Vec<(PathBuf, Option<Vec<u8>>)>> = Mutex::new(Vec::new());
+static CONSOLIDATE_OVERRIDE: Mutex<Vec<(PathBuf, Option<Arc<Consolidation>>)>> =
+    Mutex::new(Vec::new());
 
-/// Whether `suffix` may be a `--beside` suffix: one name component.
-#[must_use]
-pub fn beside_suffix_allowed(suffix: &[u8]) -> bool {
-    !suffix.is_empty()
-        && !suffix.contains(&b'/')
-        && !suffix.contains(&0)
-        && suffix != b"."
-        && suffix != b".."
+/// Run every session of this process with `--consolidate` (`None`: off).
+pub fn set_consolidate(settings: Option<Consolidation>) {
+    *CONSOLIDATE.lock().unwrap_or_else(PoisonError::into_inner) = settings.map(Arc::new);
 }
 
-/// Run every session of this process with `--beside SUFFIX` (`None`: off).
-///
-/// # Errors
-/// `FIELD_DOMAIN_VIOLATION` for a suffix [`beside_suffix_allowed`] refuses.
-pub fn set_beside_suffix(suffix: Option<Vec<u8>>) -> Result<()> {
-    if let Some(suffix) = &suffix {
-        if !beside_suffix_allowed(suffix) {
-            return Err(BulkloadRefusal::FieldDomainViolation);
-        }
-    }
-    *BESIDE_SUFFIX.lock().unwrap_or_else(PoisonError::into_inner) = suffix;
-    Ok(())
-}
-
-/// Run sessions into the canonical destination `root` with `--beside` at
-/// `suffix` (`Some(None)`: off for this root; `None`: the process setting
-/// again). Test hook.
+/// Run sessions into the canonical destination `root` with `settings`
+/// (`Some(None)`: off for this root; `None`: the process setting again).
+/// Test hook.
 #[doc(hidden)]
-pub fn set_beside(root: &Path, suffix: Option<Option<Vec<u8>>>) {
-    let mut overrides = BESIDE_OVERRIDE
+pub fn set_consolidate_for(root: &Path, settings: Option<Option<Consolidation>>) {
+    let mut overrides = CONSOLIDATE_OVERRIDE
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     overrides.retain(|(at, _)| at != root);
-    if let Some(suffix) = suffix {
-        overrides.push((root.to_path_buf(), suffix));
+    if let Some(settings) = settings {
+        overrides.push((root.to_path_buf(), settings.map(Arc::new)));
     }
 }
 
-/// The `--beside` suffix sessions into the canonical destination `root`
-/// run with.
-fn beside_suffix(root: &Path) -> Option<Vec<u8>> {
-    BESIDE_OVERRIDE
+/// The consolidation sessions into the canonical destination `root` run
+/// with.
+fn consolidation(root: &Path) -> Option<Arc<Consolidation>> {
+    CONSOLIDATE_OVERRIDE
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .iter()
         .find(|(at, _)| at == root)
         .map_or_else(
             || {
-                BESIDE_SUFFIX
+                CONSOLIDATE
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .clone()
             },
-            |(_, suffix)| suffix.clone(),
+            |(_, settings)| settings.clone(),
         )
 }
 
-/// Seats that land beside under `--beside` whatever their live path holds,
-/// absent included (`estate-move`'s Codex index, review of #280 finding 6:
-/// the live index is never written by a pull, and the snapshot a pass
-/// takes is always at `state_5.sqlite<suffix>`). Relative paths.
-static BESIDE_ALWAYS: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
-
-/// Land the seats at `paths` beside under `--beside` whatever their live
-/// path holds (an empty list: none).
-pub fn set_beside_always(paths: Vec<Vec<u8>>) {
-    *BESIDE_ALWAYS.lock().unwrap_or_else(PoisonError::into_inner) = paths;
-}
-
-fn beside_always() -> HashSet<Vec<u8>> {
-    BESIDE_ALWAYS
+/// Whether this process's sessions only plan (`--plan-only`): nothing is
+/// written, and a recorded verb records nothing.
+#[must_use]
+pub fn plan_only() -> bool {
+    CONSOLIDATE
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .iter()
-        .cloned()
-        .collect()
+        .as_ref()
+        .is_some_and(|settings| settings.plan_only)
 }
 
-/// Consolidation of append logs ([`consolidate`]) for every session of this
-/// process (`estate-move --sessions`).
-static CONSOLIDATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Why an append log that diverged is held: its union is the #294 lane's.
+const APPEND_LOG_PENDING: &str = "append-log: diverged, and the JSONL union (#294) has not landed";
+/// Why a `SQLite` store (or its `-wal`, `-shm`, `-journal`) is held: its
+/// union is the #278 lane's row stream (`--sqlite-rows`), never this file
+/// path.
+const SQLITE_PENDING: &str = "sqlite: the row union (#278) has not landed";
+/// Why a transcript the destination holds under another project key is
+/// held: a second copy of one session is a duplicate (SPEC rule 3), and
+/// the re-seat, which knows the session's lane, decides its one file.
+const ELSEWHERE_PENDING: &str = "append-log: the destination holds this session under another key";
+/// Why a live path of another kind is held.
+const OTHER_KIND: &str = "the live path is a link or another kind";
 
-/// The archive roots an append log's live link may point into
-/// ([`set_consolidate_archives`]).
-static CONSOLIDATE_ARCHIVES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-
-/// Set the archive roots (`--replace-archived-dest`) whose links the
-/// re-seat replaces by a union (A-106).
-///
-/// A consolidated append log whose live path is a link to a regular file
-/// under one of them is landed for that union; any other node of another
-/// kind is refused `DESTINATION_KIND_MISMATCH`.
-pub fn set_consolidate_archives(roots: &[PathBuf]) {
-    *CONSOLIDATE_ARCHIVES
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner) = roots
-        .iter()
-        .map(|root| std::fs::canonicalize(root).unwrap_or_else(|_| root.clone()))
-        .collect();
-}
-
-/// Whether `live` is a link whose target is a regular file under an archive
-/// root ([`set_consolidate_archives`]).
-fn archive_link(live: &Path) -> bool {
-    let Ok(meta) = std::fs::symlink_metadata(live) else {
-        return false;
-    };
-    if !meta.file_type().is_symlink() {
-        return false;
-    }
-    let Ok(target) = std::fs::canonicalize(live) else {
-        return false;
-    };
-    target.is_file()
-        && CONSOLIDATE_ARCHIVES
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .any(|root| target.starts_with(root))
-}
-
-/// Consolidation by canonical destination root, for tests.
-static CONSOLIDATE_OVERRIDE: Mutex<Vec<(PathBuf, bool)>> = Mutex::new(Vec::new());
-
-/// Consolidate append logs in every session of this process under
-/// `--beside` (operator ruling 2026-10-20).
-///
-/// A `.jsonl` seat whose live file is neither its bytes, a prefix of them,
-/// nor holds them is consolidated in place ([`consolidate`]), never landed
-/// beside.
-pub fn set_consolidate(on: bool) {
-    CONSOLIDATE.store(on, Ordering::Relaxed);
-}
-
-/// Consolidation for sessions into the canonical destination `root`
-/// (`None`: the process setting again). Test hook.
-#[doc(hidden)]
-pub fn set_consolidate_root(root: &Path, on: Option<bool>) {
-    let mut overrides = CONSOLIDATE_OVERRIDE
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    overrides.retain(|(at, _)| at != root);
-    if let Some(on) = on {
-        overrides.push((root.to_path_buf(), on));
-    }
-}
-
-/// Whether a seat at `rel_path` in a session into `root` is consolidated
-/// rather than landed beside: consolidation on, and an append log
-/// (`.jsonl`).
-fn consolidates(root: &Path, rel_path: &[u8]) -> bool {
-    let on = CONSOLIDATE_OVERRIDE
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .iter()
-        .find(|(at, _)| at == root)
-        .map_or_else(|| CONSOLIDATE.load(Ordering::Relaxed), |(_, on)| *on);
-    on && rel_path.ends_with(b".jsonl")
-}
-
-/// A test hook run by [`Inbound::consolidate`] after the live file is read
-/// and merged, before the exchange: a destination writer appending then.
-#[cfg(test)]
-type ConsolidateHook = fn(&Path);
-
-#[cfg(test)]
-static CONSOLIDATE_HOOK: Mutex<Vec<(PathBuf, ConsolidateHook)>> = Mutex::new(Vec::new());
-
-#[cfg(test)]
-fn set_consolidate_hook(root: &Path, hook: Option<ConsolidateHook>) {
-    let mut hooks = CONSOLIDATE_HOOK
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    hooks.retain(|(at, _)| at != root);
-    if let Some(hook) = hook {
-        hooks.push((root.to_path_buf(), hook));
-    }
-}
-
-#[cfg(test)]
-fn consolidate_hook(root: &Path, live: &Path) {
-    let hook = CONSOLIDATE_HOOK
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .iter()
-        .find(|(at, _)| at == root)
-        .map(|(_, hook)| *hook);
-    if let Some(hook) = hook {
-        hook(live);
-    }
+/// One seat's planned action under `--plan-only`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedSeat {
+    pub rel_path: Vec<u8>,
+    /// [`crate::consolidate::Class::word`], or `symlink`.
+    pub class: &'static str,
+    /// `create`, `adopt`, `extend`, `covered`, `consolidate` or `hold`.
+    pub action: &'static str,
+    pub source_size: u64,
+    /// The live file's size, when there is one.
+    pub live_size: Option<u64>,
+    /// Why it is held.
+    pub reason: Option<&'static str>,
 }
 
 /// The prefixes of the seats a session lists ([`TransferStats::listed`]).
@@ -1599,41 +1457,6 @@ fn listing() -> Vec<Vec<u8>> {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .clone()
-}
-
-/// `rel_path` with the beside `suffix` appended.
-#[must_use]
-pub fn beside_path(rel_path: &[u8], suffix: &[u8]) -> Vec<u8> {
-    let mut beside = Vec::with_capacity(rel_path.len() + suffix.len());
-    beside.extend_from_slice(rel_path);
-    beside.extend_from_slice(suffix);
-    beside
-}
-
-/// `row` at its beside path: the same seat, named `<path><suffix>`.
-fn beside_row(row: &RowSchema, suffix: &[u8]) -> RowSchema {
-    RowSchema {
-        rel_path: beside_path(&row.rel_path, suffix),
-        ..row.clone()
-    }
-}
-
-use crate::transfer_store::BESIDE_KEY_MARK;
-
-/// The row key of a seat's beside output from its live row key: the keys
-/// of one path share the path's prefix ([`transfer_store::path_prefix`]),
-/// so the beside key is the same key under the beside path, then
-/// [`BESIDE_KEY_MARK`]. Holds for the row key and the snapshot key alike;
-/// the row still decodes from the front.
-fn beside_key(authority: &[u8], key: &[u8], rel_path: &[u8], beside: &[u8]) -> Result<Vec<u8>> {
-    let live = crate::transfer_store::path_prefix(authority, rel_path)?;
-    let rest = key
-        .strip_prefix(live.as_slice())
-        .ok_or(BulkloadRefusal::ContractSelfInconsistent)?;
-    let mut out = crate::transfer_store::path_prefix(authority, beside)?;
-    out.extend_from_slice(rest);
-    out.extend_from_slice(BESIDE_KEY_MARK);
-    Ok(out)
 }
 
 /// The delta lever by canonical destination root, for tests that compare
@@ -4586,6 +4409,8 @@ struct ReceiveContext<'a> {
     displaced: &'a SharedDisplaced,
     session: &'a SessionChunks,
     salvage: &'a Salvage,
+    /// `--consolidate` ([`Consolidation`]).
+    consolidate: Option<&'a Consolidation>,
 }
 
 /// Chunks of this store's orphaned temporaries (see
@@ -4660,39 +4485,15 @@ fn finish_receive(
     stats: &mut TransferStats,
     salvage_staged: &HashMap<Vec<u8>, Vec<usize>>,
     (sidecars, snapshot_bases): (&[SidecarReport], &HashSet<Vec<u8>>),
-    beside_of: &HashMap<Vec<u8>, Vec<u8>>,
 ) -> Result<()> {
     for (rel_path, outcome) in committer.finish()? {
-        // A consolidation whose live file moved before its exchange (a
-        // writer appended): nothing was replaced, and the next pass merges
-        // again (rerun-only).
-        let outcome = match outcome {
-            Err(BulkloadRefusal::DestinationOccupied)
-                if stats.consolidated.iter().any(|done| done.path == rel_path) =>
-            {
-                Err(BulkloadRefusal::DestinationUnsettled)
-            }
-            other => other,
-        };
-        // A publication under a beside path (`--beside`) is the source
-        // path's outcome: accounted `applied-beside` once committed, and
-        // refused under the source's name otherwise.
-        match (beside_of.get(&rel_path), outcome) {
-            (Some(source), Ok(())) => {
-                stats.completed += 1;
-                stats.applied_beside.push((source.clone(), rel_path));
-            }
-            (Some(source), Err(refusal)) => stats.refuse_here(source.clone(), &refusal),
-            (None, Ok(())) => stats.completed += 1,
-            (None, Err(refusal)) => stats.refuse_here(rel_path, &refusal),
+        match outcome {
+            Ok(()) => stats.completed += 1,
+            Err(refusal) => stats.refuse_here(rel_path, &refusal),
         }
     }
-    stats.applied_beside.sort();
-    stats.applied_beside.dedup();
-    counters::add(
-        Counter::DestAppliedBeside,
-        stats.applied_beside.len() as u64,
-    );
+    stats.consolidated.sort();
+    stats.consolidated.dedup();
     resolve_sidecars(stats, sidecars, snapshot_bases);
     let keep = salvage_to_keep(target, stats, salvage_staged);
     target.retire_salvaged(&keep)?;
@@ -4721,10 +4522,6 @@ fn finish_receive(
         .collect();
     counters::add(Counter::DestPrefixExtended, extended.len() as u64);
     stats.prefix_extended = extended;
-    // A consolidation counts once its group committed.
-    stats
-        .consolidated
-        .retain(|done| !refused.contains(done.path.as_slice()));
     if stats.refusals.is_empty() {
         target.finish_directories(store)?;
     }
@@ -5555,12 +5352,6 @@ struct Inbound<'a, W> {
     /// Entries queued for their group commit, by relative path, awaiting
     /// `Held` (#77 round 2, N1), and the committer's per-group outcomes.
     pending_held: HashMap<Vec<u8>, u64>,
-    /// Entries answered without a publication (an append log consolidated
-    /// by the union, or covered by it): `Held` is sent at their `End`.
-    answered: HashSet<Vec<u8>>,
-    /// The consolidation ledger (`consolidate.sqlite` in the state), opened
-    /// at the first union.
-    union_ledger: Option<crate::consolidate::Ledger>,
     committed: Receiver<crate::materialize::GroupOutcomes>,
     /// The source has offered every entry.
     walk_done: bool,
@@ -5596,31 +5387,23 @@ struct Inbound<'a, W> {
     sidecars: Vec<SidecarReport>,
     /// Bases published from a snapshot, or reused or adopted as one.
     snapshot_bases: HashSet<Vec<u8>>,
-    /// `--beside SUFFIX` for this session's root ([`beside_suffix`]).
-    beside: Option<Vec<u8>>,
-    /// Publications queued under a beside path, by that path, with the
-    /// source path each stands for: the committer's outcomes name the
-    /// beside path, the session's report names the source's.
-    beside_of: HashMap<Vec<u8>, Vec<u8>>,
-    /// `--beside` (review of #280, finding 4): the destination paths ending
-    /// with the suffix that this session already decided to write, a seat's
-    /// own live path or another seat's beside path. A second claim of one is
-    /// that seat's `DESTINATION_OCCUPIED`, never two publications of one
-    /// name. Only suffixed names are kept, so it stays small.
-    claimed: HashSet<Vec<u8>>,
-    /// `--beside`: seats landed beside whatever their live path holds
-    /// ([`set_beside_always`]).
-    always: HashSet<Vec<u8>>,
-    /// `--beside` (second review of #280, finding 5): directories whose live
-    /// path holds a symlink or another kind, landed beside, by live path:
-    /// every entry under one is decided under its beside directory.
-    redirects: HashMap<Vec<u8>, Vec<u8>>,
+    /// The listing prefixes ([`set_listing`]).
+    listing: Vec<Vec<u8>>,
+    /// `--consolidate` for this session's root ([`consolidation`]).
+    consolidate: Option<Arc<Consolidation>>,
+    /// The consolidation ledger, opened at the first union.
+    consolidate_ledger: Option<crate::consolidate::Ledger>,
+    /// Set when an entry's end answered it itself (a consolidation, or a
+    /// plan): `Held` with this value is sent at once, never awaited from a
+    /// group commit.
+    answered_now: Option<bool>,
+    /// `--consolidate`: the destination's `projects/<key>/<name>` names, by
+    /// name, with their keys, read once at the first transcript decided.
+    elsewhere: Option<HashMap<Vec<u8>, Vec<Vec<u8>>>>,
     /// `--map-prefix` for this session's root ([`map::for_root`]): every
     /// source path the walk offers is landed at its mapped path, or refused
     /// by the owner rule ([`PrefixMap::land`]).
     maps: PrefixMap,
-    /// The listing prefixes ([`set_listing`]).
-    listing: Vec<Vec<u8>>,
 }
 
 /// A walk frame: what a batch of new directories holds back.
@@ -5923,7 +5706,7 @@ fn receive_session<R: Read, W: Write>(
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .any(|root| root == target.path());
-        let beside = beside_suffix(target.path());
+        let consolidate = consolidation(target.path());
         let mut receiver = Inbound {
             output,
             hand,
@@ -5946,8 +5729,6 @@ fn receive_session<R: Read, W: Write>(
             salvage: Salvage::default(),
             salvage_staged: HashMap::new(),
             pending_held: HashMap::new(),
-            answered: HashSet::new(),
-            union_ledger: None,
             committed: group_outcomes,
             walk_done: false,
             granted: CREDIT_WINDOW,
@@ -5968,13 +5749,12 @@ fn receive_session<R: Read, W: Write>(
             leaf: landing.leaf,
             sidecars: Vec::new(),
             snapshot_bases: HashSet::new(),
-            beside,
-            beside_of: HashMap::new(),
-            claimed: HashSet::new(),
-            always: beside_always(),
-            redirects: HashMap::new(),
-            maps,
             listing: listing(),
+            consolidate,
+            consolidate_ledger: None,
+            answered_now: None,
+            elsewhere: None,
+            maps,
         };
         drop(setup_timer);
         let source_bytes_read = {
@@ -5988,7 +5768,6 @@ fn receive_session<R: Read, W: Write>(
             pool,
             sidecars,
             snapshot_bases,
-            beside_of,
             ..
         } = receiver;
         drop(pool);
@@ -5999,18 +5778,10 @@ fn receive_session<R: Read, W: Write>(
             salvage_staged,
             sidecars,
             snapshot_bases,
-            beside_of,
         ))
     });
-    let (
-        source_bytes_read,
-        mut stats,
-        session,
-        salvage_staged,
-        sidecars,
-        snapshot_bases,
-        beside_of,
-    ) = streamed?;
+    let (source_bytes_read, mut stats, session, salvage_staged, sidecars, snapshot_bases) =
+        streamed?;
     let _tail_timer = PhaseTimer(&RECV_TAIL_NS, Instant::now());
     stats.source_bytes_read = source_bytes_read;
     drop(session);
@@ -6021,7 +5792,6 @@ fn receive_session<R: Read, W: Write>(
         &mut stats,
         &salvage_staged,
         (&sidecars, &snapshot_bases),
-        &beside_of,
     )?;
     Ok(stats)
 }
@@ -6193,7 +5963,8 @@ impl<W: Write> Inbound<'_, W> {
     /// directories (see [`DirectoryBatch`]).
     fn walked(&mut self, frame: Walked) -> Result<()> {
         let cap = self.target.batch();
-        if cap <= 1 {
+        // A plan creates nothing: no directory is batched.
+        if cap <= 1 || self.planning() {
             return self.handle_walked(frame);
         }
         let directory = match &frame {
@@ -6268,7 +6039,6 @@ impl<W: Write> Inbound<'_, W> {
                 if matches!(row.kind, FileKind::Regular | FileKind::Symlink) {
                     self.list(&row.rel_path);
                 }
-                let row = self.redirected(row);
                 self.entry(entry, row, wal)
             }
             // A source path the walk refused or skipped is still the
@@ -6416,7 +6186,6 @@ impl<W: Write> Inbound<'_, W> {
     /// is refused `DESTINATION_OCCUPIED` (R5): a snapshot published there
     /// could be rolled back or overlaid by it. The check reads only this
     /// side, so it is not remembered; removing the sidecar converges.
-    #[allow(clippy::too_many_lines)] // One arm per kind; `--beside` for symlinks and reuse.
     fn entry(&mut self, entry: u64, row: RowSchema, wal: Option<SidecarId>) -> Result<()> {
         let census_started = Instant::now();
         let snapshot_mode = self.sqlite == SqliteMode::Snapshot;
@@ -6433,6 +6202,13 @@ impl<W: Write> Inbound<'_, W> {
             None
         };
         let decided = match row.kind {
+            // `--plan-only`: a directory is never created, a symlink never
+            // made; each is reported.
+            FileKind::Directory if self.planning() => Ok(Decision::Skip),
+            FileKind::Symlink if self.planning() => {
+                self.plan_symlink(&row);
+                Ok(Decision::Skip)
+            }
             FileKind::Directory => self.batched.remove(&row.rel_path).map_or_else(
                 || self.decide_directory(&row),
                 |created| created.map(|()| Decision::Skip),
@@ -6705,15 +6481,6 @@ impl<W: Write> Inbound<'_, W> {
         if refused == RefusedOutput::Occupied && self.may_extend(row)? {
             return Ok(None);
         }
-        // `--beside`: an occupied path is no longer the end of the entry; it
-        // lands beside, unless its beside path was refused too and is
-        // unchanged since (review of #280, finding 3).
-        if self.beside.is_some()
-            && matches!(refused, RefusedOutput::Occupied | RefusedOutput::NotPrefix)
-            && !self.beside_refusal_stands(row, key, None)?
-        {
-            return Ok(None);
-        }
         counters::bump(Counter::TransferRefusedOutputsRemembered);
         Ok(Some(refused))
     }
@@ -6731,118 +6498,22 @@ impl<W: Write> Inbound<'_, W> {
             .is_some_and(|(file, _)| extend_candidate(&file, row, root).is_some()))
     }
 
-    /// `row` under the beside directory of its nearest redirected ancestor
-    /// (second review of #280, finding 5), or as it is.
-    fn redirected(&self, mut row: RowSchema) -> RowSchema {
-        row.rel_path = self.redirected_path(std::mem::take(&mut row.rel_path));
-        row
-    }
-
-    /// `path` under the beside directory of its nearest redirected
-    /// ancestor, or as it is.
-    fn redirected_path(&self, path: Vec<u8>) -> Vec<u8> {
-        if self.redirects.is_empty() {
-            return path;
-        }
-        let mut cut = None;
-        for (at, byte) in path.iter().enumerate() {
-            if *byte == b'/' {
-                if let Some(beside) = path.get(..at).and_then(|dir| self.redirects.get(dir)) {
-                    cut = Some((at, beside.clone()));
-                }
-            }
-        }
-        match cut {
-            Some((at, mut beside)) => {
-                beside.extend_from_slice(path.get(at..).unwrap_or_default());
-                beside
-            }
-            None => path,
-        }
-    }
-
-    /// A directory seat: made, or entered when it is there. Under
-    /// `--beside` a live path holding a symlink or another kind (sting's
-    /// `~/.claude/file-history/<uuid>` links into a repair tree; second
-    /// review of #280, finding 5) gets the directory beside it, at
-    /// `<path><SUFFIX>`, accounted `applied-beside`, and every entry under
-    /// it is decided there; the link is never followed or replaced.
+    /// A directory seat: created, or entered when it is there.
     fn decide_directory(&mut self, row: &RowSchema) -> Result<Decision> {
-        if !self.claim(&row.rel_path) {
-            return Err(BulkloadRefusal::DestinationOccupied);
-        }
-        match self.target.directory(row, self.store, &self.authority) {
-            Err(BulkloadRefusal::DestinationOccupied) if self.beside.is_some() => {
-                let suffix = self.beside.clone().unwrap_or_default();
-                let beside = beside_row(row, &suffix);
-                if !self.claim(&beside.rel_path) {
-                    return Err(BulkloadRefusal::DestinationOccupied);
-                }
-                self.target
-                    .directory(&beside, self.store, &self.authority)?;
-                self.redirects
-                    .insert(row.rel_path.clone(), beside.rel_path.clone());
-                self.stats
-                    .applied_beside
-                    .push((row.rel_path.clone(), beside.rel_path));
-                Ok(Decision::Skip)
-            }
-            other => other.map(|()| Decision::Skip),
-        }
+        self.target
+            .directory(row, self.store, &self.authority)
+            .map(|()| Decision::Skip)
     }
 
-    /// `--beside` (review of #280, finding 4): claim `path` for this
-    /// session when it ends with the suffix. `false` when it is claimed
-    /// already: a second seat would write the same name.
-    fn claim(&mut self, path: &[u8]) -> bool {
-        match &self.beside {
-            Some(suffix) if path.ends_with(suffix) => self.claimed.insert(path.to_vec()),
-            _ => true,
-        }
-    }
-
-    /// `--beside` (finding 4): the beside name a planned entry writes is
-    /// claimed for the rest of the session.
-    fn claim_planned(&mut self, plan: &Plan) {
-        match plan {
-            Plan::Write(Staging {
-                beside: Some(beside),
-                ..
-            })
-            | Plan::Adopt(_, _, _, Some(beside)) => {
-                self.claimed.insert(beside.clone());
-            }
-            _ => {}
-        }
-    }
-
-    /// A symlink seat: created, or adopted when it is the same link. Under
-    /// `--beside` a live path holding something else gets the link beside
-    /// it (or adopts it there); the live path is never replaced.
+    /// A symlink seat: created, or adopted when it is the same link.
     fn decide_symlink(&mut self, row: &RowSchema) -> Result<Decision> {
-        if !self.claim(&row.rel_path) {
-            return Err(BulkloadRefusal::DestinationOccupied);
-        }
-        match self.target.symlink(row) {
-            Err(BulkloadRefusal::DestinationOccupied) if self.beside.is_some() => {
-                let suffix = self.beside.clone().unwrap_or_default();
-                let beside = beside_row(row, &suffix);
-                if !self.claim(&beside.rel_path) {
-                    return Err(BulkloadRefusal::DestinationOccupied);
-                }
-                self.target.symlink(&beside)?;
-                self.stats
-                    .applied_beside
-                    .push((row.rel_path.clone(), beside.rel_path));
-                Ok(Decision::Skip)
-            }
-            other => other.map(|()| Decision::Skip),
-        }
+        self.target.symlink(row).map(|()| Decision::Skip)
     }
 
-    /// Decide a regular seat (see [`Self::entry`]). Under `--beside` a live
-    /// path holding a node of another kind (a symlink, review of #280
-    /// finding 5) is no refusal: its content is asked for and lands beside.
+    /// A regular seat: reused, refused as remembered, adopted from a
+    /// capture record, or asked for by manifest or stream. Under
+    /// `--consolidate` it is decided by its class
+    /// ([`Self::decide_consolidating`]).
     fn decide_regular(
         &mut self,
         row: &RowSchema,
@@ -6850,21 +6521,10 @@ impl<W: Write> Inbound<'_, W> {
         snapshot: Option<&(Vec<u8>, [u8; 32])>,
         snapshot_mode: bool,
     ) -> Result<Decision> {
-        if !self.claim(&row.rel_path) {
-            return Err(BulkloadRefusal::DestinationOccupied);
+        if let Some(settings) = self.consolidate.clone() {
+            return self.decide_consolidating(row, key, &settings);
         }
-        // A seat landed beside whatever its live path holds is decided as
-        // one whose live path holds another kind: its beside path alone.
-        let (identity, other_kind) = if self.lands_beside_always(row) {
-            (None, true)
-        } else {
-            match self.target.identity(row) {
-                Err(
-                    BulkloadRefusal::DestinationOccupied | BulkloadRefusal::DestinationKindMismatch,
-                ) if self.beside.is_some() => (None, true),
-                found => (found?, false),
-            }
-        };
+        let identity = self.target.identity(row)?;
         if let Some(identity) = &identity {
             if let Some((snapshot_key, _)) = snapshot {
                 if self.store.output_matches(snapshot_key, identity)? {
@@ -6877,16 +6537,6 @@ impl<W: Write> Inbound<'_, W> {
                 self.stats.reused += 1;
                 return Ok(Decision::Reuse);
             }
-        }
-        // `--beside`: this seat's output already beside the live path, from
-        // an earlier pass, is reused like any output of this store (S3), and
-        // stays accounted.
-        if identity.is_some() || other_kind {
-            if let Some(reused) = self.reuse_beside(row, key, snapshot)? {
-                return Ok(reused);
-            }
-        }
-        if let Some(identity) = &identity {
             // Refused before for what the path holds, and neither the seat
             // nor that file has moved since: the same answer, and the
             // source reads nothing for it (R25). Asked ahead of the capture
@@ -6894,12 +6544,6 @@ impl<W: Write> Inbound<'_, W> {
             // prove it either, and proving hashes the whole output.
             for remembered in std::iter::once(key).chain(snapshot.map(|(k, _)| k.as_slice())) {
                 if let Some(refused) = self.remembered_refusal(row, remembered, identity)? {
-                    // The live file held the seat's bytes and more, and
-                    // neither has moved (#280 finding 9): nothing to land.
-                    if refused == RefusedOutput::DestAhead {
-                        self.stats.dest_ahead.push(row.rel_path.clone());
-                        return Ok(Decision::Reuse);
-                    }
                     return Err(refused.refusal());
                 }
             }
@@ -6907,138 +6551,208 @@ impl<W: Write> Inbound<'_, W> {
                 return Ok(Decision::Reuse);
             }
         }
-        let live_sidecar = snapshot_mode && self.target.sqlite_sidecars_present(&row.rel_path)?;
-        // Under `--beside` a snapshot whose path has a sidecar beside it is
-        // asked for and lands beside (decided when its content is planned,
-        // where the beside path is checked the same way).
-        if live_sidecar && self.beside.is_none() {
-            return Err(BulkloadRefusal::DestinationOccupied);
-        }
-        // `--beside`, a live path of another kind or with a live sidecar: a
-        // beside path refused before for what it holds, unchanged since, is
-        // refused again with nothing read (review of #280, finding 3).
-        if (other_kind || live_sidecar) && self.beside_refusal_stands(row, key, snapshot)? {
+        if snapshot_mode && self.target.sqlite_sidecars_present(&row.rel_path)? {
             return Err(BulkloadRefusal::DestinationOccupied);
         }
         let keys =
             std::iter::once(key).chain(snapshot.map(|(snapshot_key, _)| snapshot_key.as_slice()));
-        Ok(
-            if self.wants_manifest(row, identity.is_some() || other_kind, keys)? {
-                Decision::WantManifest
-            } else {
-                Decision::Send
-            },
-        )
+        Ok(if self.wants_manifest(row, identity.is_some(), keys)? {
+            Decision::WantManifest
+        } else {
+            Decision::Send
+        })
     }
 
-    /// Whether `row` lands beside under `--beside` whatever its live path
-    /// holds ([`set_beside_always`]).
-    fn lands_beside_always(&self, row: &RowSchema) -> bool {
-        self.beside.is_some() && self.always.contains(&row.rel_path)
+    /// Whether this session only plans (`--plan-only`).
+    fn planning(&self) -> bool {
+        self.consolidate
+            .as_ref()
+            .is_some_and(|settings| settings.plan_only)
     }
 
-    /// `--beside` (review of #280, finding 3): whether the seat's beside path
-    /// still holds the file a beside landing was refused for
-    /// ([`RefusedOutput::BesideOccupied`], under its beside key and that
-    /// file's identity), by the row key or the snapshot key.
-    fn beside_refusal_stands(
-        &self,
-        row: &RowSchema,
-        key: &[u8],
-        snapshot: Option<&(Vec<u8>, [u8; 32])>,
-    ) -> Result<bool> {
-        let Some(suffix) = &self.beside else {
-            return Ok(false);
-        };
-        let beside = beside_row(row, suffix);
-        let identity = match self.target.identity(&beside) {
-            Ok(Some(identity)) => identity,
-            Ok(None)
-            | Err(
-                BulkloadRefusal::DestinationOccupied | BulkloadRefusal::DestinationKindMismatch,
-            ) => return Ok(false),
-            Err(refusal) => return Err(refusal),
-        };
-        for candidate in std::iter::once(key).chain(snapshot.map(|(k, _)| k.as_slice())) {
-            let key_beside =
-                beside_key(&self.authority, candidate, &row.rel_path, &beside.rel_path)?;
-            if self.store.refused_output(&key_beside, &identity)?
-                == Some(RefusedOutput::BesideOccupied)
-            {
-                counters::bump(Counter::TransferRefusedOutputsRemembered);
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    /// `--beside` (review of #280, finding 3): remember that this seat's
-    /// beside landing was refused, under its live key for what the live
-    /// path holds (`live`, when it is a file) and under its beside key for
-    /// what the beside path holds, so an unchanged rerun reads nothing.
-    fn remember_beside_refusal(
-        &self,
-        (row, key, racy): (&RowSchema, &[u8], bool),
-        live: Option<(StatIdentity, RefusedOutput)>,
-        beside: Option<StatIdentity>,
-    ) {
-        if let Some((identity, refused)) = live {
-            self.remember_refusal(key, Some(identity), racy, refused);
-        }
-        let Some(suffix) = &self.beside else {
-            return;
-        };
-        let beside_rel = beside_path(&row.rel_path, suffix);
-        if let Ok(key_beside) = beside_key(&self.authority, key, &row.rel_path, &beside_rel) {
-            self.remember_refusal(&key_beside, beside, racy, RefusedOutput::BesideOccupied);
-        }
-    }
-
-    /// `--beside`: `Reuse` when this seat's output already sits beside the
-    /// live file under its beside row (an earlier pass placed it there),
-    /// by the row key or, in `snapshot` mode, the snapshot key. The seat is
-    /// accounted `applied-beside` again, so the record of this session
-    /// keeps naming it.
-    fn reuse_beside(
+    /// `--consolidate` (operator ruling 2026-10-20): a regular seat, decided
+    /// by its class. A `SQLite` store (and its sidecars) is the row union's,
+    /// never this file path's, and is held until that union lands; a live
+    /// path of another kind is held; a seat consolidated before, or this
+    /// store's own output, is reused; one refused before against the same
+    /// live file is refused again with nothing read. An absent live path is
+    /// landed as before; any other is asked for by manifest and judged when
+    /// it arrives ([`plan_consolidating`]).
+    fn decide_consolidating(
         &mut self,
         row: &RowSchema,
         key: &[u8],
-        snapshot: Option<&(Vec<u8>, [u8; 32])>,
-    ) -> Result<Option<Decision>> {
-        let Some(suffix) = self.beside.clone() else {
-            return Ok(None);
-        };
-        let beside = beside_row(row, &suffix);
-        let identity = match self.target.identity(&beside) {
-            Ok(Some(identity)) => identity,
-            Ok(None)
-            | Err(
+        settings: &Consolidation,
+    ) -> Result<Decision> {
+        use crate::consolidate::{union_of, Class};
+        let class = Class::of(&row.rel_path, false);
+        let plan = settings.plan_only;
+        if class == Class::Sqlite && union_of(class).is_none() {
+            return self.hold_seat(row, class, None, SQLITE_PENDING, plan);
+        }
+        let identity = match self.target.identity(row) {
+            Ok(identity) => identity,
+            Err(
                 BulkloadRefusal::DestinationOccupied | BulkloadRefusal::DestinationKindMismatch,
-            ) => return Ok(None),
+            ) => {
+                return self.hold_seat(row, class, None, OTHER_KIND, plan);
+            }
+            // A plan creates no directory: one the seat would be landed in
+            // is still absent.
+            Err(
+                BulkloadRefusal::Io(Some(libc::ENOENT)) | BulkloadRefusal::DestinationParentMissing,
+            ) if plan => None,
             Err(refusal) => return Err(refusal),
         };
-        for (candidate, is_snapshot) in snapshot
-            .map(|(snapshot_key, _)| (snapshot_key.as_slice(), true))
-            .into_iter()
-            .chain(std::iter::once((key, false)))
-        {
-            let key_beside =
-                beside_key(&self.authority, candidate, &row.rel_path, &beside.rel_path)?;
-            if self.store.output_matches(&key_beside, &identity)? {
-                if !self.claim(&beside.rel_path) {
-                    return Err(BulkloadRefusal::DestinationOccupied);
-                }
-                self.stats.reused += 1;
-                if is_snapshot {
-                    self.snapshot_applied(&row.rel_path);
-                }
-                self.stats
-                    .applied_beside
-                    .push((row.rel_path.clone(), beside.rel_path));
-                return Ok(Some(Decision::Reuse));
-            }
+        let live_size = identity.as_ref().map(|identity| identity.size);
+        if self.store.consolidated(key)? {
+            return Ok(self.reuse_seat(row, class, "covered", live_size, plan));
         }
-        Ok(None)
+        let Some(identity) = identity else {
+            // A Claude transcript the destination holds under another
+            // project key (A-106: its archived fork at the lane's key) is
+            // never landed as a second copy (SPEC rule 3).
+            if class == Class::AppendLog && self.held_elsewhere(&row.rel_path) {
+                return self.hold_seat(row, class, None, ELSEWHERE_PENDING, plan);
+            }
+            if plan {
+                self.plan_seat(row, class.word(), "create", None, None);
+                return Ok(Decision::Skip);
+            }
+            return Ok(if self.wants_manifest(row, false, std::iter::once(key))? {
+                Decision::WantManifest
+            } else {
+                Decision::Send
+            });
+        };
+        if self.store.output_matches(key, &identity)? {
+            return Ok(self.reuse_seat(row, class, "adopt", live_size, plan));
+        }
+        if let Some(refused) = self.remembered_refusal(row, key, &identity)? {
+            if plan {
+                self.plan_seat(
+                    row,
+                    class.word(),
+                    "hold",
+                    live_size,
+                    Some("held before, and unchanged since"),
+                );
+                return Ok(Decision::Skip);
+            }
+            return Err(refused.refusal());
+        }
+        Ok(Decision::WantManifest)
+    }
+
+    /// Whether `rel_path`, a transcript `projects/<key>/<name>`, is a name
+    /// the destination holds under another key (a file, a link, anything).
+    fn held_elsewhere(&mut self, rel_path: &[u8]) -> bool {
+        let mut parts = rel_path.split(|byte| *byte == b'/');
+        let (Some(b"projects"), Some(key), Some(name), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return false;
+        };
+        let index = self.elsewhere.get_or_insert_with(|| {
+            use std::os::unix::ffi::OsStrExt as _;
+            let mut index: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
+            let projects = self.target.path().join("projects");
+            for dir in std::fs::read_dir(&projects).into_iter().flatten().flatten() {
+                let key = dir.file_name().as_bytes().to_vec();
+                for file in std::fs::read_dir(dir.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
+                    index
+                        .entry(file.file_name().as_bytes().to_vec())
+                        .or_default()
+                        .push(key.clone());
+                }
+            }
+            index
+        });
+        index
+            .get(name)
+            .is_some_and(|keys| keys.iter().any(|held| held.as_slice() != key))
+    }
+
+    /// A seat reused (or, planning, reported as `action`).
+    fn reuse_seat(
+        &mut self,
+        row: &RowSchema,
+        class: crate::consolidate::Class,
+        action: &'static str,
+        live_size: Option<u64>,
+        plan: bool,
+    ) -> Decision {
+        if plan {
+            self.plan_seat(row, class.word(), action, live_size, None);
+            return Decision::Skip;
+        }
+        self.stats.reused += 1;
+        Decision::Reuse
+    }
+
+    /// A seat held `HOMES_CONSOLIDATE_UNSUPPORTED` at its decision, nothing
+    /// read (or, planning, reported held).
+    fn hold_seat(
+        &mut self,
+        row: &RowSchema,
+        class: crate::consolidate::Class,
+        live_size: Option<u64>,
+        reason: &'static str,
+        plan: bool,
+    ) -> Result<Decision> {
+        if plan {
+            self.plan_seat(row, class.word(), "hold", live_size, Some(reason));
+            return Ok(Decision::Skip);
+        }
+        self.stats.held.push((row.rel_path.clone(), reason));
+        Err(BulkloadRefusal::HomesConsolidateUnsupported)
+    }
+
+    /// Report a seat's planned action (`--plan-only`).
+    fn plan_seat(
+        &mut self,
+        row: &RowSchema,
+        class: &'static str,
+        action: &'static str,
+        live_size: Option<u64>,
+        reason: Option<&'static str>,
+    ) {
+        self.stats.planned.push(PlannedSeat {
+            rel_path: row.rel_path.clone(),
+            class,
+            action,
+            source_size: row.size,
+            live_size,
+            reason,
+        });
+    }
+
+    /// `--plan-only`: a symlink seat, judged by what its live path holds.
+    fn plan_symlink(&mut self, row: &RowSchema) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let live = self
+            .target
+            .path()
+            .join(std::ffi::OsStr::from_bytes(&row.rel_path));
+        let (action, reason) = match std::fs::symlink_metadata(&live) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => ("create", None),
+            Ok(found)
+                if found.file_type().is_symlink()
+                    && std::fs::read_link(&live)
+                        .ok()
+                        .as_deref()
+                        .map(|target| target.as_os_str().as_bytes().to_vec())
+                        == row.link_target =>
+            {
+                ("adopt", None)
+            }
+            _ => ("hold", Some(OTHER_KIND)),
+        };
+        self.plan_seat(row, "symlink", action, None, reason);
     }
 
     /// A refusal of an entry whose path a crashed prefix extension left
@@ -7139,9 +6853,8 @@ impl<W: Write> Inbound<'_, W> {
             }
         };
         // The wire names the source's path: the entry was decided at its
-        // mapped path (`--map-prefix`), under any beside directory of its
-        // ancestors (`--beside`), so the two are compared there.
-        if row.rel_path != self.redirected_path(self.maps.path(rel_path.to_vec())) {
+        // mapped path (`--map-prefix`), so the two are compared there.
+        if row.rel_path != self.maps.path(rel_path.to_vec()) {
             return Err(BulkloadRefusal::ProtocolStateViolation);
         }
         self.stats.refuse(row.rel_path, code, sqlite_code);
@@ -7149,6 +6862,7 @@ impl<W: Write> Inbound<'_, W> {
     }
 
     /// Plan a manifest's entry and request only what cannot be filled here.
+    #[allow(clippy::too_many_lines)] // Validate, plan (and consolidate), ask, file.
     fn manifest(&mut self, entry: u64, root: [u8; 32], chunks: Vec<ChunkSpec>) -> Result<()> {
         if chunks.len() > MAX_MANIFEST_CHUNKS {
             return Err(BulkloadRefusal::FrameCodec);
@@ -7187,16 +6901,14 @@ impl<W: Write> Inbound<'_, W> {
                     displaced: &self.displaced,
                     session: &self.session,
                     salvage: &self.salvage,
+                    consolidate: self.consolidate.as_deref(),
                 },
                 // A snapshot's output is never extended (#218).
                 Planned {
                     row: &row,
                     extend: !snapshot
-                        && extends(self.target.path(), &row.rel_path, self.beside.is_some()),
+                        && prefix_extend_scope(self.target.path()).covers(&row.rel_path),
                     snapshot,
-                    beside: self.beside.as_deref(),
-                    claimed: &self.claimed,
-                    always: self.lands_beside_always(&row),
                 },
                 &manifest,
                 &mut salvaged_from,
@@ -7223,10 +6935,10 @@ impl<W: Write> Inbound<'_, W> {
             | Plan::Adopt(..)
             | Plan::NoExchange(_)
             | Plan::NotPrefix(_)
-            | Plan::BesideRefused { .. }
-            | Plan::DestAhead(_) => (Vec::new(), None),
+            | Plan::Covered
+            | Plan::Held { .. }
+            | Plan::Dry(_) => (Vec::new(), None),
         };
-        self.claim_planned(&plan);
         write_control(
             self.output,
             &Control::NeedChunks {
@@ -7435,6 +7147,7 @@ impl<W: Write> Inbound<'_, W> {
         // Every write of the entry lands before its file is checked,
         // published or discarded (item 3): its submit, so its seal, follows.
         self.settle_entry(entry)?;
+        self.answered_now = None;
         let incoming = self
             .incoming
             .remove(&entry)
@@ -7461,9 +7174,6 @@ impl<W: Write> Inbound<'_, W> {
                 {
                     return Err(BulkloadRefusal::ProtocolStateViolation);
                 }
-                if let Plan::DestAhead(identity) = &filling.plan {
-                    return self.end_dest_ahead(entry, &filling.row, &filling.key, *identity, racy);
-                }
                 let rel_path = filling.row.rel_path.clone();
                 let snapshot = filling.snapshot;
                 (rel_path, snapshot, self.end_filling(filling, racy))
@@ -7477,22 +7187,22 @@ impl<W: Write> Inbound<'_, W> {
         // commit has drained them, so the bytes are durable here under the
         // final name (#77 round 2, N1). Only then may the source record the
         // capture, which therefore never costs a source read again. An
-        // output queued under its beside path (`--beside`) is awaited
-        // under that path, which the committer's outcome names.
+        // entry a consolidation (or a plan) answered itself is answered now:
+        // nothing of it waits on a group commit.
+        let answered = self.answered_now.take();
         match outcome {
-            Ok(None) if self.answered.remove(&rel_path) => {
+            Ok(()) if answered.is_some() => {
                 self.release(entry);
-                write_control(self.output, &Control::Held { entry, held: false })?;
+                write_control(
+                    self.output,
+                    &Control::Held {
+                        entry,
+                        held: answered.unwrap_or(false),
+                    },
+                )?;
             }
-            Ok(beside) => {
-                let held_as = match beside {
-                    Some(beside) => {
-                        self.beside_of.insert(beside.clone(), rel_path);
-                        beside
-                    }
-                    None => rel_path,
-                };
-                self.pending_held.insert(held_as, entry);
+            Ok(()) => {
+                self.pending_held.insert(rel_path, entry);
             }
             Err(refusal) => {
                 self.refuse(rel_path, &refusal);
@@ -7500,29 +7210,6 @@ impl<W: Write> Inbound<'_, W> {
                 write_control(self.output, &Control::Held { entry, held: false })?;
             }
         }
-        self.settle_held()?;
-        fault_point!(ReceiveAfterEnd);
-        Ok(())
-    }
-
-    /// `--beside` (#280 finding 9): an entry the live file already holds,
-    /// and more ([`Plan::DestAhead`]): accounted `dest-ahead`, nothing
-    /// written, remembered under the file's identity (unless the capture was
-    /// racy), so an unchanged rerun answers it at `Decide` with nothing read.
-    /// Answered `held: false`: no output of this store holds it, so the
-    /// source records no capture for it.
-    fn end_dest_ahead(
-        &mut self,
-        entry: u64,
-        row: &RowSchema,
-        key: &[u8],
-        identity: StatIdentity,
-        racy: bool,
-    ) -> Result<()> {
-        self.remember_refusal(key, Some(identity), racy, RefusedOutput::DestAhead);
-        self.stats.dest_ahead.push(row.rel_path.clone());
-        self.release(entry);
-        write_control(self.output, &Control::Held { entry, held: false })?;
         self.settle_held()?;
         fault_point!(ReceiveAfterEnd);
         Ok(())
@@ -7589,15 +7276,8 @@ impl<W: Write> Inbound<'_, W> {
         self.target.fold_finish()
     }
 
-    /// Returns the beside path when the output was queued under it
-    /// (`--beside`), else `None`.
     #[allow(clippy::too_many_lines)] // Verify, adopt, extend or supersede, stage, publish.
-    fn end_streaming(
-        &mut self,
-        streaming: Streaming,
-        root: [u8; 32],
-        racy: bool,
-    ) -> Result<Option<Vec<u8>>> {
+    fn end_streaming(&mut self, streaming: Streaming, root: [u8; 32], racy: bool) -> Result<()> {
         let Streaming {
             row,
             key,
@@ -7624,42 +7304,38 @@ impl<W: Write> Inbound<'_, W> {
                 }
             });
         let mut supersede = None;
-        let manifest = Manifest {
-            root,
-            chunks: specs,
-        };
+        // `--consolidate`: a streamed entry is judged by its class, as a
+        // planned one is; a plan writes nothing, whatever the path holds.
+        if let Some(settings) = self.consolidate.clone() {
+            let manifest = Manifest {
+                root,
+                chunks: specs.clone(),
+            };
+            let occupied = !matches!(self.target.existing(&row), Ok(None));
+            if checked.is_ok() && (adopt || settings.plan_only) && occupied {
+                return self.end_streamed_consolidating(
+                    staged,
+                    &row,
+                    (key, record, racy, root),
+                    &manifest,
+                    &settings,
+                );
+            }
+            if settings.plan_only {
+                if let Some(staged) = staged {
+                    let _ = staged.discard();
+                }
+                checked?;
+                let class = crate::consolidate::Class::of(&row.rel_path, snapshot);
+                self.plan_seat(&row, class.word(), "create", None, None);
+                self.answered_now = Some(false);
+                return Ok(());
+            }
+        }
         // M2r2 A-103: a grown file with no owning record, extended from the
         // streamed copy (its whole prefix compared, `base` 0).
         let mut grown = None;
-        // `--beside`: the beside path this entry lands at, when the live
-        // path holds other bytes bulkload did not write, or a snapshot's
-        // live path has a sidecar beside it.
-        let mut land_beside: Option<Vec<u8>> = None;
-        let live_sidecar = checked.is_ok()
-            && (self.lands_beside_always(&row)
-                || (snapshot
-                    && self.beside.is_some()
-                    && self.target.sqlite_sidecars_present(&row.rel_path)?));
-        // What the live path's refusal may be remembered as (finding 3).
-        let mut live_refused: Option<(StatIdentity, RefusedOutput)> = None;
-        // Consolidation (ruling 2026-10-20): the streamed seat is merged
-        // with the live append log in place.
-        let mut consolidate_live = false;
-        // `--beside`: a node of another kind at the live path lands beside
-        // (review of #280, finding 5).
-        let other_kind = checked.is_ok()
-            && adopt
-            && self.beside.is_some()
-            && matches!(
-                self.target.existing(&row),
-                Err(BulkloadRefusal::DestinationOccupied | BulkloadRefusal::DestinationKindMismatch)
-            );
-        if live_sidecar || other_kind {
-            land_beside = self
-                .beside
-                .as_deref()
-                .map(|suffix| beside_path(&row.rel_path, suffix));
-        } else if checked.is_ok() && adopt {
+        if checked.is_ok() && adopt {
             // Streamed in place of a manifest: an existing output at the
             // path is adopted against the streamed chunks, as a manifest
             // would have been checked, and the staged copy is dropped. One
@@ -7671,22 +7347,20 @@ impl<W: Write> Inbound<'_, W> {
                 let Some((file, parent)) = existing else {
                     return Ok(None);
                 };
+                let manifest = Manifest {
+                    root,
+                    chunks: specs,
+                };
                 let (verified, settled) =
                     verify_settled(self.target.path(), &file, &row, &manifest);
                 match verified {
                     Ok(identity) => Ok(Some((file, parent, identity))),
                     Err(BulkloadRefusal::DestinationOccupied) => {
-                        // Under `--beside` a live path is never replaced
-                        // (review of #280, finding 1).
-                        supersede = if self.beside.is_some() {
-                            None
-                        } else {
-                            owned_output(self.store, &self.authority, &row, &file)?
-                        };
+                        supersede = owned_output(self.store, &self.authority, &row, &file)?;
                         let root_path = self.target.path();
                         if supersede.is_none()
                             && !snapshot
-                            && extends(root_path, &row.rel_path, self.beside.is_some())
+                            && prefix_extend_scope(root_path).covers(&row.rel_path)
                         {
                             if let Some((identity, prior)) =
                                 extend_candidate(&file, &row, root_path)
@@ -7705,34 +7379,7 @@ impl<W: Write> Inbound<'_, W> {
                                 }
                             }
                         }
-                        if supersede.is_none()
-                            && self.beside.is_some()
-                            && settled.is_none()
-                            && prefix_extend_scope(self.target.path()).covers(&row.rel_path)
-                        {
-                            // `--beside`: an append-only live file a writer
-                            // may be at is judged on a later pass, never
-                            // copied beside now (#280 finding 9 review).
-                            Err(BulkloadRefusal::DestinationUnsettled)
-                        } else if supersede.is_none()
-                            && self.beside.is_some()
-                            && !snapshot
-                            && consolidates(self.target.path(), &row.rel_path)
-                        {
-                            // An append log: consolidated in place, never
-                            // landed beside (ruling 2026-10-20).
-                            consolidate_live = true;
-                            Ok(None)
-                        } else if supersede.is_none() && self.beside.is_some() {
-                            // `--beside`: the streamed copy lands beside.
-                            land_beside = self
-                                .beside
-                                .as_deref()
-                                .map(|suffix| beside_path(&row.rel_path, suffix));
-                            live_refused =
-                                settled.map(|identity| (identity, RefusedOutput::Occupied));
-                            Ok(None)
-                        } else if supersede.is_none() {
+                        if supersede.is_none() {
                             self.note_interrupted(&row.rel_path);
                             self.remember_refusal(&key, settled, racy, RefusedOutput::Occupied);
                             Err(BulkloadRefusal::DestinationOccupied)
@@ -7756,9 +7403,13 @@ impl<W: Write> Inbound<'_, W> {
                     if let Some(staged) = staged {
                         let _ = staged.discard();
                     }
-                    return self
-                        .adopt_settling(file, parent, &row, (key, record, racy, root), identity)
-                        .map(|()| None);
+                    return self.adopt_settling(
+                        file,
+                        parent,
+                        &row,
+                        (key, record, racy, root),
+                        identity,
+                    );
                 }
                 Ok(None) => (),
                 Err(refusal) => {
@@ -7790,7 +7441,7 @@ impl<W: Write> Inbound<'_, W> {
                 (key, record, racy, root),
             );
         }
-        let staged = match (checked, staged) {
+        let mut staged = match (checked, staged) {
             (Ok(()), Some(staged)) => staged,
             // An empty file has no data frame; it is staged here.
             (Ok(()), None) => self.target.stage(&row)?,
@@ -7802,77 +7453,6 @@ impl<W: Write> Inbound<'_, W> {
             }
         };
         fault_point!(ReceiveAfterChunks);
-        if consolidate_live {
-            return self
-                .consolidate(staged, &row, (key, record, racy, root), hints)
-                .map(|()| None);
-        }
-        // `--beside`: the beside path is decided as a planned entry's is;
-        // the staged copy takes the beside name.
-        let (row, key) = match &land_beside {
-            Some(beside_rel) => {
-                // Another seat of this session writes this name (finding 4).
-                if !self.claim(beside_rel) {
-                    let _ = staged.discard();
-                    return Err(BulkloadRefusal::DestinationOccupied);
-                }
-                let beside = RowSchema {
-                    rel_path: beside_rel.clone(),
-                    ..row.clone()
-                };
-                let target = beside_target(
-                    &ReceiveContext {
-                        target: self.target,
-                        store: self.store,
-                        authority: &self.authority,
-                        displaced: &self.displaced,
-                        session: &self.session,
-                        salvage: &self.salvage,
-                    },
-                    &beside,
-                    &manifest,
-                    snapshot,
-                );
-                let key_beside = beside_key(&self.authority, &key, &row.rel_path, beside_rel);
-                match (target, key_beside) {
-                    (Ok(BesideTarget::Fresh), Ok(key_beside)) => (beside, key_beside),
-                    (Ok(BesideTarget::Supersede(owned)), Ok(key_beside)) => {
-                        supersede = Some(*owned);
-                        (beside, key_beside)
-                    }
-                    (Ok(BesideTarget::Adopt(file, parent, identity)), Ok(key_beside)) => {
-                        let _ = staged.discard();
-                        let placed = beside.rel_path.clone();
-                        return self
-                            .adopt(
-                                file,
-                                parent,
-                                &beside,
-                                (key_beside, record, racy, root),
-                                identity,
-                            )
-                            .map(|()| Some(placed));
-                    }
-                    (Err((refusal, settled)), _) => {
-                        let _ = staged.discard();
-                        if refusal == BulkloadRefusal::DestinationOccupied {
-                            self.remember_beside_refusal((&row, &key, racy), live_refused, settled);
-                        }
-                        return Err(refusal);
-                    }
-                    (_, Err(refusal)) => {
-                        let _ = staged.discard();
-                        return Err(refusal);
-                    }
-                }
-            }
-            None => (row, key),
-        };
-        let mut staged = if land_beside.is_some() {
-            staged.with_suffix(self.beside.as_deref().unwrap_or_default())?
-        } else {
-            staged
-        };
         if snapshot {
             if let Err(refusal) = self.verify_snapshot(&staged, &row) {
                 let _ = staged.discard();
@@ -7881,7 +7461,221 @@ impl<W: Write> Inbound<'_, W> {
             staged.mark_sqlite();
         }
         self.publish(staged, &row, (key, record, racy, root), hints, supersede)
-            .map(|()| land_beside)
+    }
+
+    /// `--consolidate`: the live file already holds the seat's bytes; the
+    /// seat is recorded consolidated, so an unchanged one is reused next
+    /// pass. Answered at once: nothing is published.
+    fn covered(&mut self, row: &RowSchema, key: &[u8], racy: bool) -> Result<()> {
+        if !racy {
+            self.store.record_consolidated(key)?;
+        }
+        self.stats
+            .consolidated
+            .push((row.rel_path.clone(), "covered".to_owned()));
+        self.stats.completed += 1;
+        self.answered_now = Some(true);
+        Ok(())
+    }
+
+    /// `--consolidate`: merge the received bytes in `staged` (in memory)
+    /// into the live file by `class`'s union, then drop them. A held union
+    /// is remembered under the live file's identity; any other outcome
+    /// records the seat consolidated and answers it at once.
+    fn consolidate_staged(
+        &mut self,
+        staged: StagedFile,
+        row: &RowSchema,
+        key: &[u8],
+        class: crate::consolidate::Class,
+        racy: bool,
+    ) -> Result<()> {
+        let ran = self.run_union(&staged, row, class);
+        let _ = staged.discard();
+        let (outcome, before) = ran?;
+        match outcome.action {
+            crate::consolidate::Action::Held(reason) => {
+                self.stats.held.push((row.rel_path.clone(), reason));
+                self.remember_refusal(key, before, racy, RefusedOutput::ConsolidateHeld);
+                Err(BulkloadRefusal::HomesConsolidateUnsupported)
+            }
+            action => {
+                if !racy {
+                    self.store.record_consolidated(key)?;
+                }
+                self.stats
+                    .consolidated
+                    .push((row.rel_path.clone(), action.word().to_owned()));
+                self.stats.completed += 1;
+                self.answered_now = Some(true);
+                Ok(())
+            }
+        }
+    }
+
+    /// Run `class`'s union of `staged` into the live file, with the live
+    /// file's identity before it (what a hold is remembered under).
+    fn run_union(
+        &mut self,
+        staged: &StagedFile,
+        row: &RowSchema,
+        class: crate::consolidate::Class,
+    ) -> Result<(crate::consolidate::Outcome, Option<StatIdentity>)> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::ffi::OsStrExt as _;
+        let settings = self
+            .consolidate
+            .clone()
+            .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
+        let before = self
+            .target
+            .existing(row)
+            .ok()
+            .flatten()
+            .and_then(|(file, _)| file.metadata().ok())
+            .map(|found| StatIdentity::from_metadata(&found));
+        let Some(union) = crate::consolidate::union_of(class) else {
+            let reason = if class == crate::consolidate::Class::Sqlite {
+                SQLITE_PENDING
+            } else {
+                APPEND_LOG_PENDING
+            };
+            return Ok((
+                crate::consolidate::Outcome {
+                    action: crate::consolidate::Action::Held(reason),
+                    written: 0,
+                    recorded: 0,
+                },
+                before,
+            ));
+        };
+        if self.consolidate_ledger.is_none() {
+            self.consolidate_ledger = Some(crate::consolidate::Ledger::open(&settings.ledger)?);
+        }
+        let ledger = self
+            .consolidate_ledger
+            .as_ref()
+            .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
+        let live_path = self
+            .target
+            .path()
+            .join(std::ffi::OsStr::from_bytes(&row.rel_path));
+        // An in-memory file has no name: a union that opens by path opens
+        // this one.
+        let source_path = PathBuf::from(format!("/proc/self/fd/{}", staged.file().as_raw_fd()));
+        let outcome = union(
+            &crate::consolidate::Live {
+                dir: staged.parent(),
+                name: staged.leaf(),
+                path: &live_path,
+                rel: &row.rel_path,
+            },
+            &crate::consolidate::Source {
+                file: staged.file(),
+                path: &source_path,
+                size: row.size,
+                mtime_ns: row.mtime_ns,
+                maps: &settings.maps,
+            },
+            ledger,
+        )?;
+        Ok((outcome, before))
+    }
+
+    /// `--consolidate`: an entry streamed in place of its manifest (#77
+    /// review F1) whose live path was occupied when it was decided. Its
+    /// whole content is staged (as a stream is), so it is judged here as a
+    /// planned one is: adopted, covered, merged by a config union, or held.
+    /// Under `--plan-only` it is reported, and nothing is written.
+    fn end_streamed_consolidating(
+        &mut self,
+        staged: Option<StagedFile>,
+        row: &RowSchema,
+        (key, record, racy, root): (Vec<u8>, [u8; 32], bool, [u8; 32]),
+        manifest: &Manifest,
+        settings: &Consolidation,
+    ) -> Result<()> {
+        use crate::consolidate::Class;
+        let class = Class::of(&row.rel_path, false);
+        let drop_staged = |staged: Option<StagedFile>| {
+            if let Some(staged) = staged {
+                let _ = staged.discard();
+            }
+        };
+        let (file, parent) = match self.target.existing(row) {
+            Ok(Some(found)) => found,
+            Ok(None) => {
+                drop_staged(staged);
+                return Err(BulkloadRefusal::ProtocolStateViolation);
+            }
+            Err(_) => {
+                drop_staged(staged);
+                if settings.plan_only {
+                    self.plan_seat(row, class.word(), "hold", None, Some(OTHER_KIND));
+                    self.answered_now = Some(false);
+                    return Ok(());
+                }
+                self.stats.held.push((row.rel_path.clone(), OTHER_KIND));
+                return Err(BulkloadRefusal::HomesConsolidateUnsupported);
+            }
+        };
+        let live_size = file.metadata().ok().map(|found| found.len());
+        let (verified, settled) = verify_settled(self.target.path(), &file, row, manifest);
+        let covered = class == Class::AppendLog
+            && matches!(verified, Err(BulkloadRefusal::DestinationOccupied))
+            && crate::materialize::covers(&file, manifest)?;
+        if settings.plan_only {
+            drop_staged(staged);
+            let (action, reason) = match (&verified, class) {
+                (Ok(_), _) => ("adopt", None),
+                _ if covered => ("covered", None),
+                (_, Class::Config(_)) => ("consolidate", None),
+                (_, Class::AppendLog) if crate::consolidate::union_of(class).is_some() => {
+                    ("consolidate", None)
+                }
+                (_, Class::AppendLog) => ("hold", Some(APPEND_LOG_PENDING)),
+                (_, Class::Sqlite) => ("hold", Some(SQLITE_PENDING)),
+                (_, Class::Opaque) => ("hold", Some("opaque: the bytes differ")),
+            };
+            self.plan_seat(row, class.word(), action, live_size, reason);
+            self.answered_now = Some(false);
+            return Ok(());
+        }
+        match verified {
+            Ok(identity) => {
+                drop_staged(staged);
+                return self.adopt_settling(file, parent, row, (key, record, racy, root), identity);
+            }
+            Err(BulkloadRefusal::DestinationOccupied) => {}
+            Err(refusal) => {
+                drop_staged(staged);
+                return Err(refusal);
+            }
+        }
+        if covered {
+            drop_staged(staged);
+            return self.covered(row, &key, racy);
+        }
+        match (class, staged) {
+            // The class's one union (an append log's is the #294 lane's):
+            // its outcome is acted on, a covered file never rewritten.
+            (Class::Config(_) | Class::AppendLog, Some(staged))
+                if crate::consolidate::union_of(class).is_some() =>
+            {
+                self.consolidate_staged(staged, row, &key, class, racy)
+            }
+            (_, staged) => {
+                drop_staged(staged);
+                let reason = match class {
+                    Class::Sqlite => SQLITE_PENDING,
+                    Class::AppendLog => APPEND_LOG_PENDING,
+                    _ => "opaque: the bytes differ",
+                };
+                self.stats.held.push((row.rel_path.clone(), reason));
+                self.remember_refusal(&key, settled, racy, RefusedOutput::ConsolidateHeld);
+                Err(BulkloadRefusal::HomesConsolidateUnsupported)
+            }
+        }
     }
 
     /// A received snapshot's last checks before it is published (#218):
@@ -7902,10 +7696,7 @@ impl<W: Write> Inbound<'_, W> {
         )
     }
 
-    /// Returns the beside path when the output was queued under it
-    /// (`--beside`), else `None`.
-    #[allow(clippy::too_many_lines)] // One arm per plan; `--beside` for adopt and write.
-    fn end_filling(&mut self, filling: Filling, racy: bool) -> Result<Option<Vec<u8>>> {
+    fn end_filling(&mut self, filling: Filling, racy: bool) -> Result<()> {
         let Filling {
             row,
             key,
@@ -7919,7 +7710,7 @@ impl<W: Write> Inbound<'_, W> {
         let root = manifest.root;
         match plan {
             Plan::Refuse(refusal) => Err(refusal),
-            Plan::Adopt(file, parent, verified, beside) => {
+            Plan::Adopt(file, parent, verified) => {
                 // Verified at the plan: read again only if it moved since.
                 let unmoved = verified.filter(|identity| {
                     file.metadata()
@@ -7930,33 +7721,13 @@ impl<W: Write> Inbound<'_, W> {
                 } else {
                     let (verified, settled) =
                         verify_settled(self.target.path(), &file, &row, &manifest);
-                    if matches!(verified, Err(BulkloadRefusal::DestinationOccupied))
-                        && beside.is_none()
-                    {
+                    if matches!(verified, Err(BulkloadRefusal::DestinationOccupied)) {
                         self.note_interrupted(&row.rel_path);
                         self.remember_refusal(&key, settled, racy, RefusedOutput::Occupied);
                     }
                     verified?
                 };
-                // An adopted beside output is recorded under its own row.
-                let Some(beside_rel) = beside else {
-                    return self
-                        .adopt_settling(file, parent, &row, (key, record, racy, root), identity)
-                        .map(|()| None);
-                };
-                let key_beside = beside_key(&self.authority, &key, &row.rel_path, &beside_rel)?;
-                let beside_row = RowSchema {
-                    rel_path: beside_rel.clone(),
-                    ..row
-                };
-                self.adopt(
-                    file,
-                    parent,
-                    &beside_row,
-                    (key_beside, record, racy, root),
-                    identity,
-                )
-                .map(|()| Some(beside_rel))
+                self.adopt_settling(file, parent, &row, (key, record, racy, root), identity)
             }
             Plan::NotPrefix(identity) => {
                 self.note_interrupted(&row.rel_path);
@@ -7967,18 +7738,17 @@ impl<W: Write> Inbound<'_, W> {
                 self.remember_refusal(&key, settled, racy, RefusedOutput::ExchangeUnsupported);
                 Err(BulkloadRefusal::DestinationExchangeUnsupported)
             }
-            Plan::BesideRefused {
-                refusal,
-                live,
-                beside,
-            } => {
-                if refusal == BulkloadRefusal::DestinationOccupied {
-                    self.remember_beside_refusal((&row, &key, racy), live, beside);
-                }
-                Err(refusal)
+            Plan::Covered => self.covered(&row, &key, racy),
+            Plan::Held { identity, reason } => {
+                self.stats.held.push((row.rel_path.clone(), reason));
+                self.remember_refusal(&key, identity, racy, RefusedOutput::ConsolidateHeld);
+                Err(BulkloadRefusal::HomesConsolidateUnsupported)
             }
-            // Answered by `end` before it gets here.
-            Plan::DestAhead(_) => Err(BulkloadRefusal::ContractSelfInconsistent),
+            Plan::Dry(planned) => {
+                self.stats.planned.push(planned);
+                self.answered_now = Some(false);
+                Ok(())
+            }
             Plan::Write(mut staging) => {
                 self.open -= 1;
                 if let Some(failure) = failure {
@@ -7986,6 +7756,9 @@ impl<W: Write> Inbound<'_, W> {
                     return Err(failure.refusal);
                 }
                 fault_point!(ReceiveAfterChunks);
+                if let Some(class) = staging.consolidate {
+                    return self.consolidate_staged(staging.staged, &row, &key, class, racy);
+                }
                 if let Some(extend) = staging.extend.take() {
                     return self.finish_extend(
                         staging.staged,
@@ -7994,27 +7767,6 @@ impl<W: Write> Inbound<'_, W> {
                         (key, record, racy, root),
                     );
                 }
-                if staging.consolidate {
-                    return self
-                        .consolidate(
-                            staging.staged,
-                            &row,
-                            (key, record, racy, root),
-                            staging.hints,
-                        )
-                        .map(|()| None);
-                }
-                // `--beside`: published under the seat's beside row.
-                let (row, key) = match &staging.beside {
-                    Some(beside_rel) => (
-                        RowSchema {
-                            rel_path: beside_rel.clone(),
-                            ..row.clone()
-                        },
-                        beside_key(&self.authority, &key, &row.rel_path, beside_rel)?,
-                    ),
-                    None => (row, key),
-                };
                 if snapshot {
                     if let Err(refusal) = self.verify_snapshot(&staging.staged, &row) {
                         let _ = staging.staged.discard();
@@ -8029,7 +7781,6 @@ impl<W: Write> Inbound<'_, W> {
                     staging.hints,
                     staging.supersede.map(|owned| *owned),
                 )
-                .map(|()| staging.beside)
             }
         }
     }
@@ -8165,15 +7916,13 @@ impl<W: Write> Inbound<'_, W> {
     /// settled, so an unchanged rerun reads and sends nothing for it. The
     /// staged tail is removed either way. The file is counted and reported
     /// extended once its record commits (`finish_receive`).
-    /// Returns the beside path when the file was not a prefix after all and
-    /// `--beside` landed the whole seat beside it ([`Self::beside_from_extend`]).
     fn finish_extend(
         &mut self,
         staged: StagedFile,
         extend: Extend,
         row: &RowSchema,
         record: (Vec<u8>, [u8; 32], bool, [u8; 32]),
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<()> {
         let Extend {
             file,
             parent,
@@ -8185,9 +7934,6 @@ impl<W: Write> Inbound<'_, W> {
             hints,
             straddle,
         } = extend;
-        // BLAKE3 over the proven `[0, base)`, before the head compare adds
-        // to it: what a beside landing re-checks the prefix against.
-        let proven = *hasher.clone().finalize().as_bytes();
         let appended = self.append_tail(
             &staged,
             (&file, &writer),
@@ -8195,35 +7941,16 @@ impl<W: Write> Inbound<'_, W> {
             &mut hasher,
             row,
         );
+        let _ = staged.discard();
         let (after, proof) = match appended {
-            Ok(done) => {
-                let _ = staged.discard();
-                done
-            }
-            // `--beside`: the straddling chunk's head differs, so the file
-            // is not the seat's prefix; the seat lands whole beside it,
-            // from the file's proven prefix and the staged tail.
-            Err(Unextended::NotPrefix) if self.beside.is_some() => {
-                let suffix = self.beside.clone().unwrap_or_default();
-                // An append log is consolidated in place (ruling 2026-10-20).
-                let consolidate = consolidates(self.target.path(), &row.rel_path);
-                return self.beside_from_extend(
-                    staged,
-                    (&file, identity, base, proven),
-                    (row, hints),
-                    record,
-                    (&suffix, consolidate),
-                );
-            }
+            Ok(done) => done,
             Err(Unextended::NotPrefix) => {
-                let _ = staged.discard();
                 let (key, _, racy, _) = &record;
                 self.remember_refusal(key, Some(identity), *racy, RefusedOutput::NotPrefix);
                 self.note_interrupted(&row.rel_path);
                 return Err(BulkloadRefusal::DestinationOccupied);
             }
             Err(Unextended::Refused(refusal)) => {
-                let _ = staged.discard();
                 self.note_interrupted(&row.rel_path);
                 return Err(refusal);
             }
@@ -8235,272 +7962,6 @@ impl<W: Write> Inbound<'_, W> {
             proof.prior_blake3,
             row.size,
         ));
-        Ok(None)
-    }
-
-    /// `--beside` after a failed prefix extension: the seat's bytes are the
-    /// live file's `[0, base)` (proven the manifest's by chunk, and
-    /// re-hashed here against `proven` as they are copied: a file changed
-    /// since is refused `DESTINATION_OCCUPIED`, nothing placed) followed by
-    /// the staged tail `[base, size)`, every byte of which was verified as it
-    /// arrived. They are written to a new staged file, which is published
-    /// at the beside path as any beside output is ([`beside_target`]); the
-    /// staged tail is removed either way. The live file is read, never
-    /// written. Returns the beside path.
-    #[allow(clippy::too_many_lines)] // Copy the proven prefix, then the tail; judge, publish.
-    fn beside_from_extend(
-        &mut self,
-        tail: StagedFile,
-        (file, identity, base, proven): (&std::fs::File, StatIdentity, u64, [u8; 32]),
-        (row, hints): (&RowSchema, Vec<ChunkHint>),
-        (key, record, racy, root): (Vec<u8>, [u8; 32], bool, [u8; 32]),
-        (suffix, consolidate): (&[u8], bool),
-    ) -> Result<Option<Vec<u8>>> {
-        const PIECE: u64 = 1 << 20;
-        let beside = beside_row(row, suffix);
-        let key_beside = beside_key(&self.authority, &key, &row.rel_path, &beside.rel_path)?;
-        // Another seat of this session writes this name (finding 4).
-        if !consolidate && !self.claim(&beside.rel_path) {
-            let _ = tail.discard();
-            return Err(BulkloadRefusal::DestinationOccupied);
-        }
-        let whole = (|| -> Result<StagedFile> {
-            let out = if consolidate {
-                self.target.stage(row)?
-            } else {
-                self.target.stage(row)?.with_suffix(suffix)?
-            };
-            let copied = (|| -> Result<()> {
-                let mut buffer = vec![0_u8; usize::try_from(PIECE).unwrap_or(usize::MAX)];
-                let mut hasher = blake3::Hasher::new();
-                let mut at = 0_u64;
-                while at < base {
-                    let length = usize::try_from((base - at).min(PIECE)).unwrap_or(usize::MAX);
-                    let piece = buffer
-                        .get_mut(..length)
-                        .ok_or(BulkloadRefusal::BudgetExceeded)?;
-                    if crate::io::sys::pread_full(file, piece, at)
-                        .refuse_at("transfer::beside_from_extend")?
-                        != length
-                    {
-                        return Err(BulkloadRefusal::DestinationOccupied);
-                    }
-                    counters::add_len(Counter::DestVerifyRead, length);
-                    hasher.update(piece);
-                    crate::io::sys::pwrite_all(&**out.file(), piece, at).map_err(|error| {
-                        crate::materialize::space_refusal(crate::refuse::io(
-                            &error,
-                            "transfer::beside_from_extend",
-                        ))
-                    })?;
-                    counters::add_len(Counter::DestMaterializeWrite, length);
-                    at += length as u64;
-                }
-                let moved = file.metadata().map_or(true, |found| {
-                    StatIdentity::from_metadata(&found) != identity
-                });
-                if moved || *hasher.finalize().as_bytes() != proven {
-                    return Err(BulkloadRefusal::DestinationOccupied);
-                }
-                while at < row.size {
-                    let length = usize::try_from((row.size - at).min(PIECE)).unwrap_or(usize::MAX);
-                    let piece = buffer
-                        .get_mut(..length)
-                        .ok_or(BulkloadRefusal::BudgetExceeded)?;
-                    if crate::io::sys::pread_full(&**tail.file(), piece, at - base)
-                        .refuse_at("transfer::beside_from_extend")?
-                        != length
-                    {
-                        return Err(BulkloadRefusal::DigestMismatch);
-                    }
-                    crate::io::sys::pwrite_all(&**out.file(), piece, at).map_err(|error| {
-                        crate::materialize::space_refusal(crate::refuse::io(
-                            &error,
-                            "transfer::beside_from_extend",
-                        ))
-                    })?;
-                    counters::add_len(Counter::DestMaterializeWrite, length);
-                    at += length as u64;
-                }
-                Ok(())
-            })();
-            match copied {
-                Ok(()) => Ok(out),
-                Err(refusal) => {
-                    let _ = out.discard();
-                    Err(refusal)
-                }
-            }
-        })();
-        let _ = tail.discard();
-        let out = whole?;
-        // An append log: the whole seat is consolidated with the live file
-        // in place, never landed beside (ruling 2026-10-20).
-        if consolidate {
-            return self
-                .consolidate(out, row, (key, record, racy, root), hints)
-                .map(|()| None);
-        }
-        // The whole file is staged: the beside path is judged against its
-        // bytes as a planned entry's is.
-        let target = {
-            let context = ReceiveContext {
-                target: self.target,
-                store: self.store,
-                authority: &self.authority,
-                displaced: &self.displaced,
-                session: &self.session,
-                salvage: &self.salvage,
-            };
-            beside_existing(&context, &beside, out.file())
-        };
-        let supersede = match target {
-            Ok(BesideTarget::Fresh) => None,
-            Ok(BesideTarget::Supersede(owned)) => Some(*owned),
-            Ok(BesideTarget::Adopt(file, parent, identity)) => {
-                let _ = out.discard();
-                self.adopt(
-                    file,
-                    parent,
-                    &beside,
-                    (key_beside, record, racy, root),
-                    identity,
-                )?;
-                return Ok(Some(beside.rel_path));
-            }
-            Err(refusal) => {
-                let _ = out.discard();
-                return Err(refusal);
-            }
-        };
-        self.publish(
-            out,
-            &beside,
-            (key_beside, record, racy, root),
-            hints,
-            supersede,
-        )?;
-        Ok(Some(beside.rel_path))
-    }
-
-    /// Consolidate the append log at `row`'s live path with the seat's
-    /// bytes, staged whole in `staged` (operator ruling 2026-10-20; SPEC
-    /// #298 rules 3, 4 and 7). One code path with the homes dispatch: the
-    /// union is [`crate::consolidate::append_log::union`]'s, and this acts on
-    /// its outcome. Never a beside copy, never a stage copy published.
-    ///
-    /// - **Before.** The live file must be a regular file, quiet past the
-    ///   racy window; else `DESTINATION_UNSETTLED`, rerun-only.
-    /// - **Covered or adopted.** The live file already holds the seat's
-    ///   records: nothing is rewritten (rule 7), the entry is `dest-ahead`.
-    /// - **Extended or consolidated.** The union is traded in for the live
-    ///   file by the union's own crash-safe swap, checked against the live
-    ///   file as read; ledgered in [`TransferStats::consolidated`] and in
-    ///   the state's `consolidate.sqlite`.
-    /// - **Refused.** A file held open, ending inside a line, or changed on
-    ///   every read: `DESTINATION_UNSETTLED`, rerun-only, nothing written.
-    ///
-    /// Either way the answer is remembered under the live file's identity
-    /// then, so an unchanged rerun reads nothing. The staged seat is removed.
-    fn consolidate(
-        &mut self,
-        staged: StagedFile,
-        row: &RowSchema,
-        (key, _record, racy, _root): (Vec<u8>, [u8; 32], bool, [u8; 32]),
-        _hints: Vec<ChunkHint>,
-    ) -> Result<()> {
-        use crate::consolidate::{append_log, Action, Live, Maps, Source};
-        let result = (|| -> Result<Option<StatIdentity>> {
-            let Ok(Some((file, _))) = self.target.existing(row) else {
-                return Err(BulkloadRefusal::DestinationUnsettled);
-            };
-            let found = file.metadata().refuse_at("transfer::consolidate")?;
-            let quiet = capture_clock(self.target.path()).saturating_sub(RACY_GRANULARITY_NS);
-            let identity = StatIdentity::from_metadata(&found);
-            if !found.is_file() || identity.mtime_ns >= quiet || identity.ctime_ns >= quiet {
-                return Err(BulkloadRefusal::DestinationUnsettled);
-            }
-            let mut live_bytes = vec![
-                0_u8;
-                usize::try_from(found.len())
-                    .map_err(|_| BulkloadRefusal::BudgetExceeded)?
-            ];
-            let read = crate::io::sys::pread_full(&file, &mut live_bytes, 0)
-                .refuse_at("transfer::consolidate")?;
-            counters::add_len(Counter::DestVerifyRead, read);
-            if self.union_ledger.is_none() {
-                self.union_ledger = Some(crate::consolidate::Ledger::open(self.store.root())?);
-            }
-            let ledger = self
-                .union_ledger
-                .as_ref()
-                .ok_or(BulkloadRefusal::ContractSelfInconsistent)?;
-            let live_path = self.target.path().join(path(row.rel_path.clone()));
-            #[cfg(test)]
-            consolidate_hook(self.target.path(), &live_path);
-            let maps = Maps::new(Vec::new());
-            let outcome = append_log::union(
-                &Live {
-                    dir: staged.parent(),
-                    name: staged.leaf().to_bytes(),
-                    path: &live_path,
-                    rel: &row.rel_path,
-                },
-                &Source {
-                    file: staged.file(),
-                    path: &live_path,
-                    size: row.size,
-                    mtime_ns: row.mtime_ns,
-                    maps: &maps,
-                },
-                ledger,
-            )
-            .map_err(|refusal| match refusal {
-                BulkloadRefusal::HomesConsolidateRaced => BulkloadRefusal::DestinationUnsettled,
-                other => other,
-            })?;
-            let after = std::fs::symlink_metadata(&live_path)
-                .ok()
-                .filter(std::fs::Metadata::is_file)
-                .map(|meta| StatIdentity::from_metadata(&meta));
-            match outcome.action {
-                Action::Adopted | Action::Covered => {
-                    self.stats.dest_ahead.push(row.rel_path.clone());
-                    Ok(after)
-                }
-                Action::Extended | Action::Consolidated => {
-                    let mut seat = vec![
-                        0_u8;
-                        usize::try_from(row.size)
-                            .map_err(|_| BulkloadRefusal::BudgetExceeded)?
-                    ];
-                    crate::io::sys::pread_full(&**staged.file(), &mut seat, 0)
-                        .refuse_at("transfer::consolidate")?;
-                    let output = std::fs::read(&live_path).refuse_at("transfer::consolidate")?;
-                    let plan = append_log::plan_at(&row.rel_path, &live_bytes, &seat);
-                    counters::add(Counter::DestMaterializeWrite, outcome.written);
-                    self.stats.completed += 1;
-                    self.stats.consolidated.push(Consolidated {
-                        path: row.rel_path.clone(),
-                        seat_blake3: *blake3::hash(&seat).as_bytes(),
-                        live_blake3: *blake3::hash(&live_bytes).as_bytes(),
-                        output_blake3: *blake3::hash(&output).as_bytes(),
-                        seat_records: plan.source_records,
-                        live_extra: plan.live_extra,
-                        output_size: output.len() as u64,
-                    });
-                    Ok(after)
-                }
-                Action::Created | Action::Held(_) => Err(BulkloadRefusal::DestinationUnsettled),
-            }
-        })();
-        let _ = staged.discard();
-        let settled = result?;
-        // Answered here, with no publication: remembered as `dest-ahead`
-        // under the live file's identity now (the next pass reads nothing
-        // while it is unchanged).
-        self.remember_refusal(&key, settled, racy, RefusedOutput::DestAhead);
-        self.answered.insert(row.rel_path.clone());
         Ok(())
     }
 
@@ -8746,15 +8207,8 @@ enum Plan {
     /// An existing output to adopt once the entry ends. The identity is the
     /// one its bytes were already verified under, when the plan checked
     /// them (an output of this store, WP0(d)); otherwise they are verified
-    /// then. The last field names the beside path when the output adopted
-    /// is the seat's beside output (`--beside`), under whose row it is
-    /// recorded.
-    Adopt(
-        std::fs::File,
-        Arc<std::fs::File>,
-        Option<StatIdentity>,
-        Option<Vec<u8>>,
-    ),
+    /// then.
+    Adopt(std::fs::File, Arc<std::fs::File>, Option<StatIdentity>),
     /// This store's own output holds other bytes than the manifest's, on a
     /// file system with no atomic exchange to supersede it with: refused
     /// `DESTINATION_EXCHANGE_UNSUPPORTED` once the entry ends, with nothing
@@ -8767,23 +8221,36 @@ enum Plan {
     /// `DESTINATION_OCCUPIED` once the entry ends, remembered `NotPrefix`
     /// under its settled identity, with no chunk asked for.
     NotPrefix(StatIdentity),
-    /// `--beside`: the seat lands beside its live path, and the beside path
-    /// cannot take it (a foreign file with other bytes, a name another seat
-    /// of this session writes, a sidecar): refused once the entry ends, with
-    /// nothing staged or asked for. `live` and `beside` are the settled
-    /// identities it is remembered under, when known (review of #280,
-    /// finding 3).
-    BesideRefused {
-        refusal: BulkloadRefusal,
-        live: Option<(StatIdentity, RefusedOutput)>,
-        beside: Option<StatIdentity>,
+    /// `--consolidate`: the live append log holds the seat's bytes as its
+    /// first bytes (the destination continued it). Nothing is written or
+    /// asked for; the seat is recorded consolidated.
+    Covered,
+    /// `--consolidate`: held `HOMES_CONSOLIDATE_UNSUPPORTED`, nothing staged
+    /// or asked for; remembered under the live file's settled identity,
+    /// when known.
+    Held {
+        identity: Option<StatIdentity>,
+        reason: &'static str,
     },
-    /// `--beside` (#280 finding 9): the live path holds a settled file this
-    /// store does not own whose first bytes are the manifest's, and more
-    /// ([`dest_ahead`]). Nothing is staged or asked for; the entry is
-    /// accounted `dest-ahead` once it ends, remembered under the file's
-    /// identity.
-    DestAhead(StatIdentity),
+    /// `--plan-only`: the seat's planned action; nothing staged, asked for
+    /// or written.
+    Dry(PlannedSeat),
+}
+
+/// A decided plan, boxed.
+fn done(plan: Plan) -> Consolidating {
+    Consolidating::Done(Box::new(plan))
+}
+
+/// What [`plan_consolidating`] decides.
+enum Consolidating {
+    /// The entry's plan.
+    Done(Box<Plan>),
+    /// The seat's bytes are received in memory and merged by the class's
+    /// union when they are complete.
+    Stage(crate::consolidate::Class),
+    /// No live file: landed as any new path is.
+    Land,
 }
 
 /// [`verify_existing`], and, when the output holds other bytes than the
@@ -8840,13 +8307,9 @@ struct Staging {
     /// staged file holds bytes `[base, size)` and is appended from, never
     /// published.
     extend: Option<Box<Extend>>,
-    /// `--beside`: the staged file is published at this path, beside the
-    /// live file the plan found differing, under the seat's beside row.
-    beside: Option<Vec<u8>>,
-    /// Consolidation: the staged file holds the seat's bytes, and the live
-    /// append log the plan found differing is consolidated with them in
-    /// place ([`Inbound::consolidate`]), never landed beside.
-    consolidate: bool,
+    /// `--consolidate`: the staged file is in memory, and its bytes are
+    /// merged into the live file by this class's union, never published.
+    consolidate: Option<crate::consolidate::Class>,
 }
 
 /// An existing destination file with no owning record whose first
@@ -8911,124 +8374,13 @@ fn append_hook(rel_path: &[u8]) {
     }
 }
 
-/// Validate a manifest against its row, adopt an existing output, or stage a
-/// new one and fill every chunk this destination already holds. Every
-/// salvaged temporary a chunk was staged from is added to `salvaged_from`.
-///
-/// An existing output that is this store's own, untouched since its row was
-/// written, and that no longer holds the manifest's bytes (the seat
-/// changed) is superseded (WP0(d), OI-1003-Q18, #187): the new file is
-/// staged beside it and filled like any other, the old output's own chunks
-/// included through its hints, and its group commit exchanges the two. On
-/// a file system with no atomic exchange it is refused
-/// `DESTINATION_EXCHANGE_UNSUPPORTED` instead, before anything is staged.
-/// Any other existing output is adopted if its bytes verify when the entry
-/// ends, and refused `DESTINATION_OCCUPIED` if they do not: it is never
-/// replaced. A `SQLite` snapshot's output follows the same rule (#218,
-/// OI-1003-Q146).
 /// What [`plan_file`] plans: the row, whether the prefix extension may try
-/// its path, whether its content is a `SQLite` snapshot, and the `--beside`
-/// suffix of the session.
+/// its path, and whether its content is a `SQLite` snapshot.
 #[derive(Clone, Copy)]
 struct Planned<'p> {
     row: &'p RowSchema,
     extend: bool,
     snapshot: bool,
-    beside: Option<&'p [u8]>,
-    /// Suffixed names this session already writes (`Inbound::claimed`).
-    claimed: &'p HashSet<Vec<u8>>,
-    /// Lands beside whatever its live path holds ([`set_beside_always`]).
-    always: bool,
-}
-
-/// Where a seat lands beside its live path (`--beside`), decided by what
-/// the beside path holds ([`beside_target`]).
-enum BesideTarget {
-    /// Nothing there: a fresh publish.
-    Fresh,
-    /// This seat's bytes are there already (this store's own earlier beside
-    /// output, or a file that verifies): adopted under the beside row.
-    Adopt(std::fs::File, Arc<std::fs::File>, StatIdentity),
-    /// This store's own beside output holds other bytes: superseded by the
-    /// exchange (WP0(d)).
-    Supersede(Box<OwnedOutput>),
-}
-
-/// Decide the beside path of `row` (`--beside`): free, this store's own
-/// output (adopted when it verifies, superseded when it does not, refused
-/// `DESTINATION_EXCHANGE_UNSUPPORTED` with no exchange), a foreign file
-/// that verifies (adopted), or a foreign file with other bytes, refused
-/// `DESTINATION_OCCUPIED`: nothing is ever replaced beside either. A
-/// snapshot's beside path with a sidecar beside it is refused the same way
-/// (OI-1003-Q146).
-///
-/// Ownership is this seat's beside output's only ([`owned_beside`], review of
-/// #280, finding 4). A refusal for a foreign file carries that file's
-/// settled identity, which it may be remembered under (finding 3).
-fn beside_target(
-    context: &ReceiveContext<'_>,
-    beside: &RowSchema,
-    manifest: &Manifest,
-    snapshot: bool,
-) -> std::result::Result<BesideTarget, (BulkloadRefusal, Option<StatIdentity>)> {
-    let plain = |refusal| (refusal, None);
-    if snapshot
-        && context
-            .target
-            .sqlite_sidecars_present(&beside.rel_path)
-            .map_err(plain)?
-    {
-        return Err(plain(BulkloadRefusal::DestinationOccupied));
-    }
-    let Some((file, parent)) = context.target.existing(beside).map_err(plain)? else {
-        return Ok(BesideTarget::Fresh);
-    };
-    let owned = owned_beside(context.store, context.authority, beside, &file).map_err(plain)?;
-    let (verified, settled) = verify_settled(context.target.path(), &file, beside, manifest);
-    match (verified, owned) {
-        (Ok(identity), _) => Ok(BesideTarget::Adopt(file, parent, identity)),
-        (Err(BulkloadRefusal::DestinationOccupied), Some(owned)) => {
-            if context.target.exchange_supported(beside).map_err(plain)? {
-                Ok(BesideTarget::Supersede(Box::new(owned)))
-            } else {
-                Err(plain(BulkloadRefusal::DestinationExchangeUnsupported))
-            }
-        }
-        (Err(BulkloadRefusal::DestinationOccupied), None) => {
-            Err((BulkloadRefusal::DestinationOccupied, settled))
-        }
-        (Err(refusal), _) => Err(plain(refusal)),
-    }
-}
-
-/// [`beside_target`] judged against a staged copy of the seat instead of a
-/// manifest (a failed prefix extension has the whole seat staged and no
-/// manifest at hand): an existing beside file equal to `staged` byte for
-/// byte is adopted; one with other bytes is superseded when it is this
-/// store's own and refused `DESTINATION_OCCUPIED` otherwise.
-fn beside_existing(
-    context: &ReceiveContext<'_>,
-    beside: &RowSchema,
-    staged: &std::fs::File,
-) -> Result<BesideTarget> {
-    let Some((file, parent)) = context.target.existing(beside)? else {
-        return Ok(BesideTarget::Fresh);
-    };
-    let found = file.metadata().refuse_at("transfer::beside_existing")?;
-    if found.len() == beside.size && same_bytes(&file, staged, beside.size)? {
-        return Ok(BesideTarget::Adopt(
-            file,
-            parent,
-            StatIdentity::from_metadata(&found),
-        ));
-    }
-    match owned_beside(context.store, context.authority, beside, &file)? {
-        Some(owned) if context.target.exchange_supported(beside)? => {
-            Ok(BesideTarget::Supersede(Box::new(owned)))
-        }
-        Some(_) => Err(BulkloadRefusal::DestinationExchangeUnsupported),
-        None => Err(BulkloadRefusal::DestinationOccupied),
-    }
 }
 
 /// Whether the first `size` bytes of `a` and `b` are the same, read in 1
@@ -9056,6 +8408,21 @@ pub(crate) fn same_bytes(a: &std::fs::File, b: &std::fs::File, size: u64) -> Res
     Ok(true)
 }
 
+/// Validate a manifest against its row, adopt an existing output, or stage a
+/// new one and fill every chunk this destination already holds. Every
+/// salvaged temporary a chunk was staged from is added to `salvaged_from`.
+///
+/// An existing output that is this store's own, untouched since its row was
+/// written, and that no longer holds the manifest's bytes (the seat
+/// changed) is superseded (WP0(d), OI-1003-Q18, #187): the new file is
+/// staged beside it and filled like any other, the old output's own chunks
+/// included through its hints, and its group commit exchanges the two. On
+/// a file system with no atomic exchange it is refused
+/// `DESTINATION_EXCHANGE_UNSUPPORTED` instead, before anything is staged.
+/// Any other existing output is adopted if its bytes verify when the entry
+/// ends, and refused `DESTINATION_OCCUPIED` if they do not: it is never
+/// replaced. A `SQLite` snapshot's output follows the same rule (#218,
+/// OI-1003-Q146).
 #[allow(clippy::too_many_lines)] // Validate, adopt or supersede, stage, fill, kick.
 fn plan_file(
     context: &ReceiveContext<'_>,
@@ -9063,14 +8430,7 @@ fn plan_file(
     manifest: &Manifest,
     salvaged_from: &mut Vec<usize>,
 ) -> Plan {
-    let Planned {
-        row,
-        extend,
-        snapshot,
-        beside,
-        claimed,
-        always,
-    } = planned;
+    let Planned { row, extend, .. } = planned;
     let mut placements: HashMap<[u8; 32], (u64, Vec<u64>)> = HashMap::new();
     let mut order = Vec::new();
     let mut offset = 0_u64;
@@ -9101,49 +8461,32 @@ fn plan_file(
     if offset != row.size {
         return Plan::Refuse(BulkloadRefusal::DigestMismatch);
     }
-    // `--beside` (plan of record 2026-10-19, C1/C2): a snapshot whose live
-    // path has a sidecar beside it never lands there, whatever the path
-    // holds; it lands beside.
-    // So does a seat that lands beside whatever its live path holds.
-    let live_sidecar = (always && beside.is_some())
-        || (snapshot
-            && beside.is_some()
-            && match context.target.sqlite_sidecars_present(&row.rel_path) {
-                Ok(present) => present,
-                Err(refusal) => return Plan::Refuse(refusal),
-            });
-    let beside_at = || beside.map(|suffix| beside_path(&row.rel_path, suffix));
-    // Set when this entry lands beside its live path: the beside path, and
-    // what the live path's refusal may be remembered as (finding 3).
-    let mut land_beside: Option<Vec<u8>> = None;
-    let mut live_refused: Option<(StatIdentity, RefusedOutput)> = None;
-    // Consolidation (ruling 2026-10-20): the seat is staged whole at its
-    // live name and merged with the live file when it ends.
-    let mut consolidate = false;
-    let mut supersede = match context.target.existing(row) {
+    // `--consolidate` (operator ruling 2026-10-20): the seat is judged by
+    // its class against the live file; merged ones are staged in memory.
+    let mut consolidate_into = None;
+    if let Some(settings) = context.consolidate {
+        match plan_consolidating(context, planned, manifest, settings, salvaged_from) {
+            Consolidating::Done(plan) => return *plan,
+            Consolidating::Stage(class) => consolidate_into = Some(class),
+            Consolidating::Land => {}
+        }
+    }
+    // A consolidation never supersedes the live file: its union writes it.
+    let existing = if consolidate_into.is_some() {
+        Ok(None)
+    } else {
+        context.target.existing(row)
+    };
+    let supersede = match existing {
         Ok(Some((file, parent))) => {
-            // Under `--beside` a live path is never replaced, whoever wrote
-            // it (review of #280, finding 1): this store's own output there,
-            // adopted or published on an earlier pass, is judged as any
-            // other file is. A grown append-only file is extended through
-            // `O_APPEND`; any other difference lands beside.
-            let owned = if beside.is_some() {
-                Ok(None)
-            } else {
-                owned_output(context.store, context.authority, row, &file)
-            };
-            match owned {
-                Ok(_) if live_sidecar => {
-                    land_beside = beside_at();
-                    None
-                }
+            match owned_output(context.store, context.authority, row, &file) {
                 Ok(Some(owned)) => {
                     let (verified, settled) =
                         verify_settled(context.target.path(), &file, row, manifest);
                     match verified {
                         // The seat was touched, not changed: nothing to
                         // replace.
-                        Ok(identity) => return Plan::Adopt(file, parent, Some(identity), None),
+                        Ok(identity) => return Plan::Adopt(file, parent, Some(identity)),
                         // Changed. Without an atomic exchange the output
                         // cannot be superseded: say so now, before a byte
                         // is staged or asked of the source. A snapshot
@@ -9162,151 +8505,27 @@ fn plan_file(
                     }
                 }
                 // M2r2 A-103: a grown file is extended, any other is
-                // adopted or refused as before. Under `--beside` a file
-                // that is not the seat's (a failed prefix proof, or other
-                // bytes, judged now) lands beside instead.
-                Ok(None) => {
-                    let plan = if extend {
-                        plan_extend(
-                            context,
-                            (row, beside.is_some()),
-                            manifest,
-                            (file, parent),
-                            salvaged_from,
-                        )
-                    } else {
-                        Plan::Adopt(file, parent, None, None)
-                    };
-                    let Some(suffix) = beside else {
-                        return plan;
-                    };
-                    match plan {
-                        Plan::Adopt(file, parent, None, None) => {
-                            let (verified, settled) =
-                                verify_settled(context.target.path(), &file, row, manifest);
-                            match verified {
-                                Ok(identity) => {
-                                    return Plan::Adopt(file, parent, Some(identity), None)
-                                }
-                                Err(BulkloadRefusal::DestinationOccupied) => {
-                                    // An append-only live file written
-                                    // within the racy window: a writer may
-                                    // be at it, so neither extending it, nor
-                                    // taking it as covering the seat, nor a
-                                    // copy beside it can be judged now. A
-                                    // typed refusal, not remembered: the
-                                    // next pass decides (#280 finding 9
-                                    // review). Never a beside copy, which
-                                    // would stay a duplicate (C12).
-                                    if settled.is_none()
-                                        && prefix_extend_scope(context.target.path())
-                                            .covers(&row.rel_path)
-                                    {
-                                        return Plan::Refuse(BulkloadRefusal::DestinationUnsettled);
-                                    }
-                                    // The live file holds these bytes and
-                                    // more: nothing to land (#280 finding 9).
-                                    if let Some(identity) =
-                                        dest_ahead(&file, row, manifest, context.target.path())
-                                            .filter(|_| !snapshot)
-                                    {
-                                        return Plan::DestAhead(identity);
-                                    }
-                                    // An append log is consolidated in place,
-                                    // never landed beside (ruling 2026-10-20).
-                                    if !snapshot
-                                        && consolidates(context.target.path(), &row.rel_path)
-                                    {
-                                        consolidate = true;
-                                    } else {
-                                        land_beside = Some(beside_path(&row.rel_path, suffix));
-                                        live_refused = settled
-                                            .map(|identity| (identity, RefusedOutput::Occupied));
-                                    }
-                                }
-                                Err(refusal) => return Plan::Refuse(refusal),
-                            }
-                        }
-                        Plan::NotPrefix(identity) => {
-                            if !snapshot && consolidates(context.target.path(), &row.rel_path) {
-                                consolidate = true;
-                            } else {
-                                land_beside = Some(beside_path(&row.rel_path, suffix));
-                                live_refused = Some((identity, RefusedOutput::NotPrefix));
-                            }
-                        }
-                        other => return other,
-                    }
-                    None
+                // adopted or refused as before.
+                Ok(None) if extend => {
+                    return plan_extend(context, row, manifest, (file, parent), salvaged_from)
                 }
+                Ok(None) => return Plan::Adopt(file, parent, None),
                 Err(refusal) => return Plan::Refuse(refusal),
             }
         }
-        Ok(None) if live_sidecar => {
-            land_beside = beside_at();
-            None
-        }
         Ok(None) => None,
-        // An append log under consolidation whose live path is another
-        // kind: never landed beside (SPEC #298), except a link into an
-        // archive root, whose target is the live file: its landing is the
-        // re-seat's A-106 union, consumed there (one file).
-        Err(BulkloadRefusal::DestinationOccupied | BulkloadRefusal::DestinationKindMismatch)
-            if beside.is_some()
-                && !snapshot
-                && consolidates(context.target.path(), &row.rel_path)
-                && !archive_link(&context.target.path().join(path(row.rel_path.clone()))) =>
-        {
-            return Plan::Refuse(BulkloadRefusal::DestinationKindMismatch);
-        }
-        // `--beside`: a node of another kind at the live path (a symlink:
-        // review of #280, finding 5) lands beside.
-        Err(BulkloadRefusal::DestinationOccupied | BulkloadRefusal::DestinationKindMismatch)
-            if beside.is_some() =>
-        {
-            land_beside = beside_at();
-            None
-        }
         Err(refusal) => return Plan::Refuse(refusal),
     };
-    if let Some(beside_rel) = &land_beside {
-        // Another seat of this session writes this name (finding 4).
-        if claimed.contains(beside_rel) {
-            return Plan::BesideRefused {
-                refusal: BulkloadRefusal::DestinationOccupied,
-                live: None,
-                beside: None,
-            };
-        }
-        let beside = RowSchema {
-            rel_path: beside_rel.clone(),
-            ..row.clone()
-        };
-        match beside_target(context, &beside, manifest, snapshot) {
-            Ok(BesideTarget::Fresh) => {}
-            Ok(BesideTarget::Adopt(file, parent, identity)) => {
-                return Plan::Adopt(file, parent, Some(identity), Some(beside_rel.clone()))
-            }
-            Ok(BesideTarget::Supersede(owned)) => supersede = Some(owned),
-            Err((refusal, settled)) => {
-                return Plan::BesideRefused {
-                    refusal,
-                    live: live_refused,
-                    beside: settled,
-                }
-            }
-        }
-    }
-    let staged = match context.target.stage(row) {
+    // A consolidation's bytes are received in memory, never on disk (SPEC
+    // rule 2).
+    let staged = if consolidate_into.is_some() {
+        context.target.stage_in_memory(row)
+    } else {
+        context.target.stage(row)
+    };
+    let staged = match staged {
         Ok(staged) => staged,
         Err(refusal) => return Plan::Refuse(refusal),
-    };
-    let staged = match &land_beside {
-        Some(_) => match staged.with_suffix(beside.unwrap_or_default()) {
-            Ok(staged) => staged,
-            Err(refusal) => return Plan::Refuse(refusal),
-        },
-        None => staged,
     };
     let mut missing = Vec::new();
     let mut hints = Vec::with_capacity(order.len());
@@ -9354,9 +8573,102 @@ fn plan_file(
         hints,
         placed,
         extend: None,
-        beside: land_beside,
-        consolidate,
+        consolidate: consolidate_into,
     })
+}
+
+/// `--consolidate` (operator ruling 2026-10-20): what the live file is to
+/// the seat, by the seat's class ([`crate::consolidate::Class`]).
+///
+/// - No live file: landed as any new path is.
+/// - A live path of another kind: held.
+/// - The seat's bytes: adopted.
+/// - Otherwise, by class:
+///   - an append log is covered when the live file holds the seat's bytes
+///     as its first bytes, extended when it is a proven prefix of them
+///     (M2r2 A-103), and otherwise merged by its union, or held while it
+///     has none;
+///   - a config file is received in memory and merged;
+///   - a `SQLite` store or an opaque file is held.
+///
+/// Under `--plan-only` each answer is a [`Plan::Dry`] instead, and nothing
+/// is staged or written.
+fn plan_consolidating(
+    context: &ReceiveContext<'_>,
+    planned: Planned<'_>,
+    manifest: &Manifest,
+    settings: &Consolidation,
+    salvaged_from: &mut Vec<usize>,
+) -> Consolidating {
+    use crate::consolidate::{union_of, Class};
+    let row = planned.row;
+    let class = Class::of(&row.rel_path, planned.snapshot);
+    let plan = settings.plan_only;
+    let dry = |action, live_size, reason| {
+        done(Plan::Dry(PlannedSeat {
+            rel_path: row.rel_path.clone(),
+            class: class.word(),
+            action,
+            source_size: row.size,
+            live_size,
+            reason,
+        }))
+    };
+    let held = |identity, live_size, reason| {
+        if plan {
+            dry("hold", live_size, Some(reason))
+        } else {
+            done(Plan::Held { identity, reason })
+        }
+    };
+    let (file, parent) = match context.target.existing(row) {
+        Ok(Some(found)) => found,
+        Ok(None) if plan => return dry("create", None, None),
+        Ok(None) => return Consolidating::Land,
+        Err(BulkloadRefusal::DestinationOccupied | BulkloadRefusal::DestinationKindMismatch) => {
+            return held(None, None, OTHER_KIND)
+        }
+        Err(refusal) => return done(Plan::Refuse(refusal)),
+    };
+    let live_size = file.metadata().ok().map(|found| found.len());
+    let (verified, settled) = verify_settled(context.target.path(), &file, row, manifest);
+    match verified {
+        Ok(_) if plan => return dry("adopt", live_size, None),
+        Ok(identity) => return done(Plan::Adopt(file, parent, Some(identity))),
+        Err(BulkloadRefusal::DestinationOccupied) => {}
+        Err(refusal) => return done(Plan::Refuse(refusal)),
+    }
+    match class {
+        Class::AppendLog => {
+            match crate::materialize::covers(&file, manifest) {
+                Ok(true) if plan => return dry("covered", live_size, None),
+                Ok(true) => return done(Plan::Covered),
+                Ok(false) => {}
+                Err(refusal) => return done(Plan::Refuse(refusal)),
+            }
+            let union = union_of(class);
+            if plan {
+                return match crate::materialize::prefix_holds(&file, manifest) {
+                    Ok(true) => dry("extend", live_size, None),
+                    Ok(false) if union.is_some() => dry("consolidate", live_size, None),
+                    Ok(false) => dry("hold", live_size, Some(APPEND_LOG_PENDING)),
+                    Err(refusal) => done(Plan::Refuse(refusal)),
+                };
+            }
+            match plan_extend(context, row, manifest, (file, parent), salvaged_from) {
+                Plan::Adopt(..) | Plan::NotPrefix(_) if union.is_some() => {
+                    Consolidating::Stage(class)
+                }
+                Plan::Adopt(..) => held(settled, live_size, APPEND_LOG_PENDING),
+                Plan::NotPrefix(identity) => held(Some(identity), live_size, APPEND_LOG_PENDING),
+                other => done(other),
+            }
+        }
+        Class::Config(_) if plan => dry("consolidate", live_size, None),
+        Class::Config(_) => Consolidating::Stage(class),
+        Class::Sqlite => held(settled, live_size, SQLITE_PENDING),
+        Class::Opaque => held(settled, live_size, "opaque: the bytes differ"),
+    }
 }
 
 /// M2r2 A-103: an existing regular file with no owning record whose bytes
@@ -9380,17 +8692,17 @@ fn plan_file(
 /// (`Inbound::finish_extend`). A file that is not a candidate keeps
 /// today's answer: `Plan::Adopt`, which refuses it `DESTINATION_OCCUPIED`
 /// when its bytes are not the manifest's.
-#[allow(clippy::too_many_lines)] // Prove, stage the tail, fill it.
+#[allow(clippy::too_many_lines)] // Prove the prefix, stage the tail, fill it.
 fn plan_extend(
     context: &ReceiveContext<'_>,
-    (row, beside): (&RowSchema, bool),
+    row: &RowSchema,
     manifest: &Manifest,
     (file, parent): (std::fs::File, Arc<std::fs::File>),
     salvaged_from: &mut Vec<usize>,
 ) -> Plan {
     let root = context.target.path();
     let Some((identity, prior)) = extend_candidate(&file, row, root) else {
-        return Plan::Adopt(file, parent, None, None);
+        return Plan::Adopt(file, parent, None);
     };
     // Writable, and the very file read: else not a candidate.
     let writer = match context.target.open_output_append(&row.rel_path) {
@@ -9401,12 +8713,12 @@ fn plan_extend(
         {
             writer
         }
-        _ => return Plan::Adopt(file, parent, None, None),
+        _ => return Plan::Adopt(file, parent, None),
     };
-    let (base, hasher) = match prove_prefix(&file, row, manifest, (identity, prior), beside) {
+    let (base, hasher) = match prove_prefix(&file, row, manifest, (identity, prior)) {
         Proof::Proven(base, hasher) => (base, *hasher),
         Proof::NotPrefix => return Plan::NotPrefix(identity),
-        Proof::Untried => return Plan::Adopt(file, parent, None, None),
+        Proof::Untried => return Plan::Adopt(file, parent, None),
     };
     let staged = match context.target.stage(row) {
         Ok(staged) => staged,
@@ -9487,71 +8799,8 @@ fn plan_extend(
             hints,
             straddle,
         })),
-        beside: None,
-        consolidate: false,
+        consolidate: None,
     })
-}
-
-/// `--beside` (#280 finding 9): whether the existing `file` at `row`'s live
-/// path holds the seat's bytes (and maybe more).
-///
-/// Any file class (operator ruling 2026-10-20, "no dupes"): a regular file
-/// no shorter than the seat, settled (neither its content nor its inode
-/// changed within the racy window of now, by the destination's clock),
-/// whose first bytes are every manifest chunk's, read back and hashed, and
-/// unchanged while they were read. The destination continued it (a session
-/// resumed there), or holds the very bytes under another mode: landing them
-/// beside would only copy them a second time. Its identity, or `None`.
-fn dest_ahead(
-    file: &std::fs::File,
-    row: &RowSchema,
-    manifest: &Manifest,
-    root: &Path,
-) -> Option<StatIdentity> {
-    if manifest.size() != Some(row.size) {
-        return None;
-    }
-    let found = file.metadata().ok()?;
-    let identity = StatIdentity::from_metadata(&found);
-    let quiet_since = capture_clock(root).saturating_sub(RACY_GRANULARITY_NS);
-    if !found.is_file()
-        || found.len() < row.size
-        || identity.mtime_ns >= quiet_since
-        || identity.ctime_ns >= quiet_since
-    {
-        return None;
-    }
-    let mut buffer = vec![0_u8; crate::hash::CDC_MAX_BYTES as usize];
-    let mut offset = 0_u64;
-    for chunk in &manifest.chunks {
-        let slot = usize::try_from(chunk.size)
-            .ok()
-            .and_then(|size| buffer.get_mut(..size))?;
-        if crate::io::sys::pread_full(file, slot, offset).ok() != Some(slot.len()) {
-            return None;
-        }
-        counters::add_len(Counter::DestVerifyRead, slot.len());
-        if counters::hash(Counter::HashVerifyExisting, slot) != chunk.digest {
-            return None;
-        }
-        offset = offset.checked_add(chunk.size)?;
-    }
-    let unmoved = file
-        .metadata()
-        .is_ok_and(|after| StatIdentity::from_metadata(&after) == identity);
-    (offset == row.size && unmoved).then_some(identity)
-}
-
-/// Whether the prefix extension may try a seat at `rel_path` in a session
-/// into `root`: its scope ([`PREFIX_EXTEND_ENV`]) covers the path, or, under
-/// `--beside`, any file class unless the extension is off (operator ruling
-/// 2026-10-20, "no dupes": a live file that is a byte prefix of the seat is
-/// extended, never copied beside, whatever its class).
-fn extends(root: &Path, rel_path: &[u8], beside: bool) -> bool {
-    match prefix_extend_scope(root) {
-        PrefixExtend::Off => false,
-        scope => beside || scope.covers(rel_path),
-    }
 }
 
 /// Whether `file` may be extended to `row` (M2r2 A-103): a regular file
@@ -9635,18 +8884,12 @@ enum Proof {
 
 /// The proof half of [`plan_extend`] for the candidate `file` of `identity`
 /// and length `prior`: every manifest chunk ending within it must be its
-/// bytes, and at least one must. Under `--beside` (`beside`) none need:
-/// a file whose held bytes all lie in the first chunk is judged whole at
-/// the end (its head against the staged first chunk), since the seat's
-/// bytes cross either way, appended to it or landed beside it (#280
-/// finding 9: a small transcript that grew is extended, not copied
-/// beside).
+/// bytes, and at least one must.
 fn prove_prefix(
     file: &std::fs::File,
     row: &RowSchema,
     manifest: &Manifest,
     (identity, prior): (StatIdentity, u64),
-    beside: bool,
 ) -> Proof {
     if manifest.size() != Some(row.size) {
         return Proof::Untried;
@@ -9681,10 +8924,8 @@ fn prove_prefix(
     }
     // At least one whole chunk proven: a file whose held bytes all lie in
     // the first chunk could only be judged with that chunk's bytes from the
-    // source, and a refused seat costs no wire byte (P21, #187). Under
-    // `--beside` no seat is refused for what its live path holds: its bytes
-    // cross either way.
-    let Some(base) = base.filter(|base| *base > 0 || beside) else {
+    // source, and a refused seat costs no wire byte (P21, #187).
+    let Some(base) = base.filter(|base| *base > 0) else {
         return Proof::Untried;
     };
     let moved = file.metadata().map_or(true, |found| {

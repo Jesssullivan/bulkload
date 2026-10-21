@@ -17,7 +17,6 @@
 
 use std::ffi::OsString;
 use std::io::Write as _;
-use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -650,12 +649,23 @@ impl Move {
     }
 
     fn transfer_into(&self, from: &Path, to: &Path, name: &str) -> Result<()> {
+        self.transfer_kind(bulkload_agent::transfer::RootKind::Tree, from, to, name)
+    }
+
+    /// [`Self::transfer_into`] of one file (`--file`, #232), landed as `to`.
+    fn transfer_kind(
+        &self,
+        kind: bulkload_agent::transfer::RootKind,
+        from: &Path,
+        to: &Path,
+        name: &str,
+    ) -> Result<()> {
         let pulls = self.state.join("pull");
         moving::private_dir(&pulls)?;
         let serve = self.source_state.join("serve").join(name);
         if self.local() {
             moving::private_dir(&self.source_state.join("serve"))?;
-            return super::copy_recorded(from, to, &serve, &pulls.join(name));
+            return super::copy_recorded_kind(kind, from, to, &serve, &pulls.join(name));
         }
         let mut args: Vec<OsString> = vec![
             self.host.clone(),
@@ -666,7 +676,29 @@ impl Move {
         ];
         args.extend(self.remote.iter().cloned());
         args.extend(self.config.iter().cloned());
-        super::pull_recorded(&args)
+        super::pull_recorded_kind(kind, &args)
+    }
+
+    /// The consolidation of the homes (operator ruling 2026-10-20): the
+    /// `--map` set and the source home as the destination's, the ledger in
+    /// `MOVE_STATE/consolidate`.
+    fn consolidation(
+        &self,
+        home: &Path,
+        plan_only: bool,
+    ) -> Result<bulkload_agent::transfer::Consolidation> {
+        let text = |path: &Path| path.to_string_lossy().into_owned();
+        let mut pairs: Vec<(String, String)> = self
+            .maps
+            .iter()
+            .map(|(from, to)| (text(from), text(to)))
+            .collect();
+        pairs.push((text(home), text(&dest_home(self)?)));
+        Ok(bulkload_agent::transfer::Consolidation {
+            maps: bulkload_agent::consolidate::Maps::new(pairs),
+            ledger: self.state.join("consolidate"),
+            plan_only,
+        })
     }
 }
 
@@ -854,9 +886,7 @@ fn move_command(args: &[OsString]) -> Result<()> {
     // typed closure rows, and a refused settings file never holds the
     // transcripts' re-seat.
     let mut key_maps = None;
-    let mut index_kept = false;
     let sessions: Option<Sessions> = if let Some(home) = &run.sessions {
-        let pass_started = now_secs();
         // #280 finding 9: the source's project keys land at their lanes'
         // destination keys, once; ambiguous keys stay, typed.
         let (pulled, homes, derived) = sessions_pull(&run, home, &plan);
@@ -864,32 +894,18 @@ fn move_command(args: &[OsString]) -> Result<()> {
         note(&pulled);
         reached(&mut ledger, &ledger_path, "sessions-pull", word(&pulled))?;
         let mut outcome = Sessions {
-            pulls: ["claude", "codex"]
+            pulls: ["claude", CLAUDE_JSON_PULL, "codex"]
                 .iter()
                 .map(|name| run.state.join("pull").join(name))
+                .filter(|state| state.is_dir())
                 .collect(),
             reseat: None,
         };
         if let (true, Some(homes)) = (session_completed(&pulled), &homes) {
-            let reseated = reseat(&run, home, homes, (&plan, &corpus, &private), pass_started);
+            let reseated = reseat(&run, home, homes, (&plan, &corpus, &private));
             let ended: Result<()> = reseated.as_ref().map(drop).map_err(Clone::clone);
             note(&ended);
             reached(&mut ledger, &ledger_path, "reseat", word(&ended))?;
-            // Operator ruling 2026-10-20 ("no dupes"): the Codex index
-            // snapshot this pass landed beside the live index is a whole-DB
-            // copy once its threads are registered in the live index.
-            if ended.is_ok() {
-                let index = retire_landed_index(&run, homes, pass_started);
-                note(&index.as_ref().map(drop).map_err(Clone::clone));
-                let index_word = match &index {
-                    Ok(None) => "none".to_owned(),
-                    Ok(Some(IndexCopy::Retired(threads))) => format!("retired:{threads}"),
-                    Ok(Some(IndexCopy::Kept(missing))) => format!("kept:missing={missing}"),
-                    Err(refusal) => format!("refused:{}", refusal.code()),
-                };
-                reached(&mut ledger, &ledger_path, "codex-index", index_word)?;
-                index_kept = matches!(index, Ok(Some(IndexCopy::Kept(_))) | Err(_));
-            }
             outcome.reseat = reseated.ok().flatten();
         } else {
             reached(
@@ -915,7 +931,7 @@ fn move_command(args: &[OsString]) -> Result<()> {
         false,
     )?);
     // C11: the session transfers are rows of the same report (their
-    // `applied-beside` entries accounted, their refused paths pending
+    // consolidated entries accounted, their held paths pending
     // review, a transfer that never ran unaccounted), so the gate cannot
     // pass with agent state unaccounted.
     if let Some(sessions) = &sessions {
@@ -956,7 +972,7 @@ fn move_command(args: &[OsString]) -> Result<()> {
         .collect::<Vec<_>>()
         .join(",");
     out(&format!(
-        "estate-move closure planned={} applied={} applied_beside={} carried={} referenced_only={} refused={} refused_pending_review={} unaccounted={} not_moved={not_moved} refusals={} sessions={} transfer_rows={} reseat_unaccounted={reseat_unaccounted} reseat_held={} key_maps={} key_maps_held={} key_maps_unused={} diverged={} codex_index_kept={} move_state_bytes={} pull_payload_bytes={} report={report_path:?}",
+        "estate-move closure planned={} applied={} applied_beside={} carried={} referenced_only={} refused={} refused_pending_review={} unaccounted={} not_moved={not_moved} refusals={} sessions={} transfer_rows={} reseat_unaccounted={reseat_unaccounted} reseat_held={} key_maps={} key_maps_held={} key_maps_unused={} diverged={} move_state_bytes={} pull_payload_bytes={} report={report_path:?}",
         rows.len(),
         report.applied,
         report.applied_beside,
@@ -977,17 +993,16 @@ fn move_command(args: &[OsString]) -> Result<()> {
             .filter(|(word, _)| word.ends_with("/beside-diverged"))
             .map(|(_, count)| count)
             .sum::<u64>(),
-        u8::from(index_kept),
         tree_bytes(&run.state, &|_| true),
         pull_payload_bytes(&run.state),
     ))?;
-    let gate = report.gate().and(
-        if not_moved == 0 && reseat_unaccounted == 0 && !index_kept {
+    let gate = report
+        .gate()
+        .and(if not_moved == 0 && reseat_unaccounted == 0 {
             Ok(())
         } else {
             Err(BulkloadRefusal::ClosureUnaccounted)
-        },
-    );
+        });
     reached(&mut ledger, &ledger_path, "closure", word(&gate))?;
     out(&format!(
         "estate-move gate={} next={}",
@@ -1064,6 +1079,9 @@ fn print_plan(
 // `--plan-only`: estate-diff's preview of what the apply will do
 // (read-only at the destination), one row per line in MOVE_STATE/diff.jsonl.
 fn preview(run: &Move, (plan, corpus, private): (&Path, &Path, &Path)) -> Result<()> {
+    if let Some(home) = &run.sessions {
+        homes_plan(run, home)?;
+    }
     let rows_path = run.state.join("diff.jsonl");
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -1171,8 +1189,65 @@ fn dest_home(run: &Move) -> Result<PathBuf> {
     )
 }
 
-/// The Codex index name.
-const STATE_DB: &str = "state_5.sqlite";
+/// Claude Code's user config beside `~/.claude`, and its pull's name.
+const CLAUDE_JSON: &str = ".claude.json";
+const CLAUDE_JSON_PULL: &str = "claude-json";
+
+// `--plan-only` with `--sessions` (operator ruling 2026-10-20, item 3): every
+// file of both homes and `~/.claude.json`, with its class, its action
+// (create, adopt, extend, covered, consolidate or hold, and why) and the
+// sizes on both sides, printed as `planned` lines. Nothing is staged,
+// written or recorded; a live home that does not exist yet is named, not
+// made.
+fn homes_plan(run: &Move, home: &Path) -> Result<()> {
+    let dest = dest_home(run)?;
+    bulkload_agent::transfer::set_consolidate(Some(run.consolidation(home, true)?));
+    let codex_from = run
+        .codex_root
+        .clone()
+        .unwrap_or_else(|| home.join(".codex"));
+    let mut planned = Ok(());
+    for (from, name, kind) in [
+        (
+            home.join(".claude"),
+            ".claude",
+            bulkload_agent::transfer::RootKind::Tree,
+        ),
+        (
+            home.join(CLAUDE_JSON),
+            CLAUDE_JSON,
+            bulkload_agent::transfer::RootKind::File,
+        ),
+        (
+            codex_from,
+            ".codex",
+            bulkload_agent::transfer::RootKind::Tree,
+        ),
+    ] {
+        let to = dest.join(name);
+        out(&format!("estate-move homes-plan name={name} live={to:?}"))?;
+        if kind == bulkload_agent::transfer::RootKind::Tree && !to.is_dir() {
+            out(&format!(
+                "estate-move homes-plan name={name} live=absent (every file would be created)"
+            ))?;
+            continue;
+        }
+        let pull = format!("plan-{}", name.trim_start_matches('.'));
+        // Report-only: a path refusal (an absent `~/.claude.json` among
+        // them) is printed with the plan; only a session that failed fails it.
+        if let Err(refusal) = run.transfer_kind(kind, &from, &to, &pull) {
+            if !matches!(
+                refusal,
+                BulkloadRefusal::SourceRootMissing | BulkloadRefusal::ItemsRefused
+            ) && planned.is_ok()
+            {
+                planned = Err(refusal);
+            }
+        }
+    }
+    bulkload_agent::transfer::set_consolidate(None);
+    planned
+}
 
 // Phase 6a (plan of record 2026-10-19, C9; SPEC R4 "each tree lands once,
 // at its live path"): SOURCE_HOME/.claude and the Codex root into the LIVE
@@ -1183,6 +1258,7 @@ const STATE_DB: &str = "state_5.sqlite";
 // returned; the first refusal is the phase's. `ITEMS_REFUSED` means the
 // session completed with typed path refusals (closure rows), which does
 // not stop the re-seat (C10).
+#[allow(clippy::too_many_lines)] // Three pulls, the key map and its notes.
 fn sessions_pull(
     run: &Move,
     home: &Path,
@@ -1201,14 +1277,11 @@ fn sessions_pull(
         .clone()
         .unwrap_or_else(|| home.join(".codex"));
     let pulls = run.state.join("pull");
-    let suffix = bulkload_agent::transfer::set_beside_suffix(Some(run.suffix().into_bytes()));
-    // Operator ruling 2026-10-20 ("neither WIN. they must be consolidated";
-    // "no dupes, no duplicated besides"): an append log the two homes both
-    // hold is consolidated in place, one file, never landed beside.
-    bulkload_agent::transfer::set_consolidate(true);
-    // A live transcript link into an archive root is the A-106 union's;
-    // any other node of another kind at an append log's path is refused.
-    bulkload_agent::transfer::set_consolidate_archives(&run.archived);
+    // Consolidated, never beside (operator ruling 2026-10-20): every
+    // differing live file is merged by its class's union, or held typed.
+    let suffix = run
+        .consolidation(home, false)
+        .map(|settings| bulkload_agent::transfer::set_consolidate(Some(settings)));
     // The source's transcripts and rollouts, listed by each session: the
     // provenance the re-seat tells them from the destination's own by
     // (independent review of #280, N4). Listed as they land: under their
@@ -1260,24 +1333,42 @@ fn sessions_pull(
         _ => Ok(()),
     };
     let claude_listed = write_listing(&pulls.join("claude.listing"), claude_listing);
-    // The Codex index always lands beside, as this pass's snapshot: the
-    // pull never writes the live index (review of #280, finding 6).
+    // `~/.claude.json` (structured config), merged into the live one; a
+    // source with none has nothing to merge, and leaves no record.
+    let claude_json = run
+        .transfer_kind(
+            bulkload_agent::transfer::RootKind::File,
+            &home.join(CLAUDE_JSON),
+            &dest.join(CLAUDE_JSON),
+            CLAUDE_JSON_PULL,
+        )
+        .or_else(|refusal| {
+            // The source has none: nothing to merge, and no record left to
+            // count (its one row would be the absent file's).
+            if refusal == BulkloadRefusal::SourceRootMissing
+                || source_had_none(&pulls.join(CLAUDE_JSON_PULL))
+            {
+                let _ = std::fs::remove_dir_all(pulls.join(CLAUDE_JSON_PULL));
+                Ok(())
+            } else {
+                Err(refusal)
+            }
+        });
+    // The Codex stores are the row union's (#278), never this file path:
+    // held typed until it lands, and the live index is never written.
     bulkload_agent::transfer::set_listing(vec![
         b"sessions/".to_vec(),
         b"archived_sessions/".to_vec(),
     ]);
-    bulkload_agent::transfer::set_beside_always(vec![STATE_DB.as_bytes().to_vec()]);
     let codex_root = Move::live_root(&dest.join(".codex"), "codex");
     let codex = codex_root
         .as_ref()
         .map_err(Clone::clone)
         .and_then(|real| run.transfer_into(&codex_from, real, "codex"));
     let codex_listed = write_listing(&pulls.join("codex.listing"), super::take_listed());
-    bulkload_agent::transfer::set_beside_always(Vec::new());
     bulkload_agent::transfer::set_listing(Vec::new());
-    bulkload_agent::transfer::set_consolidate(false);
-    bulkload_agent::transfer::set_consolidate_archives(&[]);
-    let cleared = bulkload_agent::transfer::set_beside_suffix(None);
+    bulkload_agent::transfer::set_consolidate(None);
+    let cleared = Ok(());
     // A session that did not complete outranks one that completed with
     // refused paths: the phase's word says whether the re-seat may run.
     let mut outcome = Ok(());
@@ -1287,6 +1378,7 @@ fn sessions_pull(
         unmapped,
         noted,
         claude_listed,
+        claude_json,
         codex,
         codex_listed,
         cleared,
@@ -1304,32 +1396,21 @@ fn sessions_pull(
     (outcome, homes, key_maps.ok())
 }
 
-// The Codex index snapshot this pass landed beside the live index: the
-// `applied-beside` row of `state_5.sqlite` in a completed Codex transfer
-// record of this pass (started at or after `pass_started`, Unix seconds).
-fn landed_index(run: &Move, dest_codex: &Path, pass_started: u64) -> Option<PathBuf> {
+// Whether the one-file session recorded in `state` found no file at its
+// source: it completed nothing, and its only rows are the source's absence.
+fn source_had_none(state: &Path) -> bool {
     use bulkload_agent::transfer_outcome::{self, EntryOutcome, Session};
-    let state = run.state.join("pull").join("codex");
-    let destination = transfer_outcome::stable(dest_codex);
-    transfer_outcome::records(&state)
+    let records: Vec<_> = transfer_outcome::records(state)
         .iter()
         .filter_map(|(_, path)| transfer_outcome::read_file(path)?.ok())
-        .filter(|record| {
+        .collect();
+    !records.is_empty()
+        && records.iter().all(|record| {
             record.session == Session::Completed
-                && record.started >= pass_started
-                && record.destination == destination
-        })
-        .find_map(|record| {
-            record
-                .entries
-                .iter()
-                .find_map(|entry| match &entry.outcome {
-                    EntryOutcome::AppliedBeside { beside }
-                        if entry.rel_path == STATE_DB.as_bytes() =>
-                    {
-                        Some(dest_codex.join(std::ffi::OsStr::from_bytes(beside)))
-                    }
-                    _ => None,
+                && record.completed == 0
+                && record.entries.iter().all(|entry| {
+                    matches!(&entry.outcome, EntryOutcome::Refused { refusal, .. }
+                        if matches!(refusal.code(), "SOURCE_VANISHED" | "SOURCE_ROOT_MISSING"))
                 })
         })
 }
@@ -1348,7 +1429,6 @@ fn lane_options(run: &Move, home: &Path, plan: &Path) -> Result<bulkload_agent::
         }
     }
     options.maps = maps;
-    options.beside_suffix = Some(run.suffix());
     Ok(options)
 }
 
@@ -1436,79 +1516,6 @@ fn key_map_proof(run: &Move) -> Result<()> {
     ))
 }
 
-/// What became of the Codex index snapshot this pass landed beside the live
-/// index ([`retire_landed_index`]).
-enum IndexCopy {
-    /// Every thread it names is registered in the live index: removed, with
-    /// how many threads.
-    Retired(u64),
-    /// Threads it names the live index lacks: kept, pending review.
-    Kept(u64),
-}
-
-// Operator ruling 2026-10-20 ("no dupes"): the Codex index snapshot this
-// pass landed beside the live index (`state_5.sqlite.LABEL`, this pull's own
-// output, named by its transfer record) is a whole-DB copy once the re-seat
-// registered its threads in the live index. Every thread id it holds is
-// looked up in the live index (both opened read-only); all found, the
-// snapshot is removed and the removal is a ledger line; any missing, it is
-// kept and holds the gate, pending review. Never a permanent whole-DB copy.
-fn retire_landed_index(run: &Move, homes: &Homes, pass_started: u64) -> Result<Option<IndexCopy>> {
-    use rusqlite::{Connection, OpenFlags};
-    let Some(snapshot) = landed_index(run, &homes.codex, pass_started) else {
-        return Ok(None);
-    };
-    let live = homes.codex.join(STATE_DB);
-    if !snapshot.is_file() || !live.is_file() {
-        return Ok(None);
-    }
-    // An index that cannot be read as it was is one the pass cannot vouch
-    // for: typed, and the copy is kept.
-    let sql = |_: rusqlite::Error| BulkloadRefusal::SqliteStateChanged;
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let ids: Vec<String> = {
-        let copy = Connection::open_with_flags(&snapshot, flags).map_err(sql)?;
-        let mut statement = copy.prepare("SELECT id FROM threads").map_err(sql)?;
-        let rows = statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(sql)?;
-        rows.collect::<std::result::Result<_, _>>().map_err(sql)?
-    };
-    let index = Connection::open_with_flags(&live, flags).map_err(sql)?;
-    let mut missing = 0_u64;
-    for id in &ids {
-        let found: Option<i64> = index
-            .query_row("SELECT 1 FROM threads WHERE id = ?1", [id], |row| {
-                row.get(0)
-            })
-            .map(Some)
-            .or_else(|error| match error {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                other => Err(sql(other)),
-            })?;
-        missing += u64::from(found.is_none());
-    }
-    drop(index);
-    if missing > 0 {
-        out(&format!(
-            "estate-move codex-index-kept path={snapshot:?} threads={} missing={missing} reason=registration-incomplete"
-        , ids.len()))?;
-        return Ok(Some(IndexCopy::Kept(missing)));
-    }
-    std::fs::remove_file(&snapshot).refuse_at("estate_move::retire_landed_index")?;
-    if let Some(parent) = snapshot.parent() {
-        bulkload_agent::durable::seal_dir(
-            &std::fs::File::open(parent).refuse_at("estate_move::retire_landed_index")?,
-        )
-        .refuse_at("estate_move::retire_landed_index")?;
-    }
-    out(&format!(
-        "estate-move codex-index-retired path={snapshot:?} threads={}",
-        ids.len()
-    ))?;
-    Ok(Some(IndexCopy::Retired(ids.len() as u64)))
-}
-
 // Bytes of every regular file under `root` that `keep` takes (by path),
 // never following a link.
 fn tree_bytes(root: &Path, keep: &dyn Fn(&Path) -> bool) -> u64 {
@@ -1562,12 +1569,6 @@ fn pull_payload_bytes(state: &Path) -> u64 {
         .sum()
 }
 
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs())
-}
-
 // Whether every session transfer completed: every path answered, refused
 // ones as typed closure rows (`ITEMS_REFUSED`), or none.
 const fn session_completed(pulled: &Result<()>) -> bool {
@@ -1575,15 +1576,13 @@ const fn session_completed(pulled: &Result<()>) -> bool {
 }
 
 // Phase 6b: `estate-reseat --lanes-from-plan` from the live home (the
-// landing) into DEST_HOME. The landed Codex index is the beside snapshot
-// `state_5.sqlite.LABEL` when the live index was kept (it had live
-// sidecars, or differed), else the index the pull landed.
+// landing) into DEST_HOME. No Codex index lands as a file (the stores are
+// the row union's), so the re-seat reads none.
 fn reseat(
     run: &Move,
     home: &Path,
     homes: &Homes,
     (plan, corpus, private): (&Path, &Path, &Path),
-    pass_started: u64,
 ) -> Result<Option<bulkload_agent::reseat::Summary>> {
     let dest_home = dest_home(run)?;
     // The homes must still be the directories the pull ran under (N1).
@@ -1611,15 +1610,13 @@ fn reseat(
         args.extend(["--map".into(), pair]);
     }
     args.extend(run.reseat_args.iter().cloned());
-    // The pull's beside suffix, so the re-seat reads the source's copy
-    // beside a destination archive link (second review of #280, N2), and
-    // the archive roots A-106 replaces links into.
-    args.extend(["--beside-suffix".into(), run.suffix().into()]);
-    for root in &run.archived {
-        args.extend([
-            "--replace-archived-dest".into(),
-            root.clone().into_os_string(),
-        ]);
+    // Consolidated homes (operator ruling 2026-10-20): nothing lands
+    // beside, so no beside suffix; and A-106 is a union now, never the
+    // source's copy replacing a destination archive link. Until the
+    // append-log union (#294) lands, a placement over such a link stays
+    // `occupied`: typed, holding the gate.
+    if !run.archived.is_empty() {
+        out("estate-move a106=union-pending replace-archived-dest=ignored")?;
     }
     // Review of #280, finding 6: the landed index is the snapshot this
     // pass took, named by this pass's Codex transfer record, or none: never
@@ -1644,10 +1641,8 @@ fn reseat(
             args.extend([flag.into(), listing.into_os_string()]);
         }
     }
-    match landed_index(run, &homes.codex, pass_started) {
-        Some(index) => args.extend(["--landing-codex-index".into(), index.into_os_string()]),
-        None => args.push("--no-landing-codex-index".into()),
-    }
+    // No Codex index lands as a file: the stores are the row union's.
+    args.push("--no-landing-codex-index".into());
     args.extend([
         "--codex-source-root".into(),
         codex_root.into_os_string(),

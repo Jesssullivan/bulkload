@@ -1,5 +1,7 @@
 # Bulkload design
 
+> **Reference only, 2026-10-20.** This describes how the code works today. It does not set requirements. [SPEC.md](SPEC.md) states what bulkload must do and wins on any disagreement. Any design here that writes a beside copy, a staging copy or a side root contradicts SPEC rules 2–4, and that design is a defect, not a feature.
+
 How bulkload works: its contracts, records and refusal codes. What it must
 achieve and when it is done is [SPEC.md](SPEC.md) (#236); the SLOs and their
 proofs are [slo.md](slo.md); [SOURCES.md](SOURCES.md) maps the rest.
@@ -339,27 +341,29 @@ same report, totals and gate:
   prints `basis: ruled-default` with the ruling;
 - one **covered** row per live `-wal`, `-shm` or `-journal` the source
   reported beside a database carried as a snapshot (`covered`, accounted);
-- one **applied-beside** row per seat a `copy` or `pull` with `--beside
-  SUFFIX` landed beside a differing live destination file (plan of record
-  2026-10-19, C1/C2; `applied-beside`, accounted and counted in
-  `applied_beside`, the row printing `beside`, the path it landed at).
-  Under the flag a file bulkload did not write is still adopted when its
-  bytes are the seat's and extended when it is a verified byte prefix
-  (M2r2 A-103); one with other bytes, a differing symlink and a database
-  with a live sidecar beside it land at `<path>SUFFIX` under the beside
-  path's own row, so a rerun reuses them reading nothing. A beside path
-  holding a foreign file with other bytes refuses `DESTINATION_OCCUPIED`;
-  only the store's own beside output is superseded (WP0(d)).
-  `estate-move --sessions` pulls both agent homes this way into the live
-  home, joins both records into its closure, and holds its gate on any
-  re-seat outcome that leaves a session not resumable (C9 to C11).
-  Under the flag an append-only file (`.jsonl`, `.txt`) whose live copy
-  this store does not own, settled, already holds the seat's bytes and more
-  (the destination continued it: a session resumed there) is left as it is
-  and is one **dest-ahead** row (accounted as covered, the answer
-  remembered under that file's identity, so an unchanged rerun reads
-  nothing): landing it beside would only copy the same bytes again (#280
-  finding 9);
+- one **consolidated** row per seat a `copy` or `pull` with
+  `--consolidate` merged into, or found covered by, a differing live file
+  (operator ruling 2026-10-20; `consolidated`, accounted as `covered`, the
+  row printing `consolidation`: `consolidate` or `covered`). A seat whose
+  class has no union, or that its union cannot carry, is a typed
+  `HOMES_CONSOLIDATE_UNSUPPORTED` refusal row, pending review, with
+  nothing written. `--beside` on `copy` and `pull` is retired (SPEC rule
+  3, "no beside copies"): an **applied-beside** row of a record written
+  while it existed still decodes and stays accounted.
+  - **Append logs** (`*.jsonl`) take the #294 lane's union,
+    `consolidate::append_log::union`. The result is one file at the path:
+    the source's bytes whole, then the live file's records the source
+    lacks, in the live file's order. A Claude transcript record is matched
+    by its `uuid`, any other line by its exact bytes, counted, so both
+    branches of a session continued on both hosts are kept.
+  - A live log that already holds every source record, in any order, is
+    `covered` and is never rewritten (SPEC rule 7).
+  - The union is traded in by the crash-safe swap, checked against the
+    live file as it was read, and ledgered in `consolidate.sqlite`
+    (`append_log_union`: both inputs' and the output's BLAKE3, and the
+    record counts).
+  - A log that a process holds open, or that ends inside a line, is
+    `HOMES_CONSOLIDATE_RACED`, retryable, with nothing written.
 - one **mapped** row per `--map-prefix SRC_REL=DST_REL` a `copy` or `pull`
   landed entries through (#280 finding 9, "no duplicates"; accounted like
   `applied`, the row printing `mapped`, the destination path). The map is a
@@ -379,66 +383,26 @@ same report, totals and gate:
   real path on the destination and keyed exactly as Claude Code keys it
   (`reseat::key`). A key two lane sources share (keys are lossy), two keys
   whose destination key is one, and a lane that does not resolve stay
-  unmapped, named on typed `estate-move key-map-held` lines, and the
-  re-seat resolves their sessions by each transcript's `cwd` as before.
-  A mapped session lands where Claude Code lists it and the re-seat finds
-  it in place; the source-key directories earlier passes left are never
-  removed, and `estate-move --key-map-proof` lists, report only, how the
-  destination key holds each of their files. On a live-home landing a
-  source copy the pull put beside an archive link is consumed by its A-106
-  replacement (one copy of the source's bytes; `--undo` puts it back), and
-  one beside the destination's own regular transcript under the lane's key
-  is judged by bytes (#294 review 1): the live file extended in place when
-  it is a strict prefix and that is safe (else `beside-held`), `covered`
-  when the copy is its prefix, else `beside-diverged`, which holds the gate
-  for the operator's review (`diverged=` on the closure line). A derived map
-  whose lane's sessions the source keyed otherwise is named on a typed
-  `estate-move key-map-unused` line. Under `--beside` an append-only live
-  file written within the racy window is refused `DESTINATION_UNSETTLED`,
-  typed and not remembered (the next pass decides), never landed beside.
-- one **consolidated** row per append log (`.jsonl`) a homes pass merged
-  in place. This follows the operator ruling of 2026-10-20 ("neither WIN.
-  they must be consolidated"; "no dupes, no duplicated besides, no stage
-  dupes") and SPEC #298. Under `estate-move`'s consolidation, a seat whose
-  live file is not its bytes, not a prefix of them and not holding them is
-  never landed beside. It is merged into one file at the path: the
-  source's bytes whole, then the live file's records the source lacks, in
-  the live file's order. A Claude transcript record is identified by its
-  `uuid`; any other line by its exact bytes, counted. Both branches of a
-  session continued on both hosts are kept.
-  - **Write.** The receive side calls the homes' one union,
-    `consolidate::append_log::union`, and acts on its outcome. A live file
-    that is covered (every source record is already held, in any order)
-    is `dest-ahead` and is never rewritten (SPEC #298 rule 7). An extended
-    or consolidated one is traded in by the union's crash-safe swap,
-    checked against the live file as it was read. A file that a process
-    holds open, that ends inside a line, or that a writer keeps changing
-    is refused `DESTINATION_UNSETTLED` and rerun only. The entry is
-    remembered under the live file's identity, so an unchanged rerun reads
-    nothing.
-  - **Ledger.** The row records the seat's, the live file's and the
-    output's BLAKE3 and the record counts.
-  - **Other kinds.** A `.jsonl` whose live path is another kind is
-    refused `DESTINATION_KIND_MISMATCH`, except a link to a regular file
-    under a `--replace-archived-dest` root. That link's target is the live
-    file, and the re-seat's A-106 replacement takes the union of the two.
-  - **Race copies.** A copy of a transcript that a re-seat race leaves
-    behind is unioned into the live file (the archive target) and removed
-    once the merged bytes are durable (`reseat::fold`, SPEC #298 rules 3
-    and 4). This covers an A-106 swap-back copy that a writer appended to,
-    and a Q198 regularization copy. Only a refusing union holds: the copy
-    is renamed to `.<name>.<token>.kept-<inode>.bulkload-reseat` (the same
-    file, never a new copy) with nothing written, and every later pass
-    retries it first. While it refuses, the path is `held-written`
-    (placement) or `kept-held` (regularization). `reseat_copy_folded`
-    counts the folds; nothing is ever set aside.
-  - **Homes dispatch.** The same union is the `AppendLog` class's
-    `consolidate::Union` (`consolidate::append_log`), and
-    `append_log::plan_at` is its row in #297's `--plan-only` listing.
+  unmapped, named on typed `estate-move key-map-held` lines. A mapped
+  session lands where Claude Code lists it and the re-seat finds it in
+  place; the source-key directories earlier passes left are never removed,
+  and `estate-move --key-map-proof` lists, report only, how the destination
+  key holds each of their files. A derived map whose lane's sessions the
+  source keyed otherwise is named on a typed `estate-move key-map-unused`
+  line.
+- **Race copies.** A copy of a transcript that a re-seat race leaves
+  behind is unioned into the live file (the archive target) and removed
+  once the merged bytes are durable (`reseat::fold`, SPEC rules 3 and 4).
+  This covers an A-106 swap-back copy that a writer appended to, and a
+  Q198 regularization copy. Only a refusing union holds: the copy is
+  renamed to `.<name>.<token>.kept-<inode>.bulkload-reseat` (the same file,
+  never a new copy) with nothing written, and every later pass retries it
+  first. While it refuses, the path is `held-written` (placement) or
+  `kept-held` (regularization), and `reseat_copy_folded` counts the folds.
 
 A transfer row's identity (`item`, 64 hex) is a digest of the transfer's
 source (`SOURCE`, or `HOST:SOURCE` for `pull`), its destination, the path
-and the code (or `covered`, `applied-beside`, `mapped`, `dest-ahead`); its refusal `instance` digests the row's
+and the code (or `covered`, `applied-beside`, `consolidated`, `mapped`); its refusal `instance` digests the row's
 record, so a rerun that refuses identically keeps its review and any other
 record is a new instance. `closure-dispose --transfer DEST_STATE` reviews a
 transfer row as it reviews a planned item, in the same plan-bound ledger.

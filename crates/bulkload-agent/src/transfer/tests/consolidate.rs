@@ -1,332 +1,371 @@
-//! Consolidation of append logs in place (operator ruling 2026-10-20:
-//! "neither WIN. they must be consolidated"; "no dupes, no duplicated
-//! besides"): a session continued on both hosts lands as one file holding
-//! both branches, `history.jsonl` as the union of its lines, a destination
-//! writer appending during the consolidation is never lost, and an unchanged
-//! rerun reads nothing. Never a beside copy.
+//! `--consolidate` on `copy` and `pull` (operator ruling 2026-10-20: the
+//! agent homes are consolidated, never landed beside; SPEC RUL-10, C10;
+//! SPEC rule 2: no payload copy on either machine).
+//!
+//! - A differing JSON or TOML file is merged into the live file in place,
+//!   and nothing is left beside it.
+//! - An append log is extended (a live prefix), covered (the live file holds
+//!   the source's bytes), or consolidated by the #294 lane's JSONL union:
+//!   one file, the source's bytes then the live file's lines it lacks.
+//! - An opaque file, a `SQLite` store and a live path of another kind are
+//!   held `HOMES_CONSOLIDATE_UNSUPPORTED`, with nothing written.
+//! - An unchanged rerun reads 0 source bytes.
+//! - The destination state holds no payload byte.
+//! - `--plan-only` writes nothing and lists every seat.
 
 use super::*;
 
-const SUFFIX: &[u8] = b".neo-20261020";
-
-struct Homes {
+/// A corpus whose destination root runs with `--consolidate`.
+struct Consolidating {
     corpus: Corpus,
     root: PathBuf,
 }
 
-impl Homes {
-    fn new() -> Self {
+impl Consolidating {
+    fn new(plan_only: bool) -> Self {
         let corpus = Corpus::new();
         let root = std::fs::canonicalize(corpus.base.join("destination")).unwrap();
-        set_beside(&root, Some(Some(SUFFIX.to_vec())));
-        set_consolidate_root(&root, Some(true));
-        Self { corpus, root }
+        let this = Self { corpus, root };
+        this.set(plan_only);
+        this
     }
 
-    fn write(&self, side: &str, rel: &str, bytes: &[u8]) -> PathBuf {
-        let path = self.corpus.base.join(side).join(rel);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, bytes).unwrap();
-        path
+    fn set(&self, plan_only: bool) {
+        set_consolidate_for(
+            &self.root,
+            Some(Some(Consolidation {
+                maps: crate::consolidate::Maps::default(),
+                ledger: self.state().join("consolidate"),
+                plan_only,
+            })),
+        );
+    }
+
+    fn source(&self) -> PathBuf {
+        self.corpus.base.join("source")
+    }
+
+    fn destination(&self) -> PathBuf {
+        self.corpus.base.join("destination")
+    }
+
+    fn state(&self) -> PathBuf {
+        self.corpus.base.join("destination-state")
+    }
+
+    fn run(&self) -> TransferStats {
+        self.corpus.run().unwrap()
     }
 
     fn settle(&self) {
-        settle_racy_window(&self.corpus.base.join("source")).unwrap();
-        settle_racy_window(&self.corpus.base.join("destination")).unwrap();
+        settle_racy_window(&self.source()).unwrap();
+        settle_racy_window(&self.destination()).unwrap();
+    }
+
+    /// Every file under `root`, by relative path, with its bytes.
+    fn files(root: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                let meta = std::fs::symlink_metadata(&path).unwrap();
+                if meta.is_dir() {
+                    pending.push(path);
+                } else if meta.is_file() {
+                    let rel = path
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    out.push((rel, std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// SPEC rule 2: no file of the destination state holds `payload`.
+    fn no_payload_in_state(&self, payload: &[u8]) {
+        for (name, bytes) in Self::files(&self.state()) {
+            assert!(
+                !bytes.windows(payload.len()).any(|window| window == payload),
+                "{name} holds payload bytes"
+            );
+        }
+    }
+
+    /// No private name is left beside a live path.
+    fn no_temporaries(&self) {
+        for (name, _) in Self::files(&self.destination()) {
+            assert!(
+                !name.contains(".bulkload") && !name.contains(".tmp"),
+                "{name} left beside a live path"
+            );
+        }
     }
 }
 
-impl Drop for Homes {
+impl Drop for Consolidating {
     fn drop(&mut self) {
-        set_beside(&self.root, None);
-        set_consolidate_root(&self.root, None);
-        set_consolidate_hook(&self.root, None);
+        set_consolidate_for(&self.root, None);
     }
 }
 
-fn record(uuid: &str, parent: &str, text: &str) -> String {
-    format!(
-        "{{\"parentUuid\":\"{parent}\",\"uuid\":\"{uuid}\",\"timestamp\":\"2026-10-20T00:00:00Z\",\"message\":\"{text}\"}}\n"
-    )
+fn set_mtime(path: &Path, age_secs: u64) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs))
+        .unwrap();
 }
 
-fn beside_of(path: &Path) -> PathBuf {
-    let mut beside = path.as_os_str().to_owned();
-    beside.push(std::ffi::OsStr::from_bytes(SUFFIX));
-    PathBuf::from(beside)
-}
-
-/// One session id continued on both hosts: one file at the path, neo's
-/// bytes then sting's branch; never a beside copy; ledgered; and the rerun
-/// reads nothing.
-#[test]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "the process check proves nothing off Linux: every consolidation is unsettled"
-)]
-fn a_session_continued_on_both_hosts_is_one_file_with_both_branches() {
-    let homes = Homes::new();
-    let shared = format!("{}{}", record("a", "", "hi"), record("b", "a", "hello"));
-    let neo = format!("{shared}{}", record("n1", "b", "on neo"));
-    let sting_branch = format!(
-        "{}{}",
-        record("s1", "b", "on sting"),
-        record("s2", "s1", "more")
-    );
-    let rel = "projects/-k/s.jsonl";
-    homes.write("source", rel, neo.as_bytes());
-    let live = homes.write(
-        "destination",
-        rel,
-        format!("{shared}{sting_branch}").as_bytes(),
-    );
-    homes.settle();
-
-    let first = homes.corpus.run().unwrap();
-    assert!(first.refusals.is_empty(), "{:?}", first.refusals);
-    assert!(
-        first.applied_beside.is_empty(),
-        "{:?}",
-        first.applied_beside
-    );
-    assert_eq!(
-        std::fs::read_to_string(&live).unwrap(),
-        format!("{neo}{sting_branch}"),
-        "one file: neo's bytes, then sting's branch"
-    );
-    assert!(!beside_of(&live).exists(), "never a beside copy");
-    assert_eq!(first.consolidated.len(), 1, "{:?}", first.consolidated);
-    let done = &first.consolidated[0];
-    assert_eq!(done.path, rel.as_bytes());
-    assert_eq!((done.seat_records, done.live_extra), (3, 2));
-    assert_eq!(
-        done.output_blake3,
-        *blake3::hash(format!("{neo}{sting_branch}").as_bytes()).as_bytes()
-    );
-    let ledger = crate::transfer_outcome::TransferRecord::ended(
-        "copy",
-        "source",
-        &homes.root,
-        &Ok(first),
-        "transfer::copy",
-    );
-    assert!(ledger
-        .entries
+fn consolidated(stats: &TransferStats) -> Vec<(String, String)> {
+    stats
+        .consolidated
         .iter()
-        .any(|entry| entry.rel_path == rel.as_bytes()
-            && matches!(
-                entry.outcome,
-                crate::transfer_outcome::EntryOutcome::Consolidated { live_extra: 2, .. }
-            )));
-
-    homes.settle();
-    let again = homes.corpus.run().unwrap();
-    assert!(again.refusals.is_empty(), "{:?}", again.refusals);
-    assert_eq!(
-        again.source_bytes_read, 0,
-        "an unchanged rerun reads nothing"
-    );
-    assert!(again.consolidated.is_empty());
-    assert_eq!(
-        std::fs::read_to_string(&live).unwrap(),
-        format!("{neo}{sting_branch}")
-    );
+        .map(|(path, action)| (String::from_utf8_lossy(path).into_owned(), action.clone()))
+        .collect()
 }
 
-/// `history.jsonl` (no `uuid`): the union of its lines, counted.
-#[test]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "the process check proves nothing off Linux: every consolidation is unsettled"
-)]
-fn history_is_the_union_of_both_hosts_lines() {
-    let homes = Homes::new();
-    let neo = "{\"display\":\"a\"}\n{\"display\":\"neo\"}\n";
-    let sting = "{\"display\":\"a\"}\n{\"display\":\"sting\"}\n";
-    homes.write("source", "history.jsonl", neo.as_bytes());
-    let live = homes.write("destination", "history.jsonl", sting.as_bytes());
-    homes.settle();
-    let stats = homes.corpus.run().unwrap();
-    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
-    assert_eq!(
-        std::fs::read_to_string(&live).unwrap(),
-        "{\"display\":\"a\"}\n{\"display\":\"neo\"}\n{\"display\":\"sting\"}\n"
-    );
-    assert!(!beside_of(&live).exists());
-    assert_eq!(stats.consolidated.len(), 1);
-}
-
-/// A destination writer appends after the receive checked the live file and
-/// before the union reads it: its line is in the union, never lost. (A
-/// writer under the union's own swap is merged on the union's next read:
-/// `consolidate::append_log`'s tests.)
-#[test]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "the process check proves nothing off Linux: every consolidation is unsettled"
-)]
-fn a_line_sting_appends_during_the_consolidation_is_never_lost() {
-    fn append(live: &Path) {
-        use std::io::Write as _;
-        let mut file = std::fs::OpenOptions::new().append(true).open(live).unwrap();
-        file.write_all(b"{\"uuid\":\"late\",\"message\":\"while merging\"}\n")
-            .unwrap();
-    }
-    let homes = Homes::new();
-    let shared = record("a", "", "hi");
-    let neo = format!("{shared}{}", record("n1", "a", "on neo"));
-    let sting = format!("{shared}{}", record("s1", "a", "on sting"));
-    let rel = "projects/-k/t.jsonl";
-    homes.write("source", rel, neo.as_bytes());
-    let live = homes.write("destination", rel, sting.as_bytes());
-    homes.settle();
-    set_consolidate_hook(&homes.root, Some(append));
-    let first = homes.corpus.run().unwrap();
-    set_consolidate_hook(&homes.root, None);
-    assert!(first.refusals.is_empty(), "{:?}", first.refusals);
-    assert_eq!(first.consolidated.len(), 1);
-    let late = "{\"uuid\":\"late\",\"message\":\"while merging\"}\n";
-    assert_eq!(
-        std::fs::read_to_string(&live).unwrap(),
-        format!("{neo}{}{late}", record("s1", "a", "on sting"))
-    );
-    assert!(!beside_of(&live).exists());
-
-    homes.settle();
-    let again = homes.corpus.run().unwrap();
-    assert!(again.refusals.is_empty(), "{:?}", again.refusals);
-    assert_eq!(
-        again.source_bytes_read, 0,
-        "an unchanged rerun reads nothing"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&live).unwrap(),
-        format!("{neo}{}{late}", record("s1", "a", "on sting"))
-    );
-}
-
-/// Operator ruling 2026-10-20 ("no dupes, no duplicated besides"), every
-/// file class of the homes: a beside copy is written only for bytes the live
-/// file neither is, nor is a prefix of (extended in place), nor holds
-/// (covered, `dest-ahead`, the very bytes under another mode included).
-#[test]
-fn a_beside_is_written_only_for_bytes_the_live_file_lacks() {
-    use std::os::unix::fs::PermissionsExt as _;
-    let homes = Homes::new();
-    // Settings the destination extended: covered.
-    homes.write("source", "settings.json", b"{\"a\":1}\n");
-    let covered = homes.write("destination", "settings.json", b"{\"a\":1}\n{\"b\":2}\n");
-    // The same bytes under another mode: covered.
-    let same = homes.write("source", "plugins/known.json", b"{\"p\":1}\n");
-    let moded = homes.write("destination", "plugins/known.json", b"{\"p\":1}\n");
-    std::fs::set_permissions(&same, std::fs::Permissions::from_mode(0o644)).unwrap();
-    std::fs::set_permissions(&moded, std::fs::Permissions::from_mode(0o600)).unwrap();
-    // A live file that is a prefix of the source's: extended in place.
-    homes.write("source", "plugins/grown.json", b"{\"g\":1}\n{\"g\":2}\n");
-    let grown = homes.write("destination", "plugins/grown.json", b"{\"g\":1}\n");
-    // Other bytes: the one beside copy.
-    homes.write("source", "config.toml", b"model = \"neo\"\n");
-    let other = homes.write("destination", "config.toml", b"model = \"sting\"\n");
-    homes.settle();
-
-    let stats = homes.corpus.run().unwrap();
-    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
-    let mut ahead = stats.dest_ahead.clone();
-    ahead.sort();
-    assert_eq!(
-        ahead,
-        [b"plugins/known.json".to_vec(), b"settings.json".to_vec()]
-    );
-    assert_eq!(
-        stats.applied_beside,
-        [(
-            b"config.toml".to_vec(),
-            [&b"config.toml"[..], SUFFIX].concat()
-        )]
-    );
-    assert_eq!(std::fs::read(&grown).unwrap(), b"{\"g\":1}\n{\"g\":2}\n");
-    for path in [&covered, &moded, &grown] {
-        assert!(!beside_of(path).exists(), "{path:?}");
-    }
-    assert!(beside_of(&other).exists());
-}
-
-/// An append log whose live path is another kind (a directory, a link
-/// outside the archive roots) is refused typed, nothing landed beside it; a
-/// link into an archive root is the re-seat's A-106 union and is landed for
-/// it.
-#[test]
-fn a_log_whose_live_path_is_another_kind_is_refused_unless_an_archive_link() {
-    let homes = Homes::new();
-    let neo = record("a", "", "hi");
-    let (dir_rel, link_rel, archived_rel) = (
-        "projects/-k/dir.jsonl",
-        "projects/-k/link.jsonl",
-        "projects/-k/archived.jsonl",
-    );
-    for rel in [dir_rel, link_rel, archived_rel] {
-        homes.write("source", rel, neo.as_bytes());
-    }
-    let dir = homes.root.join(dir_rel);
-    std::fs::create_dir_all(&dir).unwrap();
-    let elsewhere = homes.write("elsewhere", "other.jsonl", b"{\"x\":1}\n");
-    std::os::unix::fs::symlink(&elsewhere, homes.root.join(link_rel)).unwrap();
-    let archive = homes.corpus.base.join("archive");
-    let target = homes.write("archive", "s.jsonl", b"{\"x\":2}\n");
-    std::os::unix::fs::symlink(&target, homes.root.join(archived_rel)).unwrap();
-    set_consolidate_archives(&[archive]);
-    homes.settle();
-    let stats = homes.corpus.run();
-    set_consolidate_archives(&[]);
-    let stats = stats.unwrap();
-    let mut refused: Vec<(String, String)> = stats
+fn held(stats: &TransferStats) -> Vec<String> {
+    let mut held: Vec<String> = stats
         .refusals
         .iter()
-        .map(|(path, code)| (String::from_utf8_lossy(path).into_owned(), code.clone()))
+        .filter(|(_, code)| code == "HOMES_CONSOLIDATE_UNSUPPORTED")
+        .map(|(path, _)| String::from_utf8_lossy(path).into_owned())
         .collect();
-    refused.sort();
-    assert_eq!(
-        refused,
-        [
-            (dir_rel.to_owned(), "DESTINATION_KIND_MISMATCH".to_owned()),
-            (link_rel.to_owned(), "DESTINATION_KIND_MISMATCH".to_owned()),
-        ]
-    );
-    assert!(!beside_of(&dir).exists());
-    assert!(!beside_of(&homes.root.join(link_rel)).exists());
-    assert_eq!(std::fs::read(&elsewhere).unwrap(), b"{\"x\":1}\n");
-    assert_eq!(
-        std::fs::read(beside_of(&homes.root.join(archived_rel))).unwrap(),
-        neo.as_bytes(),
-        "landed for the re-seat's union"
-    );
-    assert_eq!(std::fs::read(&target).unwrap(), b"{\"x\":2}\n");
+    held.sort();
+    held
 }
 
-/// SPEC #298 rule 7 through the one union: a live log holding every
-/// record of the source's, in another order, is covered. Nothing is
-/// rewritten (the same inode, the same bytes), and the entry is
-/// `dest-ahead`.
+/// A marker no state file may hold (SPEC rule 2).
+const MARKER: &str = "payload-marker-7f3c9e1a2b4d6f8091a3c5e7d9b1f3a5";
+
 #[test]
-fn a_live_log_holding_every_record_in_another_order_is_never_rewritten() {
-    use std::os::unix::fs::MetadataExt as _;
-    let homes = Homes::new();
-    let (a, b, s) = (
-        record("a", "", "hi"),
-        record("b", "a", "hello"),
-        record("s1", "a", "on sting"),
-    );
-    let rel = "projects/-k/order.jsonl";
-    homes.write("source", rel, format!("{a}{b}").as_bytes());
-    let held = format!("{a}{s}{b}");
-    let live = homes.write("destination", rel, held.as_bytes());
-    let inode = std::fs::metadata(&live).unwrap().ino();
-    homes.settle();
-    let stats = homes.corpus.run().unwrap();
+fn a_differing_config_is_merged_in_place_and_nothing_lands_beside() {
+    let run = Consolidating::new(false);
+    let (source, destination) = (run.source(), run.destination());
+    std::fs::write(
+        source.join("settings.json"),
+        format!("{{\n  \"model\": \"sonnet\",\n  \"allow\": [\n    \"a\"\n  ],\n  \"note\": \"{MARKER}\"\n}}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        destination.join("settings.json"),
+        "{\n  \"model\": \"opus\",\n  \"allow\": [\n    \"b\"\n  ],\n  \"theme\": \"dark\"\n}\n",
+    )
+    .unwrap();
+    std::fs::write(source.join("config.toml"), "a = 1\n[t]\nb = 2\n").unwrap();
+    std::fs::write(destination.join("config.toml"), "# sting\nc = 3\n").unwrap();
+    set_mtime(&destination.join("settings.json"), 7200);
+    set_mtime(&source.join("settings.json"), 3600);
+    run.settle();
+
+    let stats = run.run();
     assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
-    assert!(stats.consolidated.is_empty(), "{:?}", stats.consolidated);
-    assert_eq!(stats.dest_ahead, [rel.as_bytes().to_vec()]);
-    assert_eq!(std::fs::read_to_string(&live).unwrap(), held);
-    assert_eq!(std::fs::metadata(&live).unwrap().ino(), inode);
-    assert!(!beside_of(&live).exists());
+    assert_eq!(
+        consolidated(&stats),
+        [
+            ("config.toml".to_owned(), "consolidate".to_owned()),
+            ("settings.json".to_owned(), "consolidate".to_owned()),
+        ]
+    );
+    // The source modified last: its model is in the file, sting's recorded.
+    assert_eq!(
+        std::fs::read_to_string(destination.join("settings.json")).unwrap(),
+        format!("{{\n  \"model\": \"sonnet\",\n  \"allow\": [\n    \"b\",\n    \"a\"\n  ],\n  \"theme\": \"dark\",\n  \"note\": \"{MARKER}\"\n}}\n")
+    );
+    assert_eq!(
+        std::fs::read_to_string(destination.join("config.toml")).unwrap(),
+        "# sting\nc = 3\na = 1\n\n[t]\nb = 2\n"
+    );
+    let ledger = crate::consolidate::Ledger::open(&run.state().join("consolidate")).unwrap();
+    let recorded = ledger.recorded().unwrap();
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(recorded[0].other, "\"opus\"");
+    run.no_temporaries();
+    run.no_payload_in_state(MARKER.as_bytes());
+
+    // Unchanged: reused, 0 source bytes, nothing written.
+    let before = Consolidating::files(&destination);
+    let again = run.run();
+    assert!(again.refusals.is_empty(), "{:?}", again.refusals);
+    assert_eq!(again.source_bytes_read, 0);
+    assert!(again.consolidated.is_empty());
+    assert_eq!(Consolidating::files(&destination), before);
+}
+
+#[test]
+fn an_append_log_is_extended_covered_or_consolidated() {
+    let run = Consolidating::new(false);
+    let (source, destination) = (run.source(), run.destination());
+    let grown = noise(401, 400_000);
+    std::fs::write(source.join("grown.jsonl"), &grown).unwrap();
+    std::fs::write(destination.join("grown.jsonl"), &grown[..200_000]).unwrap();
+    let continued = noise(402, 300_000);
+    let mut longer = continued.clone();
+    longer.extend_from_slice(&noise(403, 50_000));
+    std::fs::write(source.join("continued.jsonl"), &continued).unwrap();
+    std::fs::write(destination.join("continued.jsonl"), &longer).unwrap();
+    let lines = |tag: &str, count: usize| -> Vec<u8> {
+        (0..count).fold(Vec::new(), |mut bytes, at| {
+            bytes.extend_from_slice(format!("{{\"{tag}\":{at}}}\n").as_bytes());
+            bytes
+        })
+    };
+    let mut diverged = lines("shared", 10_000);
+    let mut theirs = diverged.clone();
+    diverged.extend_from_slice(&lines("neo", 100));
+    theirs.extend_from_slice(&lines("sting", 100));
+    std::fs::write(source.join("diverged.jsonl"), &diverged).unwrap();
+    std::fs::write(destination.join("diverged.jsonl"), &theirs).unwrap();
+    run.settle();
+
+    let stats = run.run();
+    assert!(held(&stats).is_empty(), "{:?}", held(&stats));
+    assert_eq!(
+        consolidated(&stats),
+        [
+            ("continued.jsonl".to_owned(), "covered".to_owned()),
+            ("diverged.jsonl".to_owned(), "consolidate".to_owned()),
+        ]
+    );
+    assert_eq!(
+        stats.prefix_extended.len(),
+        1,
+        "{:?}",
+        stats.prefix_extended
+    );
+    assert_eq!(
+        std::fs::read(destination.join("grown.jsonl")).unwrap(),
+        grown
+    );
+    assert_eq!(
+        std::fs::read(destination.join("continued.jsonl")).unwrap(),
+        longer
+    );
+    let mut union = diverged.clone();
+    union.extend_from_slice(&lines("sting", 100));
+    assert_eq!(
+        std::fs::read(destination.join("diverged.jsonl")).unwrap(),
+        union,
+        "one file: the source's bytes, then the live file's lines"
+    );
+    run.no_temporaries();
+    run.no_payload_in_state(&diverged[..4096]);
+    run.no_payload_in_state(&grown[200_000..204_096]);
+
+    // Unchanged: every seat is reused, with 0 source bytes read.
+    let again = run.run();
+    assert!(held(&again).is_empty());
+    assert_eq!(again.source_bytes_read, 0);
+}
+
+#[test]
+fn opaque_files_sqlite_stores_and_other_kinds_are_held_never_beside() {
+    let run = Consolidating::new(false);
+    let (source, destination) = (run.source(), run.destination());
+    std::fs::write(source.join("blob.bin"), noise(411, 100_000)).unwrap();
+    std::fs::write(destination.join("blob.bin"), noise(412, 100_000)).unwrap();
+    std::fs::write(source.join("state_5.sqlite"), noise(413, 100_000)).unwrap();
+    std::fs::write(source.join("state_5.sqlite-wal"), noise(414, 1000)).unwrap();
+    std::fs::write(source.join("linked.json"), b"{\"a\": 1}\n").unwrap();
+    std::fs::write(destination.join("elsewhere.json"), b"{\"b\": 2}\n").unwrap();
+    std::os::unix::fs::symlink("elsewhere.json", destination.join("linked.json")).unwrap();
+    std::fs::write(source.join("same.bin"), b"same").unwrap();
+    std::fs::write(destination.join("same.bin"), b"same").unwrap();
+    std::fs::write(source.join("new.bin"), b"new").unwrap();
+    run.settle();
+
+    let stats = run.run();
+    assert_eq!(
+        held(&stats),
+        [
+            "blob.bin",
+            "linked.json",
+            "state_5.sqlite",
+            "state_5.sqlite-wal"
+        ]
+    );
+    assert_eq!(std::fs::read(destination.join("new.bin")).unwrap(), b"new");
+    assert!(!destination.join("state_5.sqlite").exists());
+    assert_eq!(
+        std::fs::read(destination.join("elsewhere.json")).unwrap(),
+        b"{\"b\": 2}\n"
+    );
+    assert!(std::fs::symlink_metadata(destination.join("linked.json"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    run.no_temporaries();
+    let mut names: Vec<String> = Consolidating::files(&destination)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    names.sort();
+    assert_eq!(names, ["blob.bin", "elsewhere.json", "new.bin", "same.bin"]);
+}
+
+#[test]
+fn plan_only_writes_nothing_and_lists_every_seat() {
+    let run = Consolidating::new(true);
+    let (source, destination) = (run.source(), run.destination());
+    std::fs::write(source.join("new.json"), b"{}\n").unwrap();
+    std::fs::write(source.join("same.bin"), b"same").unwrap();
+    std::fs::write(destination.join("same.bin"), b"same").unwrap();
+    std::fs::write(source.join("settings.json"), b"{\"a\": 1}\n").unwrap();
+    std::fs::write(destination.join("settings.json"), b"{\"b\": 2}\n").unwrap();
+    let grown = noise(421, 400_000);
+    std::fs::write(source.join("grown.jsonl"), &grown).unwrap();
+    std::fs::write(destination.join("grown.jsonl"), &grown[..200_000]).unwrap();
+    std::fs::write(source.join("blob.bin"), b"ours").unwrap();
+    std::fs::write(destination.join("blob.bin"), b"theirs").unwrap();
+    std::fs::create_dir(source.join("sub")).unwrap();
+    std::fs::write(source.join("sub/inner.txt"), b"x").unwrap();
+    run.settle();
+    let before = Consolidating::files(&destination);
+
+    let stats = run.run();
+    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+    assert_eq!(Consolidating::files(&destination), before);
+    assert!(!destination.join("sub").exists());
+    let mut planned: Vec<(String, &str)> = stats
+        .planned
+        .iter()
+        .map(|seat| {
+            (
+                String::from_utf8_lossy(&seat.rel_path).into_owned(),
+                seat.action,
+            )
+        })
+        .collect();
+    planned.sort();
+    assert_eq!(
+        planned,
+        [
+            ("blob.bin".to_owned(), "hold"),
+            ("grown.jsonl".to_owned(), "extend"),
+            ("new.json".to_owned(), "create"),
+            ("same.bin".to_owned(), "adopt"),
+            ("settings.json".to_owned(), "consolidate"),
+            ("sub/inner.txt".to_owned(), "create"),
+        ]
+    );
+    let blob = stats
+        .planned
+        .iter()
+        .find(|seat| seat.rel_path == b"blob.bin")
+        .unwrap();
+    assert_eq!((blob.source_size, blob.live_size), (4, Some(6)));
+    assert_eq!(blob.reason, Some("opaque: the bytes differ"));
+    // The plan recorded nothing a real pass would reuse.
+    run.set(false);
+    let real = run.run();
+    assert_eq!(
+        consolidated(&real),
+        [("settings.json".to_owned(), "consolidate".to_owned())]
+    );
 }

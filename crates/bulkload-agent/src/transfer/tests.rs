@@ -751,14 +751,12 @@ fn a_chunk_of_a_superseded_output_is_still_filled_locally() {
                 displaced,
                 session: &session,
                 salvage: &salvage,
+                consolidate: None,
             },
             Planned {
                 row: &row,
                 extend: false,
                 snapshot: false,
-                beside: None,
-                claimed: &HashSet::new(),
-                always: false,
             },
             &manifest,
             &mut Vec::new(),
@@ -3217,12 +3215,8 @@ mod prefix;
 
 // ---- plan of record 2026-10-19 C1/C2: `--beside SUFFIX` lands a differing
 // ---- file beside the live one --------------------------------------------
-mod beside;
-
 // ---- #280 finding 9: `--map-prefix SRC_REL=DST_REL` lands a source path
 // ---- once, at its mapped destination path --------------------------------
 mod map_prefix;
 
-// ---- operator ruling 2026-10-20: append logs consolidated in place, never
-// ---- landed beside ----------------------------------------------------------
 mod consolidate;

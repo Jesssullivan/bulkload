@@ -386,8 +386,9 @@ pub struct TransferDetail {
     /// The refused or covered path (entry rows).
     pub path: Option<Vec<u8>>,
     /// The row's outcome name: `completed`, `running` or `refused` for a
-    /// session, `refused`, `sidecar-covered`, `applied-beside`, `mapped` or
-    /// `dest-ahead` for an entry, `null` with no readable record.
+    /// session, `refused`, `sidecar-covered`, `applied-beside`,
+    /// `consolidated` or `mapped` for an entry, `null` with no readable
+    /// record.
     pub outcome: Option<&'static str>,
     /// The recorded refusal, typed or not.
     pub refusal: Option<crate::outcome::Refusal>,
@@ -398,6 +399,8 @@ pub struct TransferDetail {
     /// The destination path a `mapped` entry's source path landed at
     /// (`--map-prefix`, #280 finding 9).
     pub mapped: Option<Vec<u8>>,
+    /// A `consolidated` entry's action (`--consolidate`).
+    pub consolidation: Option<String>,
 }
 
 /// The ruling that gives a transfer refusal its default disposition.
@@ -1191,6 +1194,9 @@ fn write_transfer(out: &mut String, row: &Row, detail: &TransferDetail) {
             json_string(&mapped.escape_ascii().to_string())
         );
     }
+    if let Some(action) = &detail.consolidation {
+        let _ = write!(out, ",\"consolidation\":{}", json_string(action));
+    }
     if let Some(refusal) = &detail.refusal {
         let _ = write!(
             out,
@@ -1285,6 +1291,7 @@ fn unrecorded(state: &std::path::Path, item: String, source: &str, why: &'static
             sqlite_code: None,
             beside: None,
             mapped: None,
+            consolidation: None,
         },
     )
 }
@@ -1339,6 +1346,7 @@ fn record_rows(
         sqlite_code,
         beside: None,
         mapped: None,
+        consolidation: None,
     };
     let record = match read {
         None => {
@@ -1427,13 +1435,11 @@ fn record_rows(
             // `--map-prefix`: the source path landed at its mapped path,
             // accounted as the session's applied entries are.
             EntryOutcome::Mapped { .. } => ("mapped", None, None, Disposition::Applied, None),
-            // `--beside`: the live file holds the seat's bytes and more;
-            // covered by it, nothing written.
-            EntryOutcome::DestAhead => ("dest-ahead", None, None, Disposition::Covered, None),
-            // Consolidated in place: the seat's bytes and the live file's
-            // records, one file (ruling 2026-10-20).
+            // `--consolidate`: the seat's bytes are in the live file, merged
+            // or already there; accounted as covered (operator ruling
+            // 2026-10-20).
             EntryOutcome::Consolidated { .. } => {
-                ("consolidated", None, None, Disposition::Applied, None)
+                ("consolidated", None, None, Disposition::Covered, None)
             }
         };
         let mut entry_row = transfer_row(
@@ -1455,6 +1461,11 @@ fn record_rows(
                 EntryOutcome::Mapped { to } => detail.mapped = Some(to.clone()),
                 _ => {}
             }
+        }
+        if let (EntryOutcome::Consolidated { action }, Some(detail)) =
+            (&entry.outcome, entry_row.transfer.as_mut())
+        {
+            detail.consolidation = Some(action.clone());
         }
         entry_row.kind = RowKind::TransferEntry;
         // Only a typed refusal can carry a default: a bare IO never counts.

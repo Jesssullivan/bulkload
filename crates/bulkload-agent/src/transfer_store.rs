@@ -431,19 +431,13 @@ pub enum RefusedOutput {
     /// extension is not honoured for such a file while the extension is on
     /// (it is planned once more); this one is.
     NotPrefix,
-    /// `--beside` (review of #280, finding 3): the beside path of a seat
-    /// holds a file this store does not own with other bytes than the
-    /// seat's. Recorded under the seat's beside key with that file's
-    /// identity, beside the live path's own record.
-    BesideOccupied,
-    /// `--beside` (#280 finding 9): not a refusal. The live path holds a
-    /// file this store does not own whose first bytes are exactly the
-    /// seat's, and more (the destination continued an append-only file: a
-    /// session resumed there). The seat's bytes are at the destination, so
-    /// nothing is written, beside or in place, and the entry is accounted
-    /// `dest-ahead`; recorded so an unchanged rerun answers it with nothing
-    /// read.
-    DestAhead,
+    /// `--consolidate` (operator ruling 2026-10-20): the live path holds a
+    /// file this seat's class has no union for (or whose union held it),
+    /// with other bytes than the seat's: held
+    /// `HOMES_CONSOLIDATE_UNSUPPORTED`, nothing written. Recorded under the
+    /// seat's key with the live file's identity, so an unchanged rerun reads
+    /// nothing.
+    ConsolidateHeld,
 }
 
 impl RefusedOutput {
@@ -453,8 +447,7 @@ impl RefusedOutput {
             Self::Occupied => 1,
             Self::ExchangeUnsupported => 2,
             Self::NotPrefix => 3,
-            Self::BesideOccupied => 4,
-            Self::DestAhead => 5,
+            Self::ConsolidateHeld => 5,
         }
     }
 
@@ -463,8 +456,9 @@ impl RefusedOutput {
             1 => Some(Self::Occupied),
             2 => Some(Self::ExchangeUnsupported),
             3 => Some(Self::NotPrefix),
-            4 => Some(Self::BesideOccupied),
-            5 => Some(Self::DestAhead),
+            // 4 was `--beside`'s, retired with it (SPEC rule 3): never
+            // reused, and an old record of it is a miss.
+            5 => Some(Self::ConsolidateHeld),
             _ => None,
         }
     }
@@ -473,11 +467,9 @@ impl RefusedOutput {
     #[must_use]
     pub const fn refusal(self) -> BulkloadRefusal {
         match self {
-            // `DestAhead` is answered before it is ever asked for as one.
-            Self::Occupied | Self::NotPrefix | Self::BesideOccupied | Self::DestAhead => {
-                BulkloadRefusal::DestinationOccupied
-            }
+            Self::Occupied | Self::NotPrefix => BulkloadRefusal::DestinationOccupied,
             Self::ExchangeUnsupported => BulkloadRefusal::DestinationExchangeUnsupported,
+            Self::ConsolidateHeld => BulkloadRefusal::HomesConsolidateUnsupported,
         }
     }
 }
@@ -855,7 +847,8 @@ impl Store {
                 CREATE TABLE IF NOT EXISTS refused_outputs (key BLOB PRIMARY KEY, kind INTEGER NOT NULL, identity BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS owned_outputs (key BLOB PRIMARY KEY, identity BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS prefix_extensions (path BLOB NOT NULL, prior_size INTEGER NOT NULL, prior_blake3 BLOB NOT NULL, identity BLOB NOT NULL, PRIMARY KEY (path, prior_size));
-                CREATE TABLE IF NOT EXISTS prefix_intents (path BLOB PRIMARY KEY, prior_size INTEGER NOT NULL, prior_blake3 BLOB NOT NULL, prior_identity BLOB NOT NULL);",
+                CREATE TABLE IF NOT EXISTS prefix_intents (path BLOB PRIMARY KEY, prior_size INTEGER NOT NULL, prior_blake3 BLOB NOT NULL, prior_identity BLOB NOT NULL);
+                CREATE TABLE IF NOT EXISTS consolidated (key BLOB PRIMARY KEY);",
             )
             .and_then(|()| {
                 conn.execute(
@@ -1252,6 +1245,39 @@ impl Store {
         self.conn
             .prepare_cached("SELECT EXISTS(SELECT 1 FROM outputs WHERE key = ?1)")
             .and_then(|mut statement| statement.query_row([key], |row| row.get(0)))
+            .map_err(sqlite_error)
+    }
+
+    /// `--consolidate` (operator ruling 2026-10-20): whether the seat under
+    /// `key` (its source identity) was consolidated into the live file on
+    /// an earlier pass. The source's bytes are in the destination's file
+    /// then, whatever the destination wrote since, so an unchanged seat is
+    /// reused and the source reads nothing.
+    ///
+    /// # Errors
+    /// Refuses database failures.
+    pub fn consolidated(&self, key: &[u8]) -> Result<bool> {
+        if !self.rows_trusted {
+            return Ok(false);
+        }
+        self.conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM consolidated WHERE key = ?1)")
+            .and_then(|mut statement| statement.query_row([key], |row| row.get(0)))
+            .map_err(sqlite_error)
+    }
+
+    /// Record that the seat under `key` is consolidated ([`Self::consolidated`]),
+    /// after the union's bytes are durable.
+    ///
+    /// # Errors
+    /// Refuses database failures.
+    pub fn record_consolidated(&self, key: &[u8]) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO consolidated VALUES (?1) ON CONFLICT(key) DO NOTHING",
+                [key],
+            )
+            .map(|_| ())
             .map_err(sqlite_error)
     }
 
@@ -2233,23 +2259,9 @@ pub(crate) fn owner_key(row_key: &[u8]) -> Option<&[u8]> {
     row_key.get(..row_key.len().checked_sub(rest.len())?)
 }
 
-/// The mark every beside row's key ends with (review of #280, finding 4):
-/// a seat's beside path may be the live path of another source seat (the
-/// source holds `x` and `x<suffix>`), whose rows share the path's prefix.
-/// Only a marked row makes a file at a beside path that seat's own.
-pub(crate) const BESIDE_KEY_MARK: &[u8] = b"\0bulkload.beside.v1";
-
-/// The mark of the ownership row a racy capture's beside output gets
-/// (second review of #280, N3): the beside key with this mark in place of
-/// [`BESIDE_KEY_MARK`], in `outputs`. No reuse lookup ever asks for that
-/// key, so it is never a reuse key (#86), but it makes the output that
-/// seat's own, so a later pass supersedes it instead of refusing it as a
-/// stranger's.
-pub(crate) const BESIDE_RACY_MARK: &[u8] = b"\0bulkload.beside-racy.v1";
-
 /// Write an output's row inside the caller's transaction: its reuse row
 /// under its key, or, for a racy capture's output, its path's ownership row
-/// alone (and, for a beside output, its marked ownership row, N3).
+/// alone.
 fn row_in(conn: &rusqlite::Connection, output: &OutputRecord) -> Result<()> {
     if let Some(proof) = &output.extended {
         // M2r2 A-103: the prefix the extension proved, and what it made;
@@ -2280,16 +2292,6 @@ fn row_in(conn: &rusqlite::Connection, output: &OutputRecord) -> Result<()> {
         // seat, so it is never a reuse key.
         if let Some(owner) = owner_key(&output.key) {
             own_in(conn, owner, &output.identity)?;
-        }
-        if let Some(seat) = output.key.strip_suffix(BESIDE_KEY_MARK) {
-            let mut owner = seat.to_vec();
-            owner.extend_from_slice(BESIDE_RACY_MARK);
-            conn.execute(
-                "INSERT INTO outputs VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET identity=excluded.identity",
-                (&owner, identity_bytes(&output.identity)?),
-            )
-            .map_err(sqlite_error)?;
         }
         return Ok(());
     }
@@ -2798,6 +2800,7 @@ mod tests {
             tables,
             [
                 "captures",
+                "consolidated",
                 "directories",
                 "output_hints",
                 "outputs",

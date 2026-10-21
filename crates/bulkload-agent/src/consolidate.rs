@@ -69,7 +69,12 @@ impl Class {
             .rsplit(|byte| *byte == b'/')
             .next()
             .unwrap_or(rel_path);
-        if sqlite || name.ends_with(b".sqlite") || name.ends_with(b".sqlite3") {
+        // A store's `-wal`, `-shm` and `-journal` go with it.
+        let base = [b"-wal".as_slice(), b"-shm", b"-journal"]
+            .iter()
+            .find_map(|sidecar| name.strip_suffix(*sidecar))
+            .unwrap_or(name);
+        if sqlite || base.ends_with(b".sqlite") || base.ends_with(b".sqlite3") {
             Self::Sqlite
         } else if name.ends_with(b".jsonl") {
             Self::AppendLog

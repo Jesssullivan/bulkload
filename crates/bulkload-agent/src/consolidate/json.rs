@@ -301,7 +301,8 @@ impl Style {
         Self {
             indent,
             colon_space,
-            comma_space: comma_space.unwrap_or(false),
+            // A one-line document with no `,` yet: spaced as its `:` is.
+            comma_space: comma_space.unwrap_or(colon_space),
             newline,
             trailing_newline,
         }

@@ -698,6 +698,9 @@ fn files_are_classed_by_the_union_they_take() {
     );
     assert_eq!(Class::of(b"state_5.sqlite", false), Class::Sqlite);
     assert_eq!(Class::of(b"anything", true), Class::Sqlite);
+    assert_eq!(Class::of(b"state_5.sqlite-wal", false), Class::Sqlite);
+    assert_eq!(Class::of(b"logs_1.sqlite-journal", false), Class::Sqlite);
+    assert_eq!(Class::of(b"notes-wal", false), Class::Opaque);
     assert_eq!(Class::of(b"plugins/cache/x.bin", false), Class::Opaque);
     // The append-log union is the #294 lane's; the SQLite union is the
     // #278 lane's, and until it lands that class is held.

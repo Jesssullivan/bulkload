@@ -9,7 +9,6 @@
 
 use super::*;
 
-const SUFFIX: &[u8] = b".neo-20261019";
 const NEO: &str = "projects/-Users-jess-git-lab";
 const STING: &str = "projects/-srv-fast-local-jess-git-lab";
 
@@ -17,19 +16,26 @@ fn pair(source: &str, destination: &str) -> map::Map {
     (source.as_bytes().to_vec(), destination.as_bytes().to_vec())
 }
 
-/// A corpus whose destination root runs with `maps` (and `--beside`).
+/// A corpus whose destination root runs with `maps` (and `--consolidate`).
 struct Mapped {
     corpus: Corpus,
     root: PathBuf,
 }
 
 impl Mapped {
-    fn new(maps: Vec<map::Map>, beside: bool) -> Self {
+    fn new(maps: Vec<map::Map>, consolidate: bool) -> Self {
         let corpus = Corpus::new();
         let root = std::fs::canonicalize(corpus.base.join("destination")).unwrap();
         set_map_prefix(&root, Some(maps));
-        if beside {
-            set_beside(&root, Some(Some(SUFFIX.to_vec())));
+        if consolidate {
+            set_consolidate_for(
+                &root,
+                Some(Some(Consolidation {
+                    maps: crate::consolidate::Maps::new(Vec::new()),
+                    ledger: corpus.base.join("consolidate"),
+                    plan_only: false,
+                })),
+            );
         }
         Self { corpus, root }
     }
@@ -56,7 +62,7 @@ impl Mapped {
 impl Drop for Mapped {
     fn drop(&mut self) {
         set_map_prefix(&self.root, None);
-        set_beside(&self.root, None);
+        set_consolidate_for(&self.root, None);
     }
 }
 
@@ -107,11 +113,7 @@ fn a_mapped_key_lands_once_under_its_destination_and_a_rerun_reads_nothing() {
 
     let first = run.corpus.run().unwrap();
     assert!(first.refusals.is_empty(), "{:?}", first.refusals);
-    assert!(
-        first.applied_beside.is_empty(),
-        "{:?}",
-        first.applied_beside
-    );
+    assert!(first.held.is_empty(), "{:?}", first.held);
     assert_eq!(mapped(&first), [(NEO.to_owned(), STING.to_owned())]);
     assert_eq!(
         std::fs::read(run.destination(&format!("{STING}/a.jsonl"))).unwrap(),
@@ -184,11 +186,7 @@ fn a_growing_transcript_is_extended_in_place_under_its_mapped_key() {
 
     let first = run.corpus.run().unwrap();
     assert!(first.refusals.is_empty(), "{:?}", first.refusals);
-    assert!(
-        first.applied_beside.is_empty(),
-        "{:?}",
-        first.applied_beside
-    );
+    assert!(first.held.is_empty(), "{:?}", first.held);
     assert_eq!(
         first
             .prefix_extended
@@ -203,9 +201,6 @@ fn a_growing_transcript_is_extended_in_place_under_its_mapped_key() {
     );
     assert_eq!(std::fs::read(&at).unwrap(), full);
     assert_eq!(std::fs::metadata(&at).unwrap().ino(), inode, "in place");
-    let mut beside = at.clone().into_os_string();
-    beside.push(std::ffi::OsStr::from_bytes(SUFFIX));
-    assert!(!Path::new(&beside).exists(), "nothing beside");
     assert!(!run.destination(NEO).exists());
 
     // It grows again: extended again, under the mapped key.
@@ -215,14 +210,9 @@ fn a_growing_transcript_is_extended_in_place_under_its_mapped_key() {
     run.settle();
     let second = run.corpus.run().unwrap();
     assert!(second.refusals.is_empty(), "{:?}", second.refusals);
-    assert!(
-        second.applied_beside.is_empty(),
-        "{:?}",
-        second.applied_beside
-    );
+    assert!(second.held.is_empty(), "{:?}", second.held);
     assert_eq!(std::fs::read(&at).unwrap(), grown);
     assert_eq!(std::fs::metadata(&at).unwrap().ino(), inode, "in place");
-    assert!(!Path::new(&beside).exists(), "nothing beside");
 
     run.settle();
     let third = run.corpus.run().unwrap();
@@ -233,11 +223,12 @@ fn a_growing_transcript_is_extended_in_place_under_its_mapped_key() {
     );
 }
 
-/// A transcript smaller than its first chunk that grew is extended in
-/// place under `--beside` (its head judged whole against the staged first
-/// chunk), not copied beside; one whose head differs lands whole beside.
+/// A transcript smaller than its first chunk that grew is extended in place
+/// under its mapped key; one whose head differs is consolidated into the
+/// live file, the source's bytes then the live file's line, never beside
+/// (SPEC rule 3).
 #[test]
-fn a_small_transcript_that_grew_is_extended_and_a_small_fork_lands_beside() {
+fn a_small_transcript_that_grew_is_extended_and_a_small_fork_is_consolidated() {
     let run = Mapped::new(vec![pair(NEO, STING)], true);
     let small: &[u8] = b"{\"a\":1}\n";
     let grown: &[u8] = b"{\"a\":1}\n{\"b\":2}\n";
@@ -248,32 +239,19 @@ fn a_small_transcript_that_grew_is_extended_and_a_small_fork_lands_beside() {
     Mapped::write(&fork_at, b"{\"z\":0}\n");
     Mapped::write(&run.source(&format!("{NEO}/k.jsonl")), grown);
     run.settle();
-    let inode = std::fs::metadata(&at).unwrap().ino();
 
     let first = run.corpus.run().unwrap();
     assert!(first.refusals.is_empty(), "{:?}", first.refusals);
-    assert_eq!(
-        first
-            .prefix_extended
-            .iter()
-            .map(|(path, held, _, size)| (path.clone(), *held, *size))
-            .collect::<Vec<_>>(),
-        [(
-            format!("{STING}/s.jsonl").into_bytes(),
-            small.len() as u64,
-            grown.len() as u64
-        )]
-    );
+    assert!(first.held.is_empty(), "{:?}", first.held);
     assert_eq!(std::fs::read(&at).unwrap(), grown);
-    assert_eq!(std::fs::metadata(&at).unwrap().ino(), inode, "in place");
-    let beside = |path: &Path| {
-        let mut beside = path.as_os_str().to_owned();
-        beside.push(std::ffi::OsStr::from_bytes(SUFFIX));
-        PathBuf::from(beside)
-    };
-    assert!(!beside(&at).exists(), "nothing beside");
-    assert_eq!(std::fs::read(&fork_at).unwrap(), b"{\"z\":0}\n");
-    assert_eq!(std::fs::read(beside(&fork_at)).unwrap(), grown);
+    let mut union = grown.to_vec();
+    union.extend_from_slice(b"{\"z\":0}\n");
+    assert_eq!(std::fs::read(&fork_at).unwrap(), union);
+    let names: Vec<_> = std::fs::read_dir(at.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names.len(), 2, "nothing beside: {names:?}");
 
     run.settle();
     let again = run.corpus.run().unwrap();
@@ -285,19 +263,21 @@ fn a_small_transcript_that_grew_is_extended_and_a_small_fork_lands_beside() {
 }
 
 /// The destination continued the session (resumed there): its live file
-/// holds the seat's bytes and more. Nothing lands, beside or in place; the
-/// seat is accounted `dest-ahead`, and an unchanged rerun reads nothing.
-/// One that holds other bytes still lands beside.
+/// holds the seat's records and more. It is covered and never rewritten
+/// (SPEC rule 7); one both sides continued is consolidated into one file;
+/// an unchanged rerun reads nothing.
 #[test]
-fn a_live_file_that_holds_the_seat_and_more_is_dest_ahead_and_nothing_lands() {
+fn a_live_file_that_holds_the_seat_and_more_is_covered_and_never_rewritten() {
     let run = Mapped::new(vec![pair(NEO, STING)], true);
-    let neo = noise(921, 400_000);
+    let neo: Vec<u8> = (0..20_000).fold(Vec::new(), |mut bytes, at| {
+        bytes.extend_from_slice(format!("{{\"line\":{at}}}\n").as_bytes());
+        bytes
+    });
     let mut sting = neo.clone();
     sting.extend_from_slice(b"{\"sting\":\"continued\"}\n");
     let at = run.destination(&format!("{STING}/r.jsonl"));
     Mapped::write(&at, &sting);
     Mapped::write(&run.source(&format!("{NEO}/r.jsonl")), &neo);
-    // Both sides changed: kept both.
     let mut forked = neo;
     forked.extend_from_slice(b"{\"neo\":\"continued\"}\n");
     Mapped::write(&run.source(&format!("{NEO}/f.jsonl")), &forked);
@@ -308,13 +288,20 @@ fn a_live_file_that_holds_the_seat_and_more_is_dest_ahead_and_nothing_lands() {
 
     let first = run.corpus.run().unwrap();
     assert!(first.refusals.is_empty(), "{:?}", first.refusals);
-    assert_eq!(first.dest_ahead, [format!("{STING}/r.jsonl").into_bytes()]);
+    let mut consolidated = first.consolidated;
+    consolidated.sort();
     assert_eq!(
-        first.applied_beside,
-        [(
-            format!("{STING}/f.jsonl").into_bytes(),
-            format!("{STING}/f.jsonl{}", String::from_utf8_lossy(SUFFIX)).into_bytes()
-        )]
+        consolidated,
+        [
+            (
+                format!("{STING}/f.jsonl").into_bytes(),
+                "consolidate".to_owned()
+            ),
+            (
+                format!("{STING}/r.jsonl").into_bytes(),
+                "covered".to_owned()
+            ),
+        ]
     );
     assert_eq!(std::fs::read(&at).unwrap(), sting, "untouched");
     let now = std::fs::metadata(&at).unwrap();
@@ -322,21 +309,9 @@ fn a_live_file_that_holds_the_seat_and_more_is_dest_ahead_and_nothing_lands() {
         (now.ino(), now.mtime_nsec()),
         (live.ino(), live.mtime_nsec())
     );
-    let mut beside = at.clone().into_os_string();
-    beside.push(std::ffi::OsStr::from_bytes(SUFFIX));
-    assert!(!Path::new(&beside).exists(), "nothing beside");
-    assert_eq!(std::fs::read(&fork_at).unwrap(), sting);
-    let record = crate::transfer_outcome::TransferRecord::ended(
-        "copy",
-        "source",
-        &run.root,
-        &Ok(first),
-        "transfer::copy",
-    );
-    assert!(record.entries.contains(&crate::transfer_outcome::Entry {
-        rel_path: format!("{STING}/r.jsonl").into_bytes(),
-        outcome: crate::transfer_outcome::EntryOutcome::DestAhead,
-    }));
+    let mut union = forked;
+    union.extend_from_slice(b"{\"sting\":\"continued\"}\n");
+    assert_eq!(std::fs::read(&fork_at).unwrap(), union);
 
     run.settle();
     let again = run.corpus.run().unwrap();
@@ -345,9 +320,7 @@ fn a_live_file_that_holds_the_seat_and_more_is_dest_ahead_and_nothing_lands() {
         again.source_bytes_read, 0,
         "an unchanged rerun reads nothing"
     );
-    assert_eq!(again.dest_ahead, [format!("{STING}/r.jsonl").into_bytes()]);
     assert_eq!(std::fs::read(&at).unwrap(), sting);
-    assert!(!Path::new(&beside).exists());
 }
 
 /// The source holds a mapped destination's name itself: those paths would
@@ -411,53 +384,6 @@ fn a_set_the_rules_refuse_refuses_before_either_store_exists() {
         .unwrap()
         .next()
         .is_none());
-}
-
-/// #294 review 2: an append-only live file written within the racy window
-/// (a session writing there now) is refused `DESTINATION_UNSETTLED`, typed,
-/// nothing landed beside it and nothing remembered: once it is quiet the
-/// next pass decides it (here: both continued, so it lands beside).
-#[test]
-fn a_live_file_written_now_is_unsettled_and_the_next_pass_decides() {
-    let run = Mapped::new(vec![pair(NEO, STING)], true);
-    let at = run.destination(&format!("{STING}/w.jsonl"));
-    Mapped::write(
-        &run.source(&format!("{NEO}/w.jsonl")),
-        b"{\"a\":1}\n{\"neo\":3}\n",
-    );
-    settle_racy_window(&run.corpus.base.join("source")).unwrap();
-    // The destination's session writes now, and its clock is now.
-    Mapped::write(&at, b"{\"a\":1}\n{\"sting\":2}\n");
-    set_capture_clock(&run.root, Some(crate::git_carry::pass_start_ns()));
-    let first = run.corpus.run();
-    set_capture_clock(&run.root, None);
-    let first = first.unwrap();
-    assert_eq!(
-        refused(&first),
-        [(
-            format!("{STING}/w.jsonl"),
-            "DESTINATION_UNSETTLED".to_owned()
-        )]
-    );
-    let mut beside = at.clone().into_os_string();
-    beside.push(std::ffi::OsStr::from_bytes(SUFFIX));
-    assert!(!Path::new(&beside).exists(), "never a beside copy");
-    assert_eq!(std::fs::read(&at).unwrap(), b"{\"a\":1}\n{\"sting\":2}\n");
-
-    // Quiet now (the default test clock is an hour ahead): decided again,
-    // not remembered.
-    let second = run.corpus.run().unwrap();
-    assert!(second.refusals.is_empty(), "{:?}", second.refusals);
-    assert_eq!(
-        second.applied_beside.len(),
-        1,
-        "{:?}",
-        second.applied_beside
-    );
-    assert_eq!(
-        std::fs::read(Path::new(&beside)).unwrap(),
-        b"{\"a\":1}\n{\"neo\":3}\n"
-    );
 }
 
 /// #280 N4 with the map: a source path the owner rule refuses is still the
