@@ -1081,7 +1081,7 @@ fn print_plan(
 // (read-only at the destination), one row per line in MOVE_STATE/diff.jsonl.
 fn preview(run: &Move, (plan, corpus, private): (&Path, &Path, &Path)) -> Result<()> {
     if let Some(home) = &run.sessions {
-        homes_plan(run, home)?;
+        homes_plan(run, home, plan)?;
     }
     let rows_path = run.state.join("diff.jsonl");
     let mut file = std::fs::OpenOptions::new()
@@ -1200,7 +1200,7 @@ const CLAUDE_JSON_PULL: &str = "claude-json";
 // sizes on both sides, printed as `planned` lines. Nothing is staged,
 // written or recorded; a live home that does not exist yet is named, not
 // made.
-fn homes_plan(run: &Move, home: &Path) -> Result<()> {
+fn homes_plan(run: &Move, home: &Path, plan: &Path) -> Result<()> {
     let dest = dest_home(run)?;
     bulkload_agent::transfer::set_consolidate(Some(run.consolidation(home, true)?));
     let codex_from = run
@@ -1225,18 +1225,60 @@ fn homes_plan(run: &Move, home: &Path) -> Result<()> {
             bulkload_agent::transfer::RootKind::Tree,
         ),
     ] {
-        let to = dest.join(name);
+        let mut to = dest.join(name);
         out(&format!("estate-move homes-plan name={name} live={to:?}"))?;
-        if kind == bulkload_agent::transfer::RootKind::Tree && !to.is_dir() {
-            out(&format!(
-                "estate-move homes-plan name={name} live=absent (every file would be created)"
-            ))?;
-            continue;
+        if kind == bulkload_agent::transfer::RootKind::Tree {
+            // The real pass's live root (sting's are links into
+            // /srv/fast-local/jess/state), resolved and owner-checked as
+            // `sessions_pull` resolves it, but never created: report only.
+            match std::fs::symlink_metadata(&to) {
+                Ok(found) if found.is_dir() => {}
+                Ok(found) if found.file_type().is_symlink() => {
+                    let real = owned_real(&to)?;
+                    out(&format!(
+                        "estate-move sessions-home name={} live={to:?} real={real:?}",
+                        name.trim_start_matches('.')
+                    ))?;
+                    to = real;
+                }
+                Ok(_) => {
+                    out(&format!(
+                        "estate-move homes-plan name={name} refused={}",
+                        BulkloadRefusal::PathEscapesRoot.code()
+                    ))?;
+                    planned = planned.and(Err(BulkloadRefusal::PathEscapesRoot));
+                    continue;
+                }
+                Err(_) => {
+                    out(&format!(
+                        "estate-move homes-plan name={name} live=absent (every file would be created)"
+                    ))?;
+                    continue;
+                }
+            }
+        }
+        // #280 finding 9: the Claude tree is planned with the key map the
+        // real pass derives, so its rows (and its source-key folds) are the
+        // real pass's.
+        let claude = name == ".claude";
+        if claude {
+            let maps = derive_key_maps(run, home, plan, &to)?;
+            print_key_maps(&maps)?;
+            bulkload_agent::transfer::set_map_prefixes(maps.prefixes())?;
         }
         let pull = format!("plan-{}", name.trim_start_matches('.'));
+        let pulled = run.transfer_kind(kind, &from, &to, &pull);
+        if claude {
+            bulkload_agent::transfer::set_map_prefixes(Vec::new())?;
+        }
         // Report-only: a path refusal (an absent `~/.claude.json` among
-        // them) is printed with the plan; only a session that failed fails it.
-        if let Err(refusal) = run.transfer_kind(kind, &from, &to, &pull) {
+        // them) is printed with the plan; only a session that failed fails
+        // it, and every refusal is named.
+        if let Err(refusal) = pulled {
+            out(&format!(
+                "estate-move homes-plan name={name} refused={}",
+                refusal.code()
+            ))?;
             if !matches!(
                 refusal,
                 BulkloadRefusal::SourceRootMissing | BulkloadRefusal::ItemsRefused
