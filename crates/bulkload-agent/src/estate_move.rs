@@ -994,6 +994,9 @@ fn move_pass(run: &Move) -> Result<()> {
                 })
                 .collect()
         });
+    // The landings' racy instant: every print a landing's ledger takes is
+    // judged against it.
+    let landing_ns = bulkload_agent::git_carry::pass_start_ns();
     // Then each item's seats, host-path files and proof, mains first; a
     // related repository of the destination's own is consolidated.
     for ((row, snapshot, related), (fetched, fetch_ms)) in landing.iter().zip(fetched) {
@@ -1027,6 +1030,18 @@ fn move_pass(run: &Move) -> Result<()> {
                         )
                     } else {
                         estate::streamed::journal(&private, snapshot, &run.source)?;
+                        if row.item.workspace.is_some() {
+                            // The workspace ledger the hand-off and later passes
+                            // read.
+                            bulkload_agent::git_carry::converge::record_streamed(
+                                place,
+                                &row.id,
+                                snapshot.digest(),
+                                (snapshot.started_ns, landing_ns),
+                                &snapshot.excluded,
+                                &run.source,
+                            )?;
+                        }
                         ("workspace-restored", None)
                     };
                     estate::streamed::record_outcome(
@@ -1082,6 +1097,18 @@ fn move_pass(run: &Move) -> Result<()> {
         match landing {
             Ok(done) => {
                 estate::streamed::journal(&private, snapshot, &run.source)?;
+                if row.item.workspace.is_some() {
+                    // The workspace ledger the hand-off and later passes
+                    // read.
+                    bulkload_agent::git_carry::converge::record_streamed(
+                        place,
+                        &row.id,
+                        snapshot.digest(),
+                        (snapshot.started_ns, landing_ns),
+                        &snapshot.excluded,
+                        &run.source,
+                    )?;
+                }
                 let outcome = if row.item.workspace.is_some() {
                     "workspace-restored"
                 } else {
