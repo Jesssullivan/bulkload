@@ -804,7 +804,7 @@ fn move_pass(run: &Move) -> Result<()> {
     // replaces it; a plan with none (the homes pass: `--sessions` only)
     // goes on.
     let pulled = run
-        .transfer_ledgers(&run.source_state.join("carry"), &carry, "corpus")
+        .transfer_ledgers(&run.source_state.join("carry"), &carry, "plan")
         .and_then(|()| {
             if estate::inspect(&plan)?.is_empty() {
                 Ok(())

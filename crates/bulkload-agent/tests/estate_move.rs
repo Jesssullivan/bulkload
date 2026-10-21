@@ -536,7 +536,11 @@ fn a_sessions_only_pass_lands_the_live_home_with_no_payload_in_state() {
     fs::create_dir_all(&projects).unwrap();
     let neo = transcript(SID, &lane, "NEO");
     fs::write(projects.join(format!("{SID}.jsonl")), &neo).unwrap();
-    fs::write(src_home.join(".claude/history.jsonl"), b"{\"display\":\"p\"}\n").unwrap();
+    fs::write(
+        src_home.join(".claude/history.jsonl"),
+        b"{\"display\":\"p\"}\n",
+    )
+    .unwrap();
     let rollout_rel = format!("sessions/2026/10/20/rollout-2026-10-20T10-00-00-{THREAD}.jsonl");
     let rollout = src_home.join(".codex").join(&rollout_rel);
     fs::create_dir_all(rollout.parent().unwrap()).unwrap();
@@ -577,9 +581,14 @@ fn a_sessions_only_pass_lands_the_live_home_with_no_payload_in_state() {
         &state,
     ]));
     let both = format!("{}\n{}", moved.stdout, moved.stderr);
-    assert!(moved.stdout.contains("estate-move phase=pull outcome=ok"), "{both}");
     assert!(
-        moved.stdout.contains("estate-move phase=sessions-pull outcome=ok"),
+        moved.stdout.contains("estate-move phase=pull outcome=ok"),
+        "{both}"
+    );
+    assert!(
+        moved
+            .stdout
+            .contains("estate-move phase=sessions-pull outcome=ok"),
         "{both}"
     );
     assert_eq!(
@@ -597,7 +606,10 @@ fn a_sessions_only_pass_lands_the_live_home_with_no_payload_in_state() {
         fs::read(dst_home.join(".codex").join(&rollout_rel)).unwrap(),
         b"{\"type\":\"session_meta\"}\n"
     );
-    assert_eq!(fs::read(dst_home.join(".claude/settings.json")).unwrap(), b"{}\n");
+    assert_eq!(
+        fs::read(dst_home.join(".claude/settings.json")).unwrap(),
+        b"{}\n"
+    );
     assert!(!state.join("landing").exists(), "no landing area");
     let words = state_line(&moved.stdout, "estate-move");
     assert_eq!(words["state_payload_bytes"], "0", "{both}");
