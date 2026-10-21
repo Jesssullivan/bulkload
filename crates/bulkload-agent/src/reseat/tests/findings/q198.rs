@@ -357,10 +357,15 @@ fn run_hooked(
 /// after the target was read and before the swap. The append is never
 /// orphaned or deleted: the transcript is refused
 /// (`RESEAT_REGULARIZE_RACED`), the link and the archive (with the append)
-/// are untouched, the staged copy is kept aside (named on the line), and
-/// no row is written, so the next pass regularizes it whole while the kept
-/// copy stays.
+/// are untouched, and no row is written. The staged copy is a prefix of the
+/// archive target, so it is unioned into it (covered) and removed: no
+/// second copy stays (SPEC #298 rules 3 and 4). The next pass regularizes
+/// the whole transcript.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "a union that writes needs the open-file check (Linux only; elsewhere HOMES_CONSOLIDATE_HOLDER_UNKNOWN)"
+)]
 fn q198_2_rr_append_between_read_and_swap_keeps_both_copies() {
     let _serial = SERIAL
         .lock()
@@ -389,13 +394,11 @@ fn q198_2_rr_append_between_read_and_swap_keeps_both_copies() {
         "{report}"
     );
     assert_eq!(fs::read_link(&link).unwrap(), target);
-    let mut whole = bytes.clone();
+    let mut whole = bytes;
     whole.extend_from_slice(appended);
     assert_eq!(fs::read(&target).unwrap(), whole, "the append kept");
-    let kept = kept_beside(&link);
-    assert_eq!(kept.len(), 1, "{kept:?} {report}");
-    assert_eq!(fs::read(&kept[0]).unwrap(), bytes, "the staged copy kept");
-    assert!(report.contains(&*kept[0].to_string_lossy()), "{report}");
+    assert!(kept_beside(&link).is_empty(), "the copy folded, {report}");
+    assert!(report.contains("\"kept\":null"), "{report}");
     let ledger = ledger::Ledger::open_read_only(&options.state)
         .unwrap()
         .unwrap();
@@ -406,15 +409,20 @@ fn q198_2_rr_append_between_read_and_swap_keeps_both_copies() {
     assert!(fs::symlink_metadata(&link).unwrap().is_file(), "{lines:?}");
     assert_eq!(fs::read(&link).unwrap(), whole);
     assert_eq!(fs::read(&target).unwrap(), whole, "archive kept");
-    assert_eq!(kept_beside(&link), kept, "a kept copy is never removed");
+    assert!(kept_beside(&link).is_empty());
 }
 
 /// Q198 (2) re-review, MEDIUM 1, under the swap: the target is written
 /// just after the exchange. With the copy unchanged, the link goes back
-/// over it and the copy is kept aside; with the copy written too (a
+/// over it and the copy, a prefix of the target, is unioned into it and
+/// removed (no second copy); with the copy written too (a
 /// session opened the path after the swap), both stay: the copy at the
 /// path, the archive untouched, and `--undo` refuses the row.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "a union that writes needs the open-file check (Linux only; elsewhere HOMES_CONSOLIDATE_HOLDER_UNKNOWN)"
+)]
 fn q198_2_rr_append_under_the_swap_keeps_both_copies() {
     let _serial = SERIAL
         .lock()
@@ -440,12 +448,10 @@ fn q198_2_rr_append_under_the_swap_keeps_both_copies() {
     );
     assert!(report.contains("RESEAT_REGULARIZE_RACED"), "{report}");
     assert_eq!(fs::read_link(&link).unwrap(), target, "the link back");
-    let mut whole = bytes.clone();
+    let mut whole = bytes;
     whole.extend_from_slice(archived);
     assert_eq!(fs::read(&target).unwrap(), whole);
-    let kept = kept_beside(&link);
-    assert_eq!(kept.len(), 1, "{kept:?}");
-    assert_eq!(fs::read(&kept[0]).unwrap(), bytes);
+    assert!(kept_beside(&link).is_empty(), "the copy folded");
 
     // Both written under the swap.
     let world = World::new();

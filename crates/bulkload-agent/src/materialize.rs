@@ -1588,6 +1588,21 @@ impl StagedFile {
         }
         Ok(())
     }
+    /// The open directory it is staged and published in.
+    pub(crate) fn parent(&self) -> &File {
+        &self.parent
+    }
+
+    /// The name it is published under.
+    pub(crate) fn leaf(&self) -> &[u8] {
+        self.leaf.as_bytes()
+    }
+
+    /// Its private name in [`Self::parent`] while it is staged.
+    pub(crate) fn staged_name(&self) -> &std::ffi::CStr {
+        &self.temporary
+    }
+
     /// The open temporary file. It stays readable after publication.
     pub(crate) const fn file(&self) -> &Arc<File> {
         &self.file
