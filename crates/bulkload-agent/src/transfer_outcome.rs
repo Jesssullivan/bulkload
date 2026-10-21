@@ -30,7 +30,11 @@
 //!   found covered by, a differing live file (operator ruling 2026-10-20),
 //!   accounted. An **applied-beside** row of a record written while
 //!   `--beside` existed (#280, retired by SPEC rule 3) still decodes and
-//!   stays accounted.
+//!   stays accounted;
+//! - one **mapped** row per `--map-prefix SRC_REL=DST_REL` the session
+//!   landed an entry through (#280 finding 9): the source path and the
+//!   destination path it landed at, accounted like `applied`. Every other
+//!   row of such a session names the destination's (mapped) path.
 //!
 //! [`record_session`] makes the verb's S2 overlap decision before its first
 //! write (review finding 1: a refused overlap writes nothing, not even a
@@ -127,6 +131,11 @@ pub enum EntryOutcome {
     /// beside it. Appended after the earlier variants: a record from
     /// before it still decodes.
     Consolidated { action: String },
+    /// `--map-prefix` (#280 finding 9): the entry's `rel_path` is a map's
+    /// source path, and every entry at or under it landed at `to` plus the
+    /// rest of its path, once. Accounted like `applied`. Appended after the
+    /// earlier variants: a record from before it still decodes.
+    Mapped { to: Vec<u8> },
 }
 
 /// One path row of a session.
@@ -221,6 +230,14 @@ impl TransferRecord {
                         },
                     });
                 }
+                for (source, destination) in &stats.mapped {
+                    record.entries.push(Entry {
+                        rel_path: source.clone(),
+                        outcome: EntryOutcome::Mapped {
+                            to: destination.clone(),
+                        },
+                    });
+                }
                 record.entries.sort_by(|a, b| {
                     (&a.rel_path, entry_key(&a.outcome)).cmp(&(&b.rel_path, entry_key(&b.outcome)))
                 });
@@ -276,6 +293,7 @@ fn entry_key(outcome: &EntryOutcome) -> String {
         EntryOutcome::SidecarCovered => "covered".to_owned(),
         EntryOutcome::AppliedBeside { .. } => "applied-beside".to_owned(),
         EntryOutcome::Consolidated { .. } => "consolidated".to_owned(),
+        EntryOutcome::Mapped { .. } => "mapped".to_owned(),
     }
 }
 

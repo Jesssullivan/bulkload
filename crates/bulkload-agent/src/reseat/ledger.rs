@@ -382,6 +382,11 @@ pub struct Ledger {
     v3: bool,
     /// The temporary-name token (empty: the shared name of version 2).
     token: String,
+    /// The state directory, where the consolidation ledger is opened.
+    state: PathBuf,
+    /// The consolidation ledger (`consolidate.sqlite` in the state), opened
+    /// at the first union of a copy into a live file ([`super::fold`]).
+    union: std::cell::OnceCell<crate::consolidate::Ledger>,
 }
 
 fn sql<T>(outcome: rusqlite::Result<T>) -> Result<T> {
@@ -494,6 +499,8 @@ impl Ledger {
             read_only: false,
             v3: true,
             token,
+            state: state.to_path_buf(),
+            union: std::cell::OnceCell::new(),
         })
     }
 
@@ -527,7 +534,25 @@ impl Ledger {
             read_only: true,
             v3: version >= MIGRATE_FROM_V3,
             token: String::new(),
+            state: state.to_path_buf(),
+            union: std::cell::OnceCell::new(),
         }))
+    }
+
+    /// The consolidation ledger beside this one, opened on first use.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` for a read-only ledger or one that cannot be
+    /// opened.
+    pub fn union_ledger(&self) -> Result<&crate::consolidate::Ledger> {
+        if self.read_only {
+            return Err(BulkloadRefusal::SqliteStateChanged);
+        }
+        if let Some(ledger) = self.union.get() {
+            return Ok(ledger);
+        }
+        let ledger = crate::consolidate::Ledger::open(&self.state)?;
+        Ok(self.union.get_or_init(|| ledger))
     }
 
     /// The token in this ledger's temporary names.

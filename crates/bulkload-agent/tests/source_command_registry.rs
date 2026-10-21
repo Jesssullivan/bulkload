@@ -4268,6 +4268,14 @@ const SYSCALL_SITES: &[SyscallSite] = &[
               descriptor, no file.",
     },
     SyscallSite {
+        id: "agent::procs::same_description",
+        number: "libc::SYS_kcmp",
+        why: "The holder check (#294): kcmp(KCMP_FILE) compares whether two \
+              descriptors (this process's and another's) are one open file \
+              description; read-only, five integers, nothing copied or \
+              written, not copy_file_range.",
+    },
+    SyscallSite {
         id: "agent::io::sys_linux::escalate_io",
         number: "libc::SYS_ioprio_set",
         why: "Bounded starvation (M2 item 3): moves a thread of this process \
