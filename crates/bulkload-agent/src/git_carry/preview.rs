@@ -170,7 +170,8 @@ fn code(repo: &Path, args: &[&str]) -> Option<i32> {
         return Some(code);
     }
     let mut again = git(repo);
-    super::without_graph(&mut again)
+    super::without_graph(&mut again);
+    again
         .args(args)
         .output()
         .ok()?

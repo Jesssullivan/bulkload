@@ -126,7 +126,7 @@ pub(crate) mod git_env {
     /// The environment a read-only child runs with once more after a
     /// failure: the commit-graph off, so a stale or corrupt graph (one
     /// naming commits a gc pruned) never fails a read, and nothing rewrites
-    /// it (2026-10-21, neo's GloriousFlywheel).
+    /// it (2026-10-21, neo's `GloriousFlywheel`).
     pub const GRAPH_OFF: &[(&str, &str)] = &[
         ("GIT_CONFIG_COUNT", "1"),
         ("GIT_CONFIG_KEY_0", "core.commitGraph"),
@@ -189,11 +189,10 @@ fn git(repo: &Path) -> Command {
 
 /// Turn the commit-graph off in `command` (a [`git`] read run once more
 /// after it failed): [`git_env::GRAPH_OFF`].
-fn without_graph(command: &mut Command) -> &mut Command {
+fn without_graph(command: &mut Command) {
     for (key, value) in git_env::GRAPH_OFF {
         command.env(key, value);
     }
-    command
 }
 
 /// The oldest Git whose destination writes this carry trusts: 2.46 has
