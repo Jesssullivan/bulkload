@@ -6858,6 +6858,7 @@ impl<W: Write> Inbound<'_, W> {
         class: crate::consolidate::Class,
         settings: &Consolidation,
     ) -> Result<Option<&'static str>> {
+        use std::os::fd::AsRawFd as _;
         use std::os::unix::ffi::OsStrExt as _;
         let Some(after) = row.rel_path.strip_prefix(b"projects/") else {
             return Ok(None);
@@ -6958,10 +6959,12 @@ impl<W: Write> Inbound<'_, W> {
             if !equal(&to_meta) {
                 return Ok(Some(KEY_FOLD_DIFFERS));
             }
-            let free = match crate::procs::inside(&[from.as_path()])? {
+            let held = std::fs::File::open(&from).refuse_at("transfer::fold_source_key")?;
+            let free = match crate::procs::holders(&[&held], &[], &[held.as_raw_fd()])? {
                 Some(pids) => pids.is_empty(),
                 None => return Ok(Some(KEY_FOLD_HOLDER_UNKNOWN)),
             };
+            drop(held);
             let unmoved = std::fs::symlink_metadata(&from)
                 .is_ok_and(|now| now.ino() == from_meta.ino() && now.len() == from_meta.len());
             if !free || !unmoved {
@@ -7023,7 +7026,7 @@ impl<W: Write> Inbound<'_, W> {
         }
         let unmoved = std::fs::symlink_metadata(&from)
             .is_ok_and(|now| now.ino() == from_meta.ino() && now.len() == from_meta.len());
-        let free = match crate::procs::inside(&[from.as_path()])? {
+        let free = match crate::procs::holders(&[&source_file], &[], &[source_file.as_raw_fd()])? {
             Some(pids) => pids.is_empty(),
             None => return Ok(Some(KEY_FOLD_HOLDER_UNKNOWN)),
         };

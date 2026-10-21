@@ -1845,6 +1845,9 @@ impl Site<'_> {
             if written {
                 crate::io::durable::seal_dir(self.directory)
                     .refuse_at("reseat::place::replace_seal")?;
+                // This pass's own handle on the copy goes first: the fold's
+                // holder check counts every other handle, ours included.
+                drop(staged.file);
                 let kept = super::fold::fold_or_keep(
                     self.placer.ledger,
                     self.directory,
@@ -2661,9 +2664,15 @@ pub fn judge_beside(
     } else if held > 0 && last_byte(&live_file, held)? != Some(b'\n') {
         Some("live-mid-line")
     } else {
-        let mut roots = vec![live];
-        roots.extend(lane);
-        match crate::procs::inside(&roots)? {
+        use std::os::fd::AsRawFd as _;
+        // By identity, this check's own handles told apart exactly
+        // ([`crate::procs::holders`]); the lane by working directory.
+        let dirs: Vec<&Path> = lane.into_iter().collect();
+        match crate::procs::holders(
+            &[&live_file],
+            &dirs,
+            &[live_file.as_raw_fd(), landed_file.as_raw_fd()],
+        )? {
             Some(pids) if pids.is_empty() => None,
             Some(_) => Some("live-in-use"),
             None => Some("live-in-use-unknown"),

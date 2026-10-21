@@ -478,7 +478,7 @@ pub fn union_stream(
             Decided::Adopted => return Ok(nothing(Action::Adopted)),
             Decided::Covered => return Ok(nothing(Action::Covered)),
             Decided::Extended => {
-                free(live.path)?;
+                free(&file)?;
                 if append_tail(live.dir, &name, &stat, (&source, stat.size, size))? {
                     // The live file now: the source's bytes, its own inode.
                     record(
@@ -499,7 +499,7 @@ pub fn union_stream(
                 keep,
                 source_records,
             } => {
-                free(live.path)?;
+                free(&file)?;
                 let extra: u64 = keep.iter().map(|(_, length)| length).sum();
                 let output = Output::open(live.dir, live.name, feed, (size, &source))?;
                 let wrote = output.append(&read_live, &keep, size);
@@ -778,8 +778,7 @@ pub fn union_link(
     let Some(decided) = decide(&read_target, stat.size, &source, size, by_uuid(live.rel))? else {
         return Err(BulkloadRefusal::HomesConsolidateRaced);
     };
-    free(target)?;
-    free(live.path)?;
+    free(&held)?;
     // The regular file the live name is to hold: the target's own bytes
     // where it covers the source, else the source's, then (a union) the
     // target's extra records.
@@ -865,14 +864,17 @@ pub fn union_link(
     })
 }
 
-/// No process holds `path` open (or works under it).
+/// No process holds `file` open, apart from this very handle
+/// ([`crate::procs::holders`]: by device and inode, the caller's own open
+/// file description told apart exactly).
 ///
 /// # Errors
 /// `HOMES_CONSOLIDATE_RACED` when one does (retryable);
 /// `HOMES_CONSOLIDATE_HOLDER_UNKNOWN` where this platform cannot say
 /// (anything but Linux): nothing is written then.
-fn free(path: &Path) -> Result<()> {
-    match crate::procs::inside(&[path])? {
+fn free(file: &File) -> Result<()> {
+    use std::os::fd::AsRawFd as _;
+    match crate::procs::holders(&[file], &[], &[file.as_raw_fd()])? {
         Some(pids) if pids.is_empty() => Ok(()),
         Some(_) => Err(BulkloadRefusal::HomesConsolidateRaced),
         None => Err(BulkloadRefusal::HomesConsolidateHolderUnknown),

@@ -80,9 +80,14 @@ pub fn live_of(at: &Path) -> Option<PathBuf> {
         .filter(|target| target.is_file())
 }
 
-/// No process holds `path` open; `false` where this platform cannot say.
-fn free(path: &Path) -> Result<bool> {
-    Ok(matches!(crate::procs::inside(&[path])?, Some(pids) if pids.is_empty()))
+/// No process holds `file` open apart from this handle
+/// ([`crate::procs::holders`]); `false` where this platform cannot say.
+fn free(file: &File) -> Result<bool> {
+    use std::os::fd::AsRawFd as _;
+    Ok(matches!(
+        crate::procs::holders(&[file], &[], &[file.as_raw_fd()])?,
+        Some(pids) if pids.is_empty()
+    ))
 }
 
 /// Union the copy `name` in `dir` (at `copy`) into the live file `live`.
@@ -108,10 +113,10 @@ pub fn fold(
     let (Some(live_parent), Some(live_name)) = (live.parent(), live.file_name()) else {
         return Ok(None);
     };
-    if !free(copy)? {
+    let file = crate::hash::open_nofollow(copy)?;
+    if !free(&file)? {
         return Ok(None);
     }
-    let file = crate::hash::open_nofollow(copy)?;
     let live_dir = open_dir(live_parent)?;
     let outcome = append_log::union_stream(
         &Live {
@@ -144,7 +149,7 @@ pub fn fold(
             .refuse_at("reseat::fold::sync")?;
     }
     // The copy is still what was unioned, and no process writes it.
-    if identity_at(copy)? != Some(read) || !free(copy)? {
+    if identity_at(copy)? != Some(read) || !free(&file)? {
         return Ok(None);
     }
     crate::io::sys::unlinkat(dir, &c_name(name)?, false).refuse_at("reseat::fold::unlink")?;

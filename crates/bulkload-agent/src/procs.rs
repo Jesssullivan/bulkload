@@ -82,6 +82,120 @@ const fn scan(_roots: &[PathBuf]) -> Result<Option<Vec<u32>>> {
     Ok(None)
 }
 
+/// The processes (by pid) that hold one of `files` open, or work in or hold
+/// a regular file open under one of `dirs`.
+///
+/// Sorted; `None` where this platform cannot say (anything but Linux).
+///
+/// The bytes a write would race (#294 gate, 2026-10-21):
+/// - **Files by identity.** A file is matched by its device and inode, never
+///   by path, so a renamed or linked name is still seen.
+/// - **The caller's own handles, exactly.** `own` are the descriptors the
+///   caller opened for this check's files. A descriptor that is the very
+///   same open file description as one of them (Linux `kcmp(KCMP_FILE)`) is
+///   not a holder: a child forked from this process, before its exec, holds
+///   copies of every descriptor. Any other handle on the file is a holder,
+///   in this process too (another thread of a long-lived process is a
+///   writer like any other). Where `kcmp` cannot say, the handle counts.
+/// - **Deterministic.** What this process opened is told apart by identity,
+///   never by timing, so parallel tests (forking children of their own) do
+///   not see each other's copies as writers.
+///
+/// # Errors
+/// IO reading `/proc` itself, or the identity of one of `files`.
+pub fn holders(
+    files: &[&std::fs::File],
+    dirs: &[&Path],
+    own: &[std::os::fd::RawFd],
+) -> Result<Option<Vec<u32>>> {
+    let dirs: Vec<PathBuf> = dirs
+        .iter()
+        .filter_map(|dir| std::fs::canonicalize(dir).ok())
+        .collect();
+    scan_holders(files, &dirs, own)
+}
+
+#[cfg(target_os = "linux")]
+fn scan_holders(
+    files: &[&std::fs::File],
+    dirs: &[PathBuf],
+    own: &[std::os::fd::RawFd],
+) -> Result<Option<Vec<u32>>> {
+    use crate::refuse::RefuseAt as _;
+    use std::os::unix::fs::MetadataExt as _;
+    const SITE: &str = "procs::holders";
+    let mut ids = Vec::with_capacity(files.len());
+    for file in files {
+        let meta = file.metadata().refuse_at(SITE)?;
+        ids.push((meta.dev(), meta.ino()));
+    }
+    let me = std::process::id();
+    // The same open file description as one of the caller's own handles.
+    let ours = |pid: u32, fd: i32| {
+        own.iter().any(|mine| {
+            // SAFETY: `kcmp` reads two processes' descriptor tables and
+            // writes nothing; every argument is a plain integer.
+            let same = unsafe {
+                libc::syscall(
+                    libc::SYS_kcmp,
+                    libc::pid_t::try_from(me).unwrap_or(-1),
+                    libc::pid_t::try_from(pid).unwrap_or(-1),
+                    0, // KCMP_FILE
+                    libc::c_long::from(*mine),
+                    libc::c_long::from(fd),
+                )
+            };
+            same == 0
+        })
+    };
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir("/proc").refuse_at(SITE)? {
+        let Ok(entry) = entry else { continue };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let base = entry.path();
+        let working =
+            pid != me && std::fs::read_link(base.join("cwd")).is_ok_and(|cwd| under(&cwd, dirs));
+        let holds = working
+            || std::fs::read_dir(base.join("fd")).is_ok_and(|fds| {
+                fds.filter_map(std::result::Result::ok).any(|fd| {
+                    let Some(number) = fd.file_name().to_str().and_then(|n| n.parse::<i32>().ok())
+                    else {
+                        return false;
+                    };
+                    let Ok(meta) = std::fs::metadata(fd.path()) else {
+                        return false;
+                    };
+                    let file = ids.contains(&(meta.dev(), meta.ino()));
+                    let under_dir = !dirs.is_empty()
+                        && meta.is_file()
+                        && std::fs::read_link(fd.path()).is_ok_and(|target| under(&target, dirs));
+                    (file || under_dir) && !ours(pid, number)
+                })
+            });
+        if holds {
+            found.push(pid);
+        }
+    }
+    found.sort_unstable();
+    Ok(Some(found))
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unnecessary_wraps)]
+const fn scan_holders(
+    _files: &[&std::fs::File],
+    _dirs: &[PathBuf],
+    _own: &[std::os::fd::RawFd],
+) -> Result<Option<Vec<u32>>> {
+    Ok(None)
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     #![allow(clippy::unwrap_used)]
