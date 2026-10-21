@@ -64,6 +64,15 @@ pub struct ItemSnapshot {
     /// The item's index, as read: written at its live index by a landing
     /// and compared by entries on later passes (never by the engine).
     pub index: Option<Vec<u8>>,
+    /// The item's checked-out branch (`refs/heads/NAME`; `None` detached)
+    /// and HEAD's commit: what a consolidation switches to when clean.
+    pub head_branch: Option<String>,
+    pub head: String,
+    /// A repository whose administration lives outside its worktree and is
+    /// no linked worktree's (a submodule's `.git/modules/NAME`, a
+    /// `--separate-git-dir`): its path on the source, landed (mapped) as
+    /// this item's own, its objects fetched into it.
+    pub separate_admin: Option<PathBuf>,
 }
 
 impl ItemSnapshot {
@@ -137,9 +146,15 @@ pub fn capture_source(
             .ok()
             .map(Path::to_path_buf)
     };
+    // A submodule (or `--separate-git-dir`): its own administration, outside
+    // its worktree, is its git directory and common directory both.
+    let git_dir = fs::canonicalize(crate::git_carry::absolute_git_dir(source)?).refuse_at(SITE)?;
+    let separate_admin = (admin.is_none() && git_dir == common).then(|| common.clone());
     match &admin {
         Some(admin) => {
             excluded.push(rel_bytes(&admin.join("objects")));
+            // Submodules' administrations are their own items'.
+            excluded.push(rel_bytes(&admin.join("modules")));
             let config = admin.join(CONFIG);
             host_files.push((rel_bytes(&config), read_file(&source.join(&config))?));
             if let Ok(read) = fs::read_dir(common.join("worktrees")) {
@@ -176,6 +191,7 @@ pub fn capture_source(
     excluded.dedup();
     // The item's own index (a linked worktree's lives in the main's
     // administration): carried and settled apart from the seats.
+    let (head_branch, head) = crate::git_carry::union::head(source)?;
     let index_path = PathBuf::from(crate::git_carry::git_path(source, "index")?);
     let index = match fs::read(&index_path) {
         Ok(bytes) => Some(bytes),
@@ -208,6 +224,9 @@ pub fn capture_source(
         started_ns,
         history: stream::history(source)?,
         index,
+        head_branch,
+        head,
+        separate_admin,
     })
 }
 
@@ -347,10 +366,20 @@ pub fn land(
         missing_at_source: snapshot.snapshot.missing,
         ..Landed::default()
     };
-    let owns_store = store_of(snapshot, &live).is_some();
+    let owns_store = store_of(snapshot, &live, map).is_some();
     landed.batches = fetched.batches;
     landed.skipped = fetched.skipped;
     landed.object_bytes = fetched.bytes;
+    // 2a. A separate administration (a submodule's): its own files, its
+    // objects (fetched) and index (settled) left out.
+    if let (Some(from), Some(to)) = (&snapshot.separate_admin, admin_of(snapshot, map)) {
+        fs::create_dir_all(&to).refuse_at(SITE)?;
+        let root = fs::canonicalize(&to).refuse_at(SITE)?;
+        crate::transfer::set_excluded(&root, Some(vec![b"objects".to_vec(), b"index".to_vec()]));
+        let moved = (reach.transfer)(from, &to);
+        crate::transfer::set_excluded(&root, None);
+        moved?;
+    }
     // 2. The seats and the administration's own files.
     let root = {
         fs::create_dir_all(&live).refuse_at(SITE)?;
@@ -415,13 +444,25 @@ pub fn land(
 
 // The live object store an item owns (a main or bare repository's), from
 // its excluded `objects` path.
-fn store_of(snapshot: &ItemSnapshot, live: &Path) -> Option<PathBuf> {
+fn store_of(snapshot: &ItemSnapshot, live: &Path, map: &[(Vec<u8>, Vec<u8>)]) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt as _;
+    if let Some(admin) = admin_of(snapshot, map) {
+        return Some(admin.join("objects"));
+    }
     snapshot
         .excluded
         .iter()
         .find(|path| path.ends_with(b"objects"))
         .map(|path| live.join(std::ffi::OsStr::from_bytes(path)))
+}
+
+// A separate administration's live path: the source's, mapped.
+fn admin_of(snapshot: &ItemSnapshot, map: &[(Vec<u8>, Vec<u8>)]) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    snapshot
+        .separate_admin
+        .as_ref()
+        .map(|admin| PathBuf::from(std::ffi::OsStr::from_bytes(&mapped(&rel_bytes(admin), map))))
 }
 
 /// Fetch `snapshot`'s objects into the item's live object store.
@@ -436,13 +477,14 @@ pub fn fetch_objects(
     snapshot: &ItemSnapshot,
     state: &Path,
     upload_pack: &str,
+    map: &[(Vec<u8>, Vec<u8>)],
 ) -> Result<stream::Fetched> {
     let item = &snapshot.item;
     let live = item
         .workspace
         .clone()
         .unwrap_or_else(|| item.repository.clone());
-    let Some(objects) = store_of(snapshot, &live) else {
+    let Some(objects) = store_of(snapshot, &live, map) else {
         return Ok(stream::Fetched::default());
     };
     for dir in [objects.join("pack"), objects.join("info")] {
@@ -475,6 +517,12 @@ pub struct Converged {
     /// The seat transfer held paths it could not union (typed in its
     /// record): the item is not consolidated whole.
     pub seats_held: bool,
+    /// The destination's checkout was switched to the source's branch.
+    pub switched_to: Option<String>,
+    /// The two sides have different branches checked out and the
+    /// destination's tree is not clean (or the source's branch is not the
+    /// destination's at its tip): held typed, both listed, no seat landed.
+    pub branches_held: Option<(String, String)>,
 }
 
 /// Consolidate `snapshot`'s item into a related repository at its live path.
@@ -494,6 +542,7 @@ pub fn converge(
     reach: &Reach<'_>,
     fetched: stream::Fetched,
     source: &str,
+    map: &[(Vec<u8>, Vec<u8>)],
 ) -> Result<Converged> {
     use crate::git_carry::union;
     let item = &snapshot.item;
@@ -507,20 +556,50 @@ pub fn converge(
         object_bytes: fetched.bytes,
         ..Converged::default()
     };
-    let owns_store = store_of(snapshot, &live).is_some();
+    let owns_store = store_of(snapshot, &live, map).is_some();
     if owns_store {
         done.refs = union::refs(&live, &snapshot.snapshot.refs, source)?;
         done.stash_added = union::stash(&live, &snapshot.history.stash)?;
         done.reflog_added = union::reflogs(&live, &snapshot.history.reflogs, &done.refs)?;
     }
     if item.workspace.is_some() {
+        // A different branch on each side (the GloriousFlywheel case): the
+        // destination switches to the source's when its tree is clean and
+        // that branch is the source's at its tip; else held, both listed.
+        let (dest_branch, _) = union::head(&live)?;
+        if let Some(theirs) = &snapshot.head_branch {
+            if dest_branch.as_deref() != Some(theirs.as_str()) {
+                let tip = union::value(&live, theirs)?;
+                if union::is_clean(&live)? && tip.as_deref() == Some(snapshot.head.as_str()) {
+                    union::switch(&live, theirs)?;
+                    done.switched_to = Some(theirs.clone());
+                } else {
+                    done.branches_held = Some((
+                        dest_branch.unwrap_or_else(|| "HEAD (detached)".to_owned()),
+                        theirs.clone(),
+                    ));
+                    return Ok(done);
+                }
+            }
+        }
+        // Each file both sides changed merges three-way against the merge
+        // base of the two HEADs.
+        let (_, ours) = union::head(&live)?;
+        let mut settings = (reach.consolidation)()?;
+        if let Some(commit) = union::merge_base(&live, &ours, &snapshot.head)? {
+            settings.git = Some(crate::consolidate::merge3::Base {
+                repo: live.clone(),
+                commit,
+                scratch: reach.scratch.to_path_buf(),
+            });
+        }
         // The destination's administration is its own: nothing of the
         // source's `.git` lands here.
         let mut excluded = snapshot.excluded.clone();
         excluded.push(b".git".to_vec());
         let root = fs::canonicalize(&live).refuse_at(SITE)?;
         crate::transfer::set_excluded(&root, Some(excluded));
-        crate::transfer::set_consolidate_for(&root, Some(Some((reach.consolidation)()?)));
+        crate::transfer::set_consolidate_for(&root, Some(Some(settings)));
         let moved = (reach.transfer)(&item.source, &live);
         crate::transfer::set_consolidate_for(&root, None);
         crate::transfer::set_excluded(&root, None);

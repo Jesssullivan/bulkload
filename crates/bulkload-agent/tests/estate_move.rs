@@ -540,6 +540,243 @@ fn a_related_live_repository_is_consolidated_and_refs_union_by_name() {
     );
 }
 
+// A source repository `name` with a five-line file, and the destination's
+// clone of it at the mapped live path (no remote): a related pair.
+fn related_pair(world: &World, name: &str) -> (PathBuf, PathBuf) {
+    let (source, live) = (world.src().join(name), world.dst().join(name));
+    fs::create_dir_all(&source).unwrap();
+    git(&source, &["init", "--quiet", "--template=", "-b", "main"]);
+    fs::write(source.join("f.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "--quiet", "-m", "c0"]);
+    git(
+        &world.dst(),
+        &[
+            "clone",
+            "--quiet",
+            "--template=",
+            source.to_str().unwrap(),
+            name,
+        ],
+    );
+    git(&live, &["remote", "remove", "origin"]);
+    (source, live)
+}
+
+/// Part 1, confirmed: a checked-out branch the destination holds behind the
+/// source's but whose tree is dirty keeps the destination's tip; the
+/// source's is reachable at `refs/remotes/neo/NAME`, and listed.
+#[test]
+fn a_dirty_checkout_behind_keeps_its_tip_and_tracks_the_sources() {
+    let world = World::new("dirtybehind");
+    let (source, live) = related_pair(&world, "p");
+    git(
+        &source,
+        &["commit", "--quiet", "--allow-empty", "-m", "ahead"],
+    );
+    let ahead = out(&source, &["rev-parse", "main"]);
+    let mine = out(&live, &["rev-parse", "main"]);
+    fs::write(
+        live.join("f.txt"),
+        "one\ntwo\nthree\nfour\nfive, sting's edit\n",
+    )
+    .unwrap();
+    assert!(world.source().ok);
+    let moved = world.moved();
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    assert!(
+        moved
+            .stdout
+            .contains("ref=refs/heads/main union=tracked at=refs/remotes/neo/main"),
+        "{both}"
+    );
+    assert_eq!(out(&live, &["rev-parse", "main"]), mine, "{both}");
+    assert_eq!(out(&live, &["rev-parse", "refs/remotes/neo/main"]), ahead);
+    assert_eq!(
+        fs::read(live.join("f.txt")).unwrap(),
+        b"one\ntwo\nthree\nfour\nfive, sting's edit\n"
+    );
+}
+
+/// Part 2, the three-way union: a file both sides changed merges against
+/// its version at the merge base of the two HEADs, Git's `merge-file`
+/// semantics, when no hunk conflicts; a conflicting hunk holds the file
+/// typed, nothing written.
+#[test]
+fn a_file_both_sides_changed_merges_three_way_or_is_held() {
+    let world = World::new("merge3");
+    let (source, live) = related_pair(&world, "p");
+    fs::write(
+        source.join("f.txt"),
+        "one\ntwo\nthree\nfour\nFIVE from neo\n",
+    )
+    .unwrap();
+    fs::write(
+        live.join("f.txt"),
+        "ONE from sting\ntwo\nthree\nfour\nfive\n",
+    )
+    .unwrap();
+    assert!(world.source().ok);
+    let moved = world.moved();
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    let receipt = item_line(&moved.stdout, &live);
+    assert!(receipt.contains("seats_held=false"), "{receipt}\n{both}");
+    assert_eq!(
+        fs::read(live.join("f.txt")).unwrap(),
+        b"ONE from sting\ntwo\nthree\nfour\nFIVE from neo\n",
+        "{both}"
+    );
+    // Both sides now change the same line: held, the destination's kept.
+    fs::write(source.join("f.txt"), "one\ntwo\nTHREE neo\nfour\nfive\n").unwrap();
+    fs::write(live.join("f.txt"), "one\ntwo\nTHREE sting\nfour\nfive\n").unwrap();
+    assert!(world.source().ok);
+    let again = world.moved();
+    let both = format!("{}\n{}", again.stdout, again.stderr);
+    let receipt = item_line(&again.stdout, &live);
+    assert!(receipt.contains("seats_held=true"), "{receipt}\n{both}");
+    assert_eq!(
+        fs::read(live.join("f.txt")).unwrap(),
+        b"one\ntwo\nTHREE sting\nfour\nfive\n"
+    );
+}
+
+/// Part 2, a different branch on each side (the `GloriousFlywheel` case):
+/// sting on main and clean, neo on a feature branch with dirty and
+/// untracked files. After the ref union sting switches to neo's branch
+/// ("switch when clean") and neo's files land. A dirty sting is held typed
+/// with both branches listed, nothing switched or landed.
+#[test]
+fn a_different_branch_switches_when_clean_and_is_held_when_dirty() {
+    let world = World::new("branches");
+    let (source, live) = related_pair(&world, "p");
+    git(&source, &["checkout", "--quiet", "-b", "feature"]);
+    git(
+        &source,
+        &["commit", "--quiet", "--allow-empty", "-m", "feature work"],
+    );
+    fs::write(
+        source.join("f.txt"),
+        "one\ntwo\nthree\nfour\nfive, dirty on neo\n",
+    )
+    .unwrap();
+    fs::write(source.join("wip.txt"), b"untracked on neo\n").unwrap();
+    // A second, dirty destination of the same source, on its own path.
+    let (_, held) = related_pair(&world, "q");
+    fs::write(held.join("f.txt"), "sting's own edit\n").unwrap();
+    let q_source = world.src().join("q");
+    git(&q_source, &["checkout", "--quiet", "-b", "feature"]);
+    git(
+        &q_source,
+        &["commit", "--quiet", "--allow-empty", "-m", "feature work"],
+    );
+    assert!(world.source().ok);
+    let moved = world.moved();
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    assert!(
+        moved.stdout.contains("switched=refs/heads/feature"),
+        "{both}"
+    );
+    assert_eq!(
+        out(&live, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        "feature"
+    );
+    assert_eq!(
+        fs::read(live.join("f.txt")).unwrap(),
+        b"one\ntwo\nthree\nfour\nfive, dirty on neo\n",
+        "{both}"
+    );
+    assert_eq!(
+        fs::read(live.join("wip.txt")).unwrap(),
+        b"untracked on neo\n"
+    );
+    assert!(
+        moved
+            .stdout
+            .contains("branches=held destination=refs/heads/main source=refs/heads/feature"),
+        "{both}"
+    );
+    let receipt = item_line(&moved.stdout, &held);
+    assert!(receipt.contains("outcome=held"), "{receipt}\n{both}");
+    assert_eq!(
+        out(&held, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        "main"
+    );
+    assert_eq!(fs::read(held.join("f.txt")).unwrap(), b"sting's own edit\n");
+}
+
+/// Part 2, nested repositories and submodules are their own items: the
+/// parent excludes their paths and its `.git/modules`, each lands with its
+/// own fetch, a submodule's administration at the parent's `.git/modules`
+/// and its worktree linked to it.
+#[test]
+fn nested_repositories_and_submodules_land_as_their_own_items() {
+    let world = World::new("nested");
+    let src = world.src();
+    let library = world.base.join("library");
+    repo(&library, "lib.txt");
+    let parent = src.join("parent");
+    repo(&parent, "p.txt");
+    let ran = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args([
+            "-c",
+            "protocol.file.allow=always",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@localhost",
+            "-C",
+        ])
+        .arg(&parent)
+        .args(["submodule", "add", "--quiet"])
+        .arg(&library)
+        .arg("sub")
+        .output()
+        .unwrap();
+    assert!(
+        ran.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    git(&parent, &["commit", "--quiet", "-m", "add sub"]);
+    // An independent repository nested in the worktree (untracked by it).
+    repo(&parent.join("vendor/tool"), "tool.txt");
+    fs::create_dir_all(parent.join(".git/info")).unwrap();
+    fs::write(parent.join(".git/info/exclude"), "vendor/\n").unwrap();
+    let sourced = world.source();
+    assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
+    assert!(sourced.stdout.contains(" items=3 "), "{}", sourced.stdout);
+    let moved = world.moved();
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    let dst = world.dst();
+    for rel in ["parent", "parent/sub", "parent/vendor/tool"] {
+        assert!(
+            item_line(&moved.stdout, &dst.join(rel)).contains("outcome=workspace-restored"),
+            "{rel}\n{both}"
+        );
+    }
+    let live = dst.join("parent");
+    assert_eq!(
+        out(&live.join("sub"), &["rev-parse", "HEAD"]),
+        out(&parent.join("sub"), &["rev-parse", "HEAD"])
+    );
+    assert_eq!(fs::read(live.join("sub/lib.txt")).unwrap(), b"lib.txt\n");
+    assert_eq!(
+        out(&live.join("vendor/tool"), &["rev-parse", "HEAD"]),
+        out(&parent.join("vendor/tool"), &["rev-parse", "HEAD"])
+    );
+    assert!(
+        out(&live, &["submodule", "status"]).contains(" sub"),
+        "{both}"
+    );
+    out(
+        &live.join("sub"),
+        &["fsck", "--connectivity-only", "--no-dangling"],
+    );
+    holds_no_payload(&world.state(), 3);
+}
+
 /// A shallow source is a typed hold until it has a test: refused on the
 /// source half, nothing recorded for it to land.
 #[test]

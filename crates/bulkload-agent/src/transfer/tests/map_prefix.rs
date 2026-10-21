@@ -35,6 +35,7 @@ impl Mapped {
                     ledger: corpus.base.join("consolidate"),
                     plan_only: false,
                     archived: Vec::new(),
+                    git: None,
                 })),
             );
         }
@@ -469,6 +470,7 @@ fn a_source_key_copy_is_folded_into_the_mapped_key() {
             ledger: plan.corpus.base.join("consolidate"),
             plan_only: true,
             archived: Vec::new(),
+            git: None,
         })),
     );
     setup(&plan);
@@ -593,6 +595,7 @@ fn a_sessions_subfiles_at_the_source_key_fold_the_same_way() {
             ledger: plan.corpus.base.join("consolidate"),
             plan_only: true,
             archived: Vec::new(),
+            git: None,
         })),
     );
     setup(&plan);

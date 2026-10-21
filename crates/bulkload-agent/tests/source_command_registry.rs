@@ -406,6 +406,7 @@ const READS: &[&str] = &[
     "ls-files",
     "ls-tree",
     "merge-base",
+    "merge-file",
     "name-rev",
     "pack-objects",
     "reflog",
@@ -528,6 +529,14 @@ const WRITERS: &[(&str, usize, &str)] = &[
          since the streamed capture's B2 (SPEC rule 2 reset): \
          `union::refs` creates, fast-forwards or tracks a source ref in the \
          live destination repository, compare-and-swap.",
+    ),
+    (
+        "checkout",
+        1,
+        "`union::switch` (B2 part 2, \"switch when clean\"): a clean \
+         destination worktree switches to the source's branch after the \
+         ref union left that branch at the source's tip; the destination \
+         only.",
     ),
     (
         "merge",

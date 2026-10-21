@@ -863,6 +863,15 @@ pub fn git_path(repo: &Path, name: &str) -> Result<String> {
     text(git(repo).args(["rev-parse", "--path-format=absolute", "--git-path", name]))
 }
 
+/// `repo`'s own git directory, absolute (a linked worktree's or a
+/// submodule's administration).
+///
+/// # Errors
+/// Git's refusal.
+pub fn absolute_git_dir(repo: &Path) -> Result<PathBuf> {
+    text(git(repo).args(["rev-parse", "--absolute-git-dir"])).map(PathBuf::from)
+}
+
 /// Canonical common repository used to serialize applies sharing Git storage.
 ///
 /// # Errors

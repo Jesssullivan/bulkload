@@ -1237,6 +1237,7 @@ fn transfer_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
             maps: bulkload_agent::consolidate::Maps::new(maps),
             ledger: state.join("consolidate"),
             plan_only,
+            git: None,
             archived: Vec::new(),
         }));
     }

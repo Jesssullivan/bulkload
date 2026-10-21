@@ -136,6 +136,17 @@ fn walk(roots: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<Note>)> {
             let is_root = directory == root;
             if git_directory(&directory) {
                 usable += usize::from(is_root);
+                // B2 part 3: a nested repository or a populated submodule
+                // under this one's worktree is its own item, walked as one
+                // (the enclosing item excludes its path).
+                if let Ok(nests) = crate::git_carry::nested_repositories(&directory) {
+                    use std::os::unix::ffi::OsStrExt as _;
+                    for nest in nests.iter().rev() {
+                        if nest.kind == crate::git_carry::NestedRepositoryKind::Directory {
+                            stack.push(directory.join(std::ffi::OsStr::from_bytes(&nest.rel_path)));
+                        }
+                    }
+                }
                 found.push(directory);
                 continue;
             }
@@ -250,6 +261,35 @@ fn group(
     maps: &[(PathBuf, PathBuf)],
     (seen, items, notes): (&mut BTreeSet<PathBuf>, &mut Vec<Planned>, &mut Vec<Note>),
 ) {
+    // A submodule (or a `--separate-git-dir` checkout): its `.git` is a
+    // pointer to an administration that is its own, not a linked
+    // worktree's. The worktree itself is the item (B2 part 2).
+    if fs::symlink_metadata(directory.join(".git")).is_ok_and(|meta| meta.is_file()) {
+        let separate = match (
+            crate::git_carry::absolute_git_dir(&directory).and_then(|dir| {
+                fs::canonicalize(dir).map_err(|error| crate::refuse::io(&error, "estate::moving"))
+            }),
+            crate::git_carry::common_repository(&directory),
+        ) {
+            (Ok(git_dir), Ok(common)) => git_dir == common,
+            _ => false,
+        };
+        if separate {
+            let key = fs::canonicalize(&directory).unwrap_or_else(|_| directory.clone());
+            if seen.insert(key) {
+                let live = live_path(&directory, maps);
+                items.push(Planned {
+                    item: Item {
+                        source: directory,
+                        repository: live.clone(),
+                        workspace: Some(live),
+                    },
+                    kind: "submodule",
+                });
+            }
+            return;
+        }
+    }
     let listed = match converge::worktree_census(&directory) {
         Ok(listed) => listed,
         Err(refusal) => {
