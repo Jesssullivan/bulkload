@@ -910,10 +910,7 @@ fn move_pass(run: &Move) -> Result<()> {
         let text = |path: &Path| path.to_string_lossy().into_owned();
         Ok(bulkload_agent::transfer::Consolidation {
             maps: bulkload_agent::consolidate::Maps::new(
-                run.maps
-                    .iter()
-                    .map(|(from, to)| (text(from), text(to)))
-                    .collect(),
+                run.maps.iter().map(|(from, to)| (text(from), text(to))),
             ),
             ledger: run.state.join("consolidate"),
             plan_only: false,
