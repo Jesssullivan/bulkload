@@ -2689,7 +2689,7 @@ fn pull_recorded_kind(
     // `--plan-only`: nothing is recorded; the plan is printed.
     if bulkload_agent::transfer::plan_only() {
         bulkload_agent::transfer::receive_roots_apart_kind(path(2)?, path(4)?, kind)?;
-        let stats = pull_command(kind, args)?;
+        let stats = pull_tree(kind, args)?;
         keep_listed(&stats);
         return report_transfer(&stats);
     }

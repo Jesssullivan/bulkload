@@ -899,7 +899,10 @@ fn move_pass(run: &Move) -> Result<()> {
     let map = estate::streamed::path_map(&items);
     let upload_pack = upload_pack_program(run);
     let transfer = |from: &Path, to: &Path| -> Result<()> {
-        let name = format!("item-{}", blake3::hash(to.as_os_str().as_bytes()).to_hex());
+        let name = format!(
+            "item-{}",
+            blake3::hash(std::os::unix::ffi::OsStrExt::as_bytes(to.as_os_str())).to_hex()
+        );
         run.transfer_into(from, to, &name)
     };
     let reach = estate::streamed::Reach {
