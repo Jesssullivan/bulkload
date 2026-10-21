@@ -251,10 +251,11 @@ SUBCOMMANDS:
                 SOURCE_MOVE_STATE, for HOST -) holds ledgers and resume
                 marks only: a retired staging format in either is named
                 (estate-move state=retired) and refused STATE_FORMAT_RETIRED
-                at startup; a pull of the corpus or of the session trees
-                into MOVE_STATE is refused STATE_PAYLOAD_LEFT before it
-                writes, so a pass refuses at 1 until the streamed capture
-                replaces it; every pass ends with an estate-move phase=state
+                at startup; 1 pulls only the source half's plan and marks
+                (a corpus there is excluded, never landed or read), and a
+                plan with Git items refuses STATE_PAYLOAD_LEFT there until
+                the streamed capture replaces the corpus apply, while a plan
+                with none (the homes pass, --sessions) goes on; every pass ends with an estate-move phase=state
                 line (state_payload_bytes=, refusing STATE_PAYLOAD_LEFT for
                 any payload left), and the closure line carries the same
                 words. 1 pull: SOURCE_MOVE_STATE/carry into MOVE_STATE/carry;

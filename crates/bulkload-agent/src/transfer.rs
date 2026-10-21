@@ -1443,8 +1443,9 @@ static LISTING: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 /// ([`set_excluded`]), by canonical destination root.
 static EXCLUDED: Mutex<Vec<(PathBuf, Vec<Vec<u8>>)>> = Mutex::new(Vec::new());
 
-/// Never land `paths` (relative to `root`, the destination root, each a
-/// seat or a whole subtree) in a session into `root`: the destination
+/// Never land `paths` in a session into the destination root `root`.
+///
+/// Each is relative to `root`, a seat or a whole subtree: the destination
 /// answers each such entry `Skip` before anything is made or asked for, so
 /// the source reads none of its bytes (the streamed capture: a repository's
 /// `objects`, its rebuildable directories and its nested repositories,
@@ -1470,7 +1471,9 @@ fn excluded(root: &Path) -> Vec<Vec<u8>> {
 /// Whether `rel_path` is one of `excluded` or beneath one.
 fn is_excluded(excluded: &[Vec<u8>], rel_path: &[u8]) -> bool {
     excluded.iter().any(|path| {
-        rel_path.strip_prefix(path.as_slice()).is_some_and(|rest| rest.is_empty() || rest.first() == Some(&b'/'))
+        rel_path
+            .strip_prefix(path.as_slice())
+            .is_some_and(|rest| rest.is_empty() || rest.first() == Some(&b'/'))
     })
 }
 

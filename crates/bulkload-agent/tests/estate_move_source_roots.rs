@@ -207,25 +207,25 @@ fn a_pass_with_no_usable_root_refuses_typed() {
     );
 }
 
-/// An `ssh` stand-in that records every run in `ran.log` beside itself and
-/// fails: a transport the guard must never reach.
-fn recording_ssh(dir: &Path) -> PathBuf {
+/// An `ssh` stand-in: drops ssh's own options and the host, then runs the
+/// remote command here, its stdin and stdout the session's.
+fn fake_ssh(dir: &Path) {
     fs::create_dir_all(dir).unwrap();
     let ssh = dir.join("ssh");
-    let log = dir.join("ran.log");
     fs::write(
         &ssh,
-        format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 255\n", log.display()),
+        "#!/bin/sh\nwhile [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\nshift 2\nexec \"$@\"\n",
     )
     .unwrap();
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
-    log
 }
 
-// SPEC rule 2 (reset 2026-10-20): the corpus pull to a remote source would
-// stage the corpus in MOVE_STATE, so it is refused before any `ssh` runs.
+// SPEC rule 2 (reset 2026-10-20), over a transport: the pull lands only
+// the source half's plan and marks. A corpus a source half from before the
+// reset left is never pulled (excluded, its bytes never read), and a plan
+// with Git items refuses `STATE_PAYLOAD_LEFT` until the streamed capture.
 #[test]
-fn a_remote_pass_refuses_its_corpus_pull_before_any_transport() {
+fn a_remote_pass_pulls_only_ledgers_and_refuses_a_git_plan() {
     let world = World::new("remote");
     let src = world.path("src");
     fs::create_dir_all(&src).unwrap();
@@ -233,7 +233,10 @@ fn a_remote_pass_refuses_its_corpus_pull_before_any_transport() {
     let source_state = world.path("move-src");
     let state = world.path("move-dst");
     let _ = agent(&os(&[&"estate-move-source", &source_state, &src]));
-    let log = recording_ssh(&world.path("fake-bin"));
+    let old = source_state.join("carry/corpus/old-head.bundle");
+    fs::create_dir_all(old.parent().unwrap()).unwrap();
+    fs::write(&old, vec![9u8; 2048]).unwrap();
+    fake_ssh(&world.path("fake-bin"));
     let moved = agent_with_path(
         &os(&[
             &"estate-move",
@@ -263,12 +266,8 @@ fn a_remote_pass_refuses_its_corpus_pull_before_any_transport() {
             .contains("estate-move phase=state outcome=ok state_payload_bytes=0"),
         "{both}"
     );
-    assert!(
-        !log.exists(),
-        "ssh ran: {}",
-        fs::read_to_string(&log).unwrap_or_default()
-    );
-    assert!(!state.join("carry/corpus").exists());
+    assert!(state.join("carry/plan.postcard").is_file(), "{both}");
+    assert!(!state.join("carry/corpus").exists(), "{both}");
 }
 
 // #283 review 5: a first pass whose usable roots hold no repository
