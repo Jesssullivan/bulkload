@@ -437,6 +437,15 @@ struct Move {
     /// that links into ROOT is replaced by the source's copy of that session
     /// (the archived fork stays in ROOT).
     archived: Vec<PathBuf>,
+    /// `--live-link-root ROOT` (operator interview 2026-10-21, "Union into
+    /// link target"): a home directory that is a link into ROOT is the live
+    /// directory itself, merged at its real path; the link stays.
+    live_link_roots: Vec<PathBuf>,
+    /// `--regularize-link-root ROOT` (A-055, 2026-10-21): a link in a home
+    /// into ROOT (a repair stage) is regularized before the pull: its live
+    /// name becomes a real file or directory holding the target's bytes,
+    /// which the pull then unions with the source's; ROOT is never touched.
+    regularize_roots: Vec<PathBuf>,
     remote: Option<OsString>,
     config: Option<OsString>,
     jobs: usize,
@@ -463,6 +472,8 @@ impl Move {
             reseat_args: Vec::new(),
             dispositions: None,
             archived: Vec::new(),
+            live_link_roots: Vec::new(),
+            regularize_roots: Vec::new(),
             remote: None,
             config: None,
             jobs: 2,
@@ -527,6 +538,10 @@ impl Move {
                         .ok_or(BulkloadRefusal::RequiredFieldMissing)?,
                 ),
                 "--replace-archived-dest" => parsed.archived.push(absolute(args.get(at + 1))?),
+                "--live-link-root" => parsed.live_link_roots.push(absolute(args.get(at + 1))?),
+                "--regularize-link-root" => {
+                    parsed.regularize_roots.push(absolute(args.get(at + 1))?);
+                }
                 "--dispositions" if parsed.dispositions.is_none() => {
                     parsed.dispositions = Some(absolute(args.get(at + 1))?);
                 }
@@ -581,7 +596,9 @@ impl Move {
                 || parsed.dest_home.is_some()
                 || !parsed.maps.is_empty()
                 || !parsed.reseat_args.is_empty()
-                || !parsed.archived.is_empty())
+                || !parsed.archived.is_empty()
+                || !parsed.live_link_roots.is_empty()
+                || !parsed.regularize_roots.is_empty())
         {
             return Err(BulkloadRefusal::RequiredFieldMissing);
         }
@@ -895,11 +912,9 @@ fn move_command(args: &[OsString]) -> Result<()> {
         note(&pulled);
         reached(&mut ledger, &ledger_path, "sessions-pull", word(&pulled))?;
         let mut outcome = Sessions {
-            pulls: ["claude", CLAUDE_JSON_PULL, "codex"]
-                .iter()
-                .map(|name| run.state.join("pull").join(name))
-                .filter(|state| state.is_dir())
-                .collect(),
+            // Every session pull of the pass, the live links' included; a
+            // plan's are never this pass's records.
+            pulls: session_pulls(&run.state.join("pull")),
             reseat: None,
         };
         if let (true, Some(homes)) = (session_completed(&pulled), &homes) {
@@ -1266,11 +1281,28 @@ fn homes_plan(run: &Move, home: &Path, plan: &Path) -> Result<()> {
             print_key_maps(&maps)?;
             bulkload_agent::transfer::set_map_prefixes(maps.prefixes())?;
         }
-        let pull = format!("plan-{}", name.trim_start_matches('.'));
-        let pulled = run.transfer_kind(kind, &from, &to, &pull);
+        let tree = kind == bulkload_agent::transfer::RootKind::Tree;
+        let short = name.trim_start_matches('.');
+        let links = if tree {
+            // What the real pass regularizes first (counted, nothing
+            // written), and the live links it merges at their real
+            // directories.
+            regularize_home(run, short, &to, true)?;
+            bulkload_agent::reseat::links::live_links(&to, &run.live_link_roots)
+        } else {
+            Vec::new()
+        };
+        let pull = format!("plan-{short}");
+        let pulled = if tree {
+            pull_home(run, &from, &to, &pull, &links)
+        } else {
+            run.transfer_kind(kind, &from, &to, &pull)
+        };
         if claude {
             bulkload_agent::transfer::set_map_prefixes(Vec::new())?;
         }
+        let linked = pull_links(run, &from, &pull, &links);
+        let pulled = pulled.and(linked);
         // Report-only: a path refusal (an absent `~/.claude.json` among
         // them) is printed with the plan; only a session that failed fails
         // it, and every refusal is named.
@@ -1290,6 +1322,103 @@ fn homes_plan(run: &Move, home: &Path, plan: &Path) -> Result<()> {
     }
     bulkload_agent::transfer::set_consolidate(None);
     planned
+}
+
+/// The session pulls' states under `pulls`: every directory but a plan's.
+fn session_pulls(pulls: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(pulls)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            entry.path().is_dir() && !entry.file_name().to_string_lossy().starts_with("plan-")
+        })
+        .map(|entry| entry.path())
+        .collect();
+    found.sort();
+    found
+}
+
+// A-055 (2026-10-21): the home's links into a declared regularize root
+// become real files or directories before the pull (`plan`: counted only),
+// with a summary line; the root is never written.
+fn regularize_home(run: &Move, name: &str, real: &Path, plan: bool) -> Result<()> {
+    if run.regularize_roots.is_empty() {
+        return Ok(());
+    }
+    let done = bulkload_agent::reseat::links::regularize(
+        real,
+        &run.regularize_roots,
+        plan,
+        &mut |line| out(line),
+    )?;
+    out(&format!(
+        "estate-move regularized-links home={name} links={} files={} bytes={} remaining={}{}",
+        done.links,
+        done.files,
+        done.bytes,
+        done.remaining,
+        if plan { " (plan only)" } else { "" }
+    ))
+}
+
+// The home's own pull, its live links skipped (each is merged at its real
+// directory by `pull_links`).
+fn pull_home(
+    run: &Move,
+    from: &Path,
+    real: &Path,
+    name: &str,
+    links: &[(std::ffi::OsString, PathBuf)],
+) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    bulkload_agent::transfer::set_skip(
+        links
+            .iter()
+            .map(|(entry, _)| entry.as_bytes().to_vec())
+            .collect(),
+    );
+    let pulled = run.transfer_into(from, real, name);
+    bulkload_agent::transfer::set_skip(Vec::new());
+    pulled
+}
+
+// Operator interview 2026-10-21 ("Union into link target"): each live link
+// of the home (a directory linking into a --live-link-root) is the live
+// directory itself: the source's same-named directory is merged there by
+// the consolidate rules, its own transfer record; the link stays. A source
+// with no such directory has nothing to merge.
+fn pull_links(
+    run: &Move,
+    from: &Path,
+    name: &str,
+    links: &[(std::ffi::OsString, PathBuf)],
+) -> Result<()> {
+    bulkload_agent::transfer::set_listing(Vec::new());
+    let mut result = Ok(());
+    for (entry, target) in links {
+        out(&format!(
+            "estate-move live-link home={name} name={entry:?} target={target:?}"
+        ))?;
+        let pull = format!(
+            "{name}-link-{}",
+            entry
+                .to_string_lossy()
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect::<String>()
+        );
+        match run.transfer_into(&from.join(entry), target, &pull) {
+            Ok(()) | Err(BulkloadRefusal::SourceRootMissing) => {}
+            Err(refusal) => {
+                if result.is_ok() {
+                    result = Err(refusal);
+                }
+            }
+        }
+    }
+    let _ = super::take_listed();
+    result
 }
 
 // Phase 6a (plan of record 2026-10-19, C9; SPEC R4 "each tree lands once,
@@ -1332,6 +1461,10 @@ fn sessions_pull(
     bulkload_agent::transfer::set_listing(vec![b"projects/".to_vec()]);
     let _ = super::take_listed();
     let claude_root = Move::live_root(&dest.join(".claude"), "claude");
+    let claude_links = claude_root
+        .as_ref()
+        .map(|real| bulkload_agent::reseat::links::live_links(real, &run.live_link_roots))
+        .unwrap_or_default();
     // #280 finding 9: the Claude tree with the key map of this pass's lanes,
     // derived for the real, owner-checked home the pull runs under; the
     // Codex tree without (its rollouts are kept by date, not by working
@@ -1349,13 +1482,14 @@ fn sessions_pull(
             bulkload_agent::transfer::set_map_prefixes(maps.prefixes())
         })
         .and_then(|()| {
-            claude_root
-                .as_ref()
-                .map_err(Clone::clone)
-                .and_then(|real| run.transfer_into(&home.join(".claude"), real, "claude"))
+            claude_root.as_ref().map_err(Clone::clone).and_then(|real| {
+                regularize_home(run, "claude", real, false)?;
+                pull_home(run, &home.join(".claude"), real, "claude", &claude_links)
+            })
         });
     let unmapped = bulkload_agent::transfer::set_map_prefixes(Vec::new());
     let claude_listing = super::take_listed();
+    let claude_linked = pull_links(run, &home.join(".claude"), "claude", &claude_links);
     // #294 review 4: a derived map the landed sessions of its lane did not
     // use (the source keyed them otherwise) leaves them to be re-seated as
     // before, a second copy: named, typed.
@@ -1404,11 +1538,16 @@ fn sessions_pull(
         b"archived_sessions/".to_vec(),
     ]);
     let codex_root = Move::live_root(&dest.join(".codex"), "codex");
-    let codex = codex_root
+    let codex_links = codex_root
         .as_ref()
-        .map_err(Clone::clone)
-        .and_then(|real| run.transfer_into(&codex_from, real, "codex"));
+        .map(|real| bulkload_agent::reseat::links::live_links(real, &run.live_link_roots))
+        .unwrap_or_default();
+    let codex = codex_root.as_ref().map_err(Clone::clone).and_then(|real| {
+        regularize_home(run, "codex", real, false)?;
+        pull_home(run, &codex_from, real, "codex", &codex_links)
+    });
     let codex_listed = write_listing(&pulls.join("codex.listing"), super::take_listed());
+    let codex_linked = pull_links(run, &codex_from, "codex", &codex_links);
     bulkload_agent::transfer::set_listing(Vec::new());
     bulkload_agent::transfer::set_consolidate(None);
     let cleared = Ok(());
@@ -1421,9 +1560,11 @@ fn sessions_pull(
         unmapped,
         noted,
         claude_listed,
+        claude_linked,
         claude_json,
         codex,
         codex_listed,
+        codex_linked,
         cleared,
     ] {
         if let Err(refusal) = result {
