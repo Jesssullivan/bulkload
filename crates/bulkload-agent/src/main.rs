@@ -3218,8 +3218,7 @@ fn pull_serve<T>(
     args: &[std::ffi::OsString],
     receive: impl FnOnce(&mut std::process::ChildStdout, &mut std::process::ChildStdin) -> Result<T>,
 ) -> Result<T> {
-    pull_command(Remote::Serve(kind), args, receive)?
-        .ok_or(BulkloadRefusal::ProtocolStateViolation)
+    pull_command(Remote::Serve(kind), args, receive)?.ok_or(BulkloadRefusal::ProtocolStateViolation)
 }
 
 /// What the remote `bulkload-agent` an ssh session starts runs.
