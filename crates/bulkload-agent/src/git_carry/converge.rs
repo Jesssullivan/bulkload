@@ -373,8 +373,10 @@ fn read_exclude(common: &Path) -> Result<Vec<u8>> {
     }
 }
 
-/// Record the workspace ledger of a streamed landing (B1/B2): the record
-/// the hand-off and every later converge read, as a restore writes it.
+/// Record the workspace ledger of a streamed landing (B1/B2).
+///
+/// It is the record the hand-off and every later converge read, as a
+/// restore writes it.
 /// Every seat under `worktree` is printed, but `excluded` (relative paths,
 /// whole subtrees) and the administration. `recorded_ns` dates the prints:
 /// a print stamped within the racy allowance of it stays racy.
