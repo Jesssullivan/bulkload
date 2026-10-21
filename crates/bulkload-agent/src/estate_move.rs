@@ -1651,10 +1651,12 @@ fn homes_plan(run: &Move, home: &Path, plan: &Path) -> Result<()> {
         // real pass derives, so its rows (and its source-key folds) are the
         // real pass's.
         let claude = name == ".claude";
+        let mut prefixes = Vec::new();
         if claude {
             let maps = derive_key_maps(run, home, plan, &to)?;
             print_key_maps(&maps)?;
-            bulkload_agent::transfer::set_map_prefixes(maps.prefixes())?;
+            prefixes = maps.prefixes();
+            bulkload_agent::transfer::set_map_prefixes(prefixes.clone())?;
         }
         let tree = kind == bulkload_agent::transfer::RootKind::Tree;
         let short = name.trim_start_matches('.');
@@ -1676,7 +1678,7 @@ fn homes_plan(run: &Move, home: &Path, plan: &Path) -> Result<()> {
         if claude {
             bulkload_agent::transfer::set_map_prefixes(Vec::new())?;
         }
-        let linked = pull_links(run, &from, &pull, &links);
+        let linked = pull_links(run, &from, &pull, &links, &prefixes);
         let pulled = pulled.and(linked);
         // Report-only: a path refusal (an absent `~/.claude.json` among
         // them) is printed with the plan; only a session that failed fails
@@ -1737,20 +1739,20 @@ fn regularize_home(run: &Move, name: &str, real: &Path, plan: bool) -> Result<()
     ))
 }
 
-// The home's own pull, its live links skipped (each is merged at its real
-// directory by `pull_links`).
+// The home's own pull, its live links skipped (each is merged at its
+// target by `pull_links`).
 fn pull_home(
     run: &Move,
     from: &Path,
     real: &Path,
     name: &str,
-    links: &[(std::ffi::OsString, PathBuf)],
+    links: &[bulkload_agent::reseat::links::LiveLink],
 ) -> Result<()> {
     use std::os::unix::ffi::OsStrExt as _;
     bulkload_agent::transfer::set_skip(
         links
             .iter()
-            .map(|(entry, _)| entry.as_bytes().to_vec())
+            .map(|link| link.rel.as_os_str().as_bytes().to_vec())
             .collect(),
     );
     let pulled = run.transfer_into(from, real, name);
@@ -1758,32 +1760,68 @@ fn pull_home(
     pulled
 }
 
-// Operator interview 2026-10-21 ("Union into link target"): each live link
-// of the home (a directory linking into a --live-link-root) is the live
-// directory itself: the source's same-named directory is merged there by
-// the consolidate rules, its own transfer record; the link stays. A source
-// with no such directory has nothing to merge.
+// The source path of a destination path relative to the home: the key map
+// (#280 finding 9) run backwards, `projects/<D>/...` from the
+// `projects/<S>/...` that lands there; any other path is the same.
+fn source_rel(rel: &Path, maps: &[(Vec<u8>, Vec<u8>)]) -> PathBuf {
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+    let bytes = rel.as_os_str().as_bytes();
+    let mut best: Option<(&[u8], &[u8])> = None;
+    for (source, destination) in maps {
+        let under = bytes == destination.as_slice()
+            || (bytes.starts_with(destination) && bytes.get(destination.len()) == Some(&b'/'));
+        if under && best.is_none_or(|(_, held)| held.len() < destination.len()) {
+            best = Some((source, destination));
+        }
+    }
+    match best {
+        Some((source, destination)) => {
+            let mut path = source.to_vec();
+            path.extend_from_slice(bytes.get(destination.len()..).unwrap_or_default());
+            PathBuf::from(std::ffi::OsString::from_vec(path))
+        }
+        None => rel.to_path_buf(),
+    }
+}
+
+// Operator interviews 2026-10-21 ("Union into link target"; "Merge in place
+// at link targets"): each live link of the home, at any depth (a directory
+// or file linking into a --live-link-root), is the live directory or file
+// itself: the source's same path (through the key map backwards) is merged
+// into its target by the consolidate rules, its own transfer record; the
+// link stays. A source with no such path has nothing to merge.
 fn pull_links(
     run: &Move,
     from: &Path,
     name: &str,
-    links: &[(std::ffi::OsString, PathBuf)],
+    links: &[bulkload_agent::reseat::links::LiveLink],
+    maps: &[(Vec<u8>, Vec<u8>)],
 ) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
     bulkload_agent::transfer::set_listing(Vec::new());
     let mut result = Ok(());
-    for (entry, target) in links {
-        out(&format!(
-            "estate-move live-link home={name} name={entry:?} target={target:?}"
-        ))?;
+    for link in links {
+        let source = from.join(source_rel(&link.rel, maps));
         let pull = format!(
             "{name}-link-{}",
-            entry
-                .to_string_lossy()
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-                .collect::<String>()
+            blake3::hash(link.rel.as_os_str().as_bytes())
+                .to_hex()
+                .get(..16)
+                .unwrap_or_default()
         );
-        match run.transfer_into(&from.join(entry), target, &pull) {
+        out(&format!(
+            "estate-move live-link home={name} rel={} kind={} target={} source={} pull={pull}",
+            link.rel.display(),
+            if link.dir { "dir" } else { "file" },
+            link.target.display(),
+            source.display(),
+        ))?;
+        let kind = if link.dir {
+            bulkload_agent::transfer::RootKind::Tree
+        } else {
+            bulkload_agent::transfer::RootKind::File
+        };
+        match run.transfer_kind(kind, &source, &link.target, &pull) {
             Ok(()) | Err(BulkloadRefusal::SourceRootMissing) => {}
             Err(refusal) => {
                 if result.is_ok() {
@@ -1864,7 +1902,17 @@ fn sessions_pull(
         });
     let unmapped = bulkload_agent::transfer::set_map_prefixes(Vec::new());
     let claude_listing = super::take_listed();
-    let claude_linked = pull_links(run, &home.join(".claude"), "claude", &claude_links);
+    let claude_prefixes = key_maps
+        .as_ref()
+        .map(bulkload_agent::reseat::keymap::KeyMaps::prefixes)
+        .unwrap_or_default();
+    let claude_linked = pull_links(
+        run,
+        &home.join(".claude"),
+        "claude",
+        &claude_links,
+        &claude_prefixes,
+    );
     // #294 review 4: a derived map the landed sessions of its lane did not
     // use (the source keyed them otherwise) leaves them to be re-seated as
     // before, a second copy: named, typed.
@@ -1922,7 +1970,7 @@ fn sessions_pull(
         pull_home(run, &codex_from, real, "codex", &codex_links)
     });
     let codex_listed = write_listing(&pulls.join("codex.listing"), super::take_listed());
-    let codex_linked = pull_links(run, &codex_from, "codex", &codex_links);
+    let codex_linked = pull_links(run, &codex_from, "codex", &codex_links, &[]);
     bulkload_agent::transfer::set_listing(Vec::new());
     bulkload_agent::transfer::set_consolidate(None);
     let cleared = Ok(());
