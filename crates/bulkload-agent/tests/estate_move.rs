@@ -18,11 +18,8 @@
 //! - any payload a pass leaves in its state is named and refused
 //!   `STATE_PAYLOAD_LEFT`.
 //!
-//! The P-MOVE-1..3 landing proofs this file held (M2 item 7), and the four
-//! `--sessions` passes over a Git lane below (plan of record 2026-10-19,
-//! C9 to C11), wait for the streamed capture (PR B), which brings them back
-//! over live-store transfers: until then they are `#[ignore]`d with that
-//! reason.
+//! The `--sessions` passes over a Git lane below land the lane through the
+//! streamed capture and consolidate the homes (#297).
 
 #![allow(
     clippy::unwrap_used,
@@ -1285,7 +1282,6 @@ fn sessions_into_a_destination_with_no_codex_index_hold_the_store() {
 /// - A source session with no lane is `RESEAT_LANE_UNMAPPED`, typed, and
 ///   holds the gate.
 #[test]
-#[ignore = "waits for the streamed capture (PR B): SPEC rule 2 refuses the git capture and corpus pull this pass needs"]
 fn archive_links_follow_a106_and_destination_links_stay() {
     const SID_FORK: &str = "5e5e5e5e-3333-4222-8333-444444444444";
     const SID_NEO_KEY: &str = "5e5e5e5e-4444-4222-8333-444444444444";
@@ -1609,7 +1605,6 @@ fn archive_links_follow_a106_and_destination_links_stay() {
 /// re-seat ledger recorded it as neo's): never `in-place`, the gate never
 /// passes on it, and its refused ledger row is never overwritten.
 #[test]
-#[ignore = "waits for the streamed capture (PR B): SPEC rule 2 refuses the git capture and corpus pull this pass needs"]
 fn listed_then_pruned_sessions_with_no_lane_stay_typed() {
     const SID_PRUNED: &str = "5e5e5e5e-8888-4222-8333-444444444444";
     const T_LANE: &str = "019a0000-0000-7000-8000-00000000000b";
