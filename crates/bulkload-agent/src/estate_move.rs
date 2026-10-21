@@ -990,7 +990,7 @@ fn move_pass(run: &Move) -> Result<()> {
                         .as_ref()
                         .map_err(Clone::clone)
                         .and_then(|program| {
-                            estate::streamed::fetch_objects(snapshot, &private, program)
+                            estate::streamed::fetch_objects(snapshot, &private, program, &map)
                         });
                     (fetched, started.elapsed().as_millis())
                 })
@@ -1003,7 +1003,7 @@ fn move_pass(run: &Move) -> Result<()> {
         let started = std::time::Instant::now();
         if *related {
             let converged = fetched.and_then(|fetched| {
-                estate::streamed::converge(snapshot, &reach, fetched, &run.source)
+                estate::streamed::converge(snapshot, &reach, fetched, &run.source, &map)
             });
             match converged {
                 Ok(done) => {

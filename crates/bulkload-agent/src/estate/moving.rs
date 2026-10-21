@@ -136,6 +136,17 @@ fn walk(roots: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<Note>)> {
             let is_root = directory == root;
             if git_directory(&directory) {
                 usable += usize::from(is_root);
+                // B2 part 3: a nested repository or a populated submodule
+                // under this one's worktree is its own item, walked as one
+                // (the enclosing item excludes its path).
+                if let Ok(nests) = crate::git_carry::nested_repositories(&directory) {
+                    use std::os::unix::ffi::OsStrExt as _;
+                    for nest in nests.iter().rev() {
+                        if nest.kind == crate::git_carry::NestedRepositoryKind::Directory {
+                            stack.push(directory.join(std::ffi::OsStr::from_bytes(&nest.rel_path)));
+                        }
+                    }
+                }
                 found.push(directory);
                 continue;
             }

@@ -688,6 +688,78 @@ fn a_different_branch_switches_when_clean_and_is_held_when_dirty() {
     assert_eq!(fs::read(held.join("f.txt")).unwrap(), b"sting's own edit\n");
 }
 
+/// Part 2, nested repositories and submodules are their own items: the
+/// parent excludes their paths and its `.git/modules`, each lands with its
+/// own fetch, a submodule's administration at the parent's `.git/modules`
+/// and its worktree linked to it.
+#[test]
+fn nested_repositories_and_submodules_land_as_their_own_items() {
+    let world = World::new("nested");
+    let src = world.src();
+    let library = world.base.join("library");
+    repo(&library, "lib.txt");
+    let parent = src.join("parent");
+    repo(&parent, "p.txt");
+    let ran = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args([
+            "-c",
+            "protocol.file.allow=always",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@localhost",
+            "-C",
+        ])
+        .arg(&parent)
+        .args(["submodule", "add", "--quiet"])
+        .arg(&library)
+        .arg("sub")
+        .output()
+        .unwrap();
+    assert!(
+        ran.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    git(&parent, &["commit", "--quiet", "-m", "add sub"]);
+    // An independent repository nested in the worktree (untracked by it).
+    repo(&parent.join("vendor/tool"), "tool.txt");
+    fs::write(parent.join(".git/info/exclude"), "vendor/\n").unwrap();
+    let sourced = world.source();
+    assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
+    assert!(sourced.stdout.contains(" items=3 "), "{}", sourced.stdout);
+    let moved = world.moved();
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    let dst = world.dst();
+    for rel in ["parent", "parent/sub", "parent/vendor/tool"] {
+        assert!(
+            item_line(&moved.stdout, &dst.join(rel)).contains("outcome=workspace-restored"),
+            "{rel}\n{both}"
+        );
+    }
+    let live = dst.join("parent");
+    assert_eq!(
+        out(&live.join("sub"), &["rev-parse", "HEAD"]),
+        out(&parent.join("sub"), &["rev-parse", "HEAD"])
+    );
+    assert_eq!(fs::read(live.join("sub/lib.txt")).unwrap(), b"lib.txt\n");
+    assert_eq!(
+        out(&live.join("vendor/tool"), &["rev-parse", "HEAD"]),
+        out(&parent.join("vendor/tool"), &["rev-parse", "HEAD"])
+    );
+    assert!(
+        out(&live, &["submodule", "status"]).contains(" sub"),
+        "{both}"
+    );
+    out(
+        &live.join("sub"),
+        &["fsck", "--connectivity-only", "--no-dangling"],
+    );
+    holds_no_payload(&world.state(), 3);
+}
+
 /// A shallow source is a typed hold until it has a test: refused on the
 /// source half, nothing recorded for it to land.
 #[test]

@@ -68,6 +68,11 @@ pub struct ItemSnapshot {
     /// and HEAD's commit: what a consolidation switches to when clean.
     pub head_branch: Option<String>,
     pub head: String,
+    /// A repository whose administration lives outside its worktree and is
+    /// no linked worktree's (a submodule's `.git/modules/NAME`, a
+    /// `--separate-git-dir`): its path on the source, landed (mapped) as
+    /// this item's own, its objects fetched into it.
+    pub separate_admin: Option<PathBuf>,
 }
 
 impl ItemSnapshot {
@@ -141,9 +146,15 @@ pub fn capture_source(
             .ok()
             .map(Path::to_path_buf)
     };
+    // A submodule (or `--separate-git-dir`): its own administration, outside
+    // its worktree, is its git directory and common directory both.
+    let git_dir = fs::canonicalize(crate::git_carry::absolute_git_dir(source)?).refuse_at(SITE)?;
+    let separate_admin = (admin.is_none() && git_dir == common).then(|| common.clone());
     match &admin {
         Some(admin) => {
             excluded.push(rel_bytes(&admin.join("objects")));
+            // Submodules' administrations are their own items'.
+            excluded.push(rel_bytes(&admin.join("modules")));
             let config = admin.join(CONFIG);
             host_files.push((rel_bytes(&config), read_file(&source.join(&config))?));
             if let Ok(read) = fs::read_dir(common.join("worktrees")) {
@@ -215,6 +226,7 @@ pub fn capture_source(
         index,
         head_branch,
         head,
+        separate_admin,
     })
 }
 
@@ -354,10 +366,20 @@ pub fn land(
         missing_at_source: snapshot.snapshot.missing,
         ..Landed::default()
     };
-    let owns_store = store_of(snapshot, &live).is_some();
+    let owns_store = store_of(snapshot, &live, map).is_some();
     landed.batches = fetched.batches;
     landed.skipped = fetched.skipped;
     landed.object_bytes = fetched.bytes;
+    // 2a. A separate administration (a submodule's): its own files, its
+    // objects (fetched) and index (settled) left out.
+    if let (Some(from), Some(to)) = (&snapshot.separate_admin, admin_of(snapshot, map)) {
+        fs::create_dir_all(&to).refuse_at(SITE)?;
+        let root = fs::canonicalize(&to).refuse_at(SITE)?;
+        crate::transfer::set_excluded(&root, Some(vec![b"objects".to_vec(), b"index".to_vec()]));
+        let moved = (reach.transfer)(from, &to);
+        crate::transfer::set_excluded(&root, None);
+        moved?;
+    }
     // 2. The seats and the administration's own files.
     let root = {
         fs::create_dir_all(&live).refuse_at(SITE)?;
@@ -422,13 +444,25 @@ pub fn land(
 
 // The live object store an item owns (a main or bare repository's), from
 // its excluded `objects` path.
-fn store_of(snapshot: &ItemSnapshot, live: &Path) -> Option<PathBuf> {
+fn store_of(snapshot: &ItemSnapshot, live: &Path, map: &[(Vec<u8>, Vec<u8>)]) -> Option<PathBuf> {
+    if let Some(admin) = admin_of(snapshot, map) {
+        return Some(admin.join("objects"));
+    }
     use std::os::unix::ffi::OsStrExt as _;
     snapshot
         .excluded
         .iter()
         .find(|path| path.ends_with(b"objects"))
         .map(|path| live.join(std::ffi::OsStr::from_bytes(path)))
+}
+
+// A separate administration's live path: the source's, mapped.
+fn admin_of(snapshot: &ItemSnapshot, map: &[(Vec<u8>, Vec<u8>)]) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    snapshot
+        .separate_admin
+        .as_ref()
+        .map(|admin| PathBuf::from(std::ffi::OsStr::from_bytes(&mapped(&rel_bytes(admin), map))))
 }
 
 /// Fetch `snapshot`'s objects into the item's live object store.
@@ -443,13 +477,14 @@ pub fn fetch_objects(
     snapshot: &ItemSnapshot,
     state: &Path,
     upload_pack: &str,
+    map: &[(Vec<u8>, Vec<u8>)],
 ) -> Result<stream::Fetched> {
     let item = &snapshot.item;
     let live = item
         .workspace
         .clone()
         .unwrap_or_else(|| item.repository.clone());
-    let Some(objects) = store_of(snapshot, &live) else {
+    let Some(objects) = store_of(snapshot, &live, map) else {
         return Ok(stream::Fetched::default());
     };
     for dir in [objects.join("pack"), objects.join("info")] {
@@ -507,6 +542,7 @@ pub fn converge(
     reach: &Reach<'_>,
     fetched: stream::Fetched,
     source: &str,
+    map: &[(Vec<u8>, Vec<u8>)],
 ) -> Result<Converged> {
     use crate::git_carry::union;
     let item = &snapshot.item;
@@ -520,7 +556,7 @@ pub fn converge(
         object_bytes: fetched.bytes,
         ..Converged::default()
     };
-    let owns_store = store_of(snapshot, &live).is_some();
+    let owns_store = store_of(snapshot, &live, map).is_some();
     if owns_store {
         done.refs = union::refs(&live, &snapshot.snapshot.refs, source)?;
         done.stash_added = union::stash(&live, &snapshot.history.stash)?;
