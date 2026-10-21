@@ -123,6 +123,16 @@ pub(crate) mod git_env {
         "fastimport.unpackLimit=0",
     ];
 
+    /// The environment a read-only child runs with once more after a
+    /// failure: the commit-graph off, so a stale or corrupt graph (one
+    /// naming commits a gc pruned) never fails a read, and nothing rewrites
+    /// it (2026-10-21, neo's GloriousFlywheel).
+    pub const GRAPH_OFF: &[(&str, &str)] = &[
+        ("GIT_CONFIG_COUNT", "1"),
+        ("GIT_CONFIG_KEY_0", "core.commitGraph"),
+        ("GIT_CONFIG_VALUE_0", "false"),
+    ];
+
     /// The object store a capture's private repository writes into, a
     /// sibling of its `objects` (S2, #162).
     ///

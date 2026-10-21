@@ -730,7 +730,9 @@ pub fn decide(
         let identity = id(item)?;
         // The item keeps the identity its plan gave it; it is placed at its
         // destination paths.
-        let mapped = inputs.remap.map_or_else(|| Some(item.clone()), |remap| remap(item));
+        let mapped = inputs
+            .remap
+            .map_or_else(|| Some(item.clone()), |remap| remap(item));
         let unmapped = mapped.is_none();
         let item = &mapped.unwrap_or_else(|| item.clone());
         // A corpus capture record, or the streamed capture's item snapshot

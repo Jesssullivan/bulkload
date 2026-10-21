@@ -3283,7 +3283,7 @@ fn the_plan_prints_every_b2_decision_and_writes_nothing() {
     assert_eq!(summary["consolidate"], "1", "{both}");
     assert_eq!(summary["conflicts"], "1", "{both}");
     let rows = fs::read_to_string(world.state().join("diff.jsonl")).unwrap();
-    for (path, verdict) in [("f.txt", "merge"), ("g.txt", "conflict"), ("new.txt", "land")] {
+    for (path, verdict) in [("f.txt", "merged"), ("g.txt", "conflict"), ("new.txt", "land")] {
         assert!(
             rows.lines().any(|row| row.contains(&format!("\"path\":\"{path}\""))
                 && row.contains(&format!("\"verdict\":\"{verdict}\""))),

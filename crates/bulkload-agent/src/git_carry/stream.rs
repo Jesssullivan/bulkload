@@ -882,6 +882,9 @@ mod tests {
         g(&repo, &["reset", "-q", "--hard", "HEAD~1"]);
         g(&repo, &["reflog", "expire", "--expire=now", "--all"]);
         g(&repo, &["prune", "--expire=now"]);
+        // The reset's ORIG_HEAD names the pruned commit: counted missing,
+        // as any operation file is; this test is the graph's.
+        fs::remove_file(repo.join(".git/ORIG_HEAD")).unwrap();
         let graph = repo.join(".git/objects/info/commit-graph");
         let before = fs::read(&graph).unwrap();
         // The fixture holds: plain Git's fsck refuses this store.

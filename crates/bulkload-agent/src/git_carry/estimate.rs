@@ -1081,10 +1081,11 @@ const READ_ONLY_SUBCOMMANDS: &[&str] = &[
 /// that did not already set configuration through the environment; whether
 /// it did.
 fn commit_graph_retry(command: &mut Command) -> bool {
+    let (count, _) = super::git_env::GRAPH_OFF[0];
     if command.get_program() != "git"
         || command
             .get_envs()
-            .any(|(key, value)| key == "GIT_CONFIG_COUNT" && value.is_some())
+            .any(|(key, value)| key == count && value.is_some())
     {
         return false;
     }
@@ -1099,13 +1100,11 @@ fn commit_graph_retry(command: &mut Command) -> bool {
             None => return false,
         }
     };
-    let read_only = READ_ONLY_SUBCOMMANDS.contains(&subcommand)
-        || (subcommand == "worktree" && args.next().and_then(|arg| arg.to_str()) == Some("list"));
+    let read_only = READ_ONLY_SUBCOMMANDS.contains(&subcommand);
     if read_only {
-        command
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", "core.commitGraph")
-            .env("GIT_CONFIG_VALUE_0", "false");
+        for (key, value) in super::git_env::GRAPH_OFF {
+            command.env(key, value);
+        }
     }
     read_only
 }

@@ -168,16 +168,17 @@ fn code(repo: &Path, args: &[&str]) -> Option<i32> {
     let ran = git(repo).args(args).output().ok()?;
     match ran.status.code() {
         Some(code @ (0 | 1)) => Some(code),
-        _ => git(repo)
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", "core.commitGraph")
-            .env("GIT_CONFIG_VALUE_0", "false")
-            .args(args)
-            .output()
-            .ok()?
-            .status
-            .code()
-            .filter(|code| matches!(code, 0 | 1)),
+        _ => {
+            let mut again = git(repo);
+            again.envs(super::git_env::GRAPH_OFF.iter().copied());
+            again
+                .args(args)
+                .output()
+                .ok()?
+                .status
+                .code()
+                .filter(|code| matches!(code, 0 | 1))
+        }
     }
 }
 
@@ -356,29 +357,28 @@ fn files_answer(ask: &FilesAsk) -> FilesAnswer {
         held(&ask.worktree, &[head.to_owned()]).is_ok_and(|held| held.contains(head))
     });
     let mut diff_known = dest_head.is_none() || dest_head == source_head.as_deref();
-    let base = if let (Some(dest), Some(ours), true) =
-        (dest_head, source_head.as_deref(), held_head)
-    {
-        if dest != ours {
-            if let Ok(names) =
-                output(git(&ask.worktree).args(["diff", "--name-only", "-z", dest, ours]))
-            {
-                candidates.extend(
-                    names
-                        .split(|byte| *byte == 0)
-                        .filter(|name| !name.is_empty())
-                        .map(<[u8]>::to_vec),
-                );
-                diff_known = true;
+    let base =
+        if let (Some(dest), Some(ours), true) = (dest_head, source_head.as_deref(), held_head) {
+            if dest != ours {
+                if let Ok(names) =
+                    output(git(&ask.worktree).args(["diff", "--name-only", "-z", dest, ours]))
+                {
+                    candidates.extend(
+                        names
+                            .split(|byte| *byte == 0)
+                            .filter(|name| !name.is_empty())
+                            .map(<[u8]>::to_vec),
+                    );
+                    diff_known = true;
+                }
             }
-        }
-        output(git(&ask.worktree).args(["merge-base", dest, ours]))
-            .ok()
-            .map(|out| String::from_utf8_lossy(&out).trim().to_owned())
-            .filter(|base| oid(base))
-    } else {
-        None
-    };
+            output(git(&ask.worktree).args(["merge-base", dest, ours]))
+                .ok()
+                .map(|out| String::from_utf8_lossy(&out).trim().to_owned())
+                .filter(|base| oid(base))
+        } else {
+            None
+        };
     let files = candidates
         .into_iter()
         .filter(|path| contained(path))
@@ -423,7 +423,8 @@ pub fn worktrees(repo: &Path) -> Result<Vec<(PathBuf, Option<String>)>> {
     for field in listed.split(|byte| *byte == 0) {
         if let Some(at) = field.strip_prefix(b"worktree ") {
             found.push((PathBuf::from(std::ffi::OsStr::from_bytes(at)), None));
-        } else if let (Some(branch), Some(last)) = (field.strip_prefix(b"branch "), found.last_mut())
+        } else if let (Some(branch), Some(last)) =
+            (field.strip_prefix(b"branch "), found.last_mut())
         {
             last.1 = Some(String::from_utf8_lossy(branch).into_owned());
         }
@@ -508,7 +509,7 @@ impl Verdict {
     pub const fn word(self) -> &'static str {
         match self {
             Self::Land => "land",
-            Self::Merge => "merge",
+            Self::Merge => "merged",
             Self::Conflict => "conflict",
             Self::Same => "same",
             Self::Unknown => "unknown",
@@ -579,7 +580,9 @@ pub fn asides(place: &Path, label: &str) -> Result<Vec<PathBuf>> {
         let Some(suffix) = file_name.as_bytes().strip_prefix(prefix.as_slice()) else {
             continue;
         };
-        if suffix.starts_with(b"neo-") || suffix.starts_with(b"sting-") || suffix == label.as_bytes()
+        if suffix.starts_with(b"neo-")
+            || suffix.starts_with(b"sting-")
+            || suffix == label.as_bytes()
         {
             found.push(entry.path());
         }
