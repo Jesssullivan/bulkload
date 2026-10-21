@@ -1,8 +1,6 @@
-//! The union's ledger tables, `row_union_*`, in the homes'
-//! consolidation ledger `STATE/consolidate.sqlite` (a bulkload store: WAL,
-//! `synchronous=FULL`, `io::durable::configure_sqlite`). The ledger borrows
-//! its connection, so #297's `Ledger::connection()` serves it as well as
-//! [`open_store`].
+//! The union's ledger tables, `row_union_*`, in the homes' consolidation
+//! ledger `STATE/consolidate.sqlite` (#297's `consolidate::Ledger`, on its
+//! `connection()`).
 //!
 //! - `stores`: per source store and destination store, the source identity
 //!   of the last pass that ended (`End`), so an unchanged store is not read.
@@ -13,15 +11,10 @@
 //! - `rows`: every row not in the destination's final state, kept or
 //!   displaced, with its key, BLAKE3 and JSON ([`Entry`]).
 
-use std::path::Path;
-
 use bulkload_proto::rows::{Identity, Value};
 use rusqlite::{params, Connection, OptionalExtension as _};
 
 use crate::{BulkloadRefusal, Result};
-
-/// The ledger's file name in the state directory.
-pub const FILE: &str = "consolidate.sqlite";
 
 /// What the destination holds of one table.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -119,18 +112,6 @@ fn sql(_: rusqlite::Error) -> BulkloadRefusal {
 
 fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
     postcard::to_stdvec(value).map_err(|_| BulkloadRefusal::FrameCodec)
-}
-
-/// Open (or create) the consolidation ledger store in `state`.
-///
-/// # Errors
-/// The ledger store's failure.
-pub fn open_store(state: &Path) -> Result<Connection> {
-    let conn = Connection::open(state.join(FILE)).map_err(sql)?;
-    crate::io::durable::configure_sqlite(&conn)?;
-    conn.busy_timeout(std::time::Duration::from_secs(30))
-        .map_err(sql)?;
-    Ok(conn)
 }
 
 impl<'c> Ledger<'c> {

@@ -263,9 +263,11 @@ pub fn consolidate<R: Read, W: Write>(
         Err(BulkloadRefusal::SqliteUnionTargetAbsent) => false,
         Err(refusal) => return Err(refusal),
     };
-    let store_conn = super::ledger::open_store(&options.state)?;
+    // The homes' consolidation ledger (#297): this union's tables beside
+    // its own.
+    let homes = crate::consolidate::Ledger::open(&options.state)?;
     let ledger = Ledger::new(
-        &store_conn,
+        homes.connection(),
         &options.host,
         &options.source,
         &options.dest.to_string_lossy(),
@@ -483,7 +485,7 @@ fn open_dest(path: &Path) -> Result<(Connection, (u64, u64))> {
     )
     .map_err(sql)?;
     if seat_of(path)? != seat {
-        return Err(BulkloadRefusal::SqliteStateChanged);
+        return Err(BulkloadRefusal::HomesConsolidateRaced);
     }
     Ok((conn, seat))
 }
@@ -932,7 +934,7 @@ impl Merge<'_> {
     fn begin(&self) -> Result<()> {
         // The store opened is still the one at its path (#297's rule).
         if seat_of(self.path)? != self.seat {
-            return Err(BulkloadRefusal::SqliteStateChanged);
+            return Err(BulkloadRefusal::HomesConsolidateRaced);
         }
         let started = Instant::now();
         let mut backoff = Duration::from_millis(10);
@@ -941,7 +943,7 @@ impl Merge<'_> {
                 Ok(()) => break,
                 Err(error) if super::hold::busy_failure(&error) => {
                     if started.elapsed() > BEGIN_WALL {
-                        return Err(BulkloadRefusal::SqliteStateChanged);
+                        return Err(BulkloadRefusal::HomesConsolidateRaced);
                     }
                     counters::bump(Counter::DestSqliteUnionBusy);
                     std::thread::sleep(backoff);

@@ -70,26 +70,23 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 
 pub use dest::{consolidate, maps, Options, UnionStats};
-pub use ledger::{open_store as open_ledger, Ledger, FILE as LEDGER_FILE};
+pub use ledger::Ledger;
+pub use source::{serve_rows, SourceStats};
 
-/// What a store's consolidation did, in #297's terms (`Action`).
+/// The homes' consolidation outcome (#297) of one [`consolidate`] result.
 ///
-/// A lossless union is `Consolidated`; a store that cannot be merged is
-/// `Held` with its code, nothing written.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action {
-    Consolidated,
-    /// The destination had no store: it was made, and the rows went in.
-    Created,
-    Held(&'static str),
-}
-
-/// The [`Action`] of one [`consolidate`] result; `None` for a refusal that
-/// is no hold (the transport's, a source's, a racing live writer's).
+/// A lossless union is `Consolidated` (`Covered` when the store was
+/// unchanged and nothing was read), a store made here is `Created`, and a
+/// store that cannot be merged is `Held` with its code, nothing written.
+/// `None` for a refusal that is no hold: the transport's, the source's, or
+/// a live writer's that kept racing (`HOMES_CONSOLIDATE_RACED`,
+/// retryable).
 #[must_use]
-pub const fn action(result: &Result<UnionStats>) -> Option<Action> {
+pub const fn action(result: &Result<UnionStats>) -> Option<crate::consolidate::Action> {
+    use crate::consolidate::Action;
     match result {
         Ok(stats) if stats.created => Some(Action::Created),
+        Ok(stats) if stats.unchanged => Some(Action::Covered),
         Ok(_) => Some(Action::Consolidated),
         Err(
             refusal @ (BulkloadRefusal::SqliteSchemaMismatch
@@ -100,7 +97,202 @@ pub const fn action(result: &Result<UnionStats>) -> Option<Action> {
         Err(_) => None,
     }
 }
-pub use source::{serve_rows, SourceStats};
+
+/// One store routed to the row union by a `--consolidate` session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Routed {
+    /// The store, relative to the session's roots.
+    pub store: Vec<u8>,
+    /// Its `-wal`, `-shm` and `-journal` the session skipped: they follow
+    /// the store's outcome.
+    pub sidecars: Vec<Vec<u8>>,
+    /// The store with `threads` in the same directory (the home's
+    /// `state_5.sqlite`), when it is another: this store's thread clock.
+    pub clock: Option<Vec<u8>>,
+}
+
+/// The stores of a session's skipped seats, state stores first.
+///
+/// The seats are [`crate::transfer::TransferStats::sqlite_routed`]. A
+/// home's `state_*.sqlite` comes first in each directory, so its threads'
+/// winners are decided before its other stores follow them.
+#[must_use]
+pub fn routed(paths: &[Vec<u8>]) -> Vec<Routed> {
+    const SIDECARS: [&[u8]; 3] = [b"-wal", b"-shm", b"-journal"];
+    let base = |path: &[u8]| -> Vec<u8> {
+        SIDECARS
+            .iter()
+            .find_map(|suffix| path.strip_suffix(*suffix))
+            .unwrap_or(path)
+            .to_vec()
+    };
+    let split = |path: &[u8]| -> (Vec<u8>, Vec<u8>) {
+        path.iter().rposition(|byte| *byte == b'/').map_or_else(
+            || (Vec::new(), path.to_vec()),
+            |at| {
+                (
+                    path.get(..at).unwrap_or_default().to_vec(),
+                    path.get(at + 1..).unwrap_or_default().to_vec(),
+                )
+            },
+        )
+    };
+    let is_state = |path: &[u8]| split(path).1.starts_with(b"state_");
+    let mut stores: Vec<Routed> = Vec::new();
+    for path in paths {
+        let store = base(path);
+        let at = stores.iter().position(|routed| routed.store == store);
+        let at = at.unwrap_or_else(|| {
+            stores.push(Routed {
+                store: store.clone(),
+                sidecars: Vec::new(),
+                clock: None,
+            });
+            stores.len() - 1
+        });
+        if *path != store {
+            if let Some(routed) = stores.get_mut(at) {
+                routed.sidecars.push(path.clone());
+            }
+        }
+    }
+    // A store whose own seat was not offered (only a sidecar was) is still
+    // the union's: the live store is merged from the source's.
+    let states: Vec<Vec<u8>> = stores
+        .iter()
+        .filter(|routed| is_state(&routed.store))
+        .map(|routed| routed.store.clone())
+        .collect();
+    for routed in &mut stores {
+        if !is_state(&routed.store) {
+            let dir = split(&routed.store).0;
+            routed.clock = states.iter().find(|state| split(state).0 == dir).cloned();
+        }
+    }
+    stores.sort_by(|a, b| {
+        is_state(&b.store)
+            .cmp(&is_state(&a.store))
+            .then_with(|| a.store.cmp(&b.store))
+    });
+    stores
+}
+
+/// Record one routed store's union in the session's stats, so its transfer
+/// record accounts for it and its sidecars: consolidated (with #297's
+/// action word), or held / refused with the typed code.
+pub fn fold(
+    stats: &mut crate::transfer::TransferStats,
+    routed: &Routed,
+    result: &Result<UnionStats>,
+) {
+    let paths = std::iter::once(&routed.store).chain(routed.sidecars.iter());
+    match (action(result), result) {
+        (Some(crate::consolidate::Action::Held(code)), _) => {
+            for path in paths {
+                stats.held.push((path.clone(), code));
+                stats.refusals.push((path.clone(), code.to_owned()));
+            }
+        }
+        (Some(action), _) => {
+            for path in paths {
+                stats
+                    .consolidated
+                    .push((path.clone(), action.word().to_owned()));
+            }
+        }
+        (None, Err(refusal)) => {
+            for path in paths {
+                stats
+                    .refusals
+                    .push((path.clone(), refusal.code().to_owned()));
+            }
+        }
+        (None, Ok(_)) => {}
+    }
+}
+
+/// Merge a `--consolidate` session's routed stores, one report line each.
+///
+/// Each store ([`routed`]) is merged by `run`, one serve session per
+/// store, a home's state store first, and every outcome is folded into
+/// `stats`. The roots are the session's source and destination roots; the
+/// host is the source host's name (`None`: this host, `local`), and
+/// `source_key` names a source store in the ledger.
+/// How a source store is named in the ledger.
+pub type SourceKey<'k> = &'k dyn Fn(&Path) -> String;
+
+pub fn union_routed(
+    stats: &mut crate::transfer::TransferStats,
+    settings: &crate::transfer::Consolidation,
+    (source_root, dest_root): (&Path, &Path),
+    (host, source_key): (Option<&str>, SourceKey<'_>),
+    mut run: impl FnMut(&Options) -> Result<UnionStats>,
+) -> Vec<String> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let routed = routed(&std::mem::take(&mut stats.sqlite_routed));
+    if settings.plan_only {
+        return Vec::new();
+    }
+    let pairs: Vec<(Vec<u8>, Vec<u8>)> = settings
+        .maps
+        .pairs()
+        .iter()
+        .map(|(from, to)| (from.as_bytes().to_vec(), to.as_bytes().to_vec()))
+        .collect();
+    let maps = maps(&pairs);
+    let join = |root: &Path, rel: &[u8]| root.join(std::ffi::OsStr::from_bytes(rel));
+    let mut lines = Vec::with_capacity(routed.len());
+    for store in &routed {
+        let source = join(source_root, &store.store);
+        let options = Options {
+            host: host.unwrap_or("local").to_owned(),
+            source: source_key(&source),
+            source_db: source.as_os_str().as_bytes().to_vec(),
+            source_clock: store
+                .clock
+                .as_ref()
+                .map(|clock| join(source_root, clock).as_os_str().as_bytes().to_vec()),
+            dest: join(dest_root, &store.store),
+            state: settings.ledger.clone(),
+            maps: maps.clone(),
+            full: false,
+        };
+        let result = run(&options);
+        let word = match (action(&result), &result) {
+            (Some(action), _) => action.word().to_owned(),
+            (None, Err(refusal)) => refusal.code().to_owned(),
+            (None, Ok(_)) => "none".to_owned(),
+        };
+        lines.push(format!(
+            "sqlite-union-store {} {word}",
+            store.store.escape_ascii()
+        ));
+        fold(stats, store, &result);
+    }
+    lines
+}
+
+/// `sqlite-union --local`, and a `copy --consolidate`'s stores: the source
+/// half on a thread of this process, over a socket pair.
+///
+/// # Errors
+/// The union's refusal, or the source half's.
+pub fn local(options: &Options) -> Result<UnionStats> {
+    let io = |error: std::io::Error| BulkloadRefusal::Io(error.raw_os_error());
+    let (source, mut dest) = std::os::unix::net::UnixStream::pair().map_err(io)?;
+    let mut source_in = source.try_clone().map_err(io)?;
+    let mut source_out = source;
+    let served = std::thread::spawn(move || serve_rows(&mut source_in, &mut source_out));
+    let mut dest_in = dest.try_clone().map_err(io)?;
+    let merged = consolidate(&mut dest_in, &mut dest, options);
+    let _ = dest.shutdown(std::net::Shutdown::Both);
+    let served = served.join().map_err(|_| BulkloadRefusal::TransportLost)?;
+    let stats = merged?;
+    // The source's own refusal reached the merge as `Refused`; one after
+    // the merge ended is still this run's failure.
+    served?;
+    Ok(stats)
+}
 
 use bulkload_proto::frame::{FRAME_HEADER_BYTES, MAX_FRAME_BYTES, TAG_CONTROL};
 use bulkload_proto::rows::{

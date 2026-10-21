@@ -2336,8 +2336,9 @@ with backoff up to 5 min, `synchronous=FULL`, foreign keys enforced.
 - **Paths:** `cwd`, `path` and `*_path` values are re-spelled through
   `--map` (A-055).
 
-**Ledger.** The `row_union_*` tables live in `STATE/consolidate.sqlite`
-(#297's ledger file), on a borrowed connection. They hold every row not in
+**Ledger.** The `row_union_*` tables live in the homes' consolidation
+ledger, `STATE/consolidate.sqlite`, on `consolidate::Ledger::connection()`
+(#297). They hold every row not in
 the destination's final state: its key as JSON, its reason, its BLAKE3 and
 its JSON. A displaced row is ledgered durably before the commit that
 replaces it.
@@ -2360,9 +2361,26 @@ are counted.
 
 **Order and gaps.**
 
-- `pull --consolidate` (#297) must merge a home's `state_5.sqlite` before
-  its other stores, so the thread winners exist for them. A thread-scoped
-  row of a thread with no recorded winner keeps per-row later-wins.
+- A thread-scoped row of a thread with no recorded winner keeps per-row
+  later-wins.
+
+**Dispatch** (`copy`/`pull --consolidate`, #297). The receive skips a
+`SQLite` store and its `-wal`, `-shm` and `-journal` on the file path,
+with nothing read (`TransferStats::sqlite_routed`). After the session,
+`sqlite_union::union_routed` merges each store by the row union, one serve
+session per store: `pull` uses its ssh child with `--sqlite-rows`, and
+`copy` runs in process. A home's `state_*.sqlite` goes first in each
+directory and is the clock of that directory's other stores. Each outcome
+joins the session's transfer record before it is written
+(`sqlite_union::fold`):
+
+- `consolidate`, `covered` (the store was unchanged) or `created`;
+- a hold, with the union's typed code;
+- the refusal, for example `HOMES_CONSOLIDATE_RACED` when the live store
+  stayed locked past the batch wall or was replaced (retryable).
+
+The store's sidecars follow its outcome. `--plan-only` lists them as
+`row-union`.
 - `>=` re-reads the rows at the old time mark itself; they are adopted.
 
 ## Durability

@@ -350,6 +350,11 @@ pub struct TransferStats {
     pub held: Vec<(Vec<u8>, &'static str)>,
     /// `--plan-only`: every seat's planned action.
     pub planned: Vec<PlannedSeat>,
+    /// `--consolidate`: `SQLite` stores and their `-wal`, `-shm` and
+    /// `-journal`, skipped on the file path with nothing read: each store
+    /// is merged by the row union, one serve session per store, after the
+    /// session (`sqlite_union::routed`, `sqlite_union::fold`).
+    pub sqlite_routed: Vec<Vec<u8>>,
 }
 
 impl TransferStats {
@@ -1398,6 +1403,15 @@ fn consolidation(root: &Path) -> Option<Arc<Consolidation>> {
         )
 }
 
+/// This process's `--consolidate` settings, if any.
+#[must_use]
+pub fn consolidation_settings() -> Option<Arc<Consolidation>> {
+    CONSOLIDATE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
 /// Whether this process's sessions only plan (`--plan-only`): nothing is
 /// written, and a recorded verb records nothing.
 #[must_use]
@@ -1412,9 +1426,9 @@ pub fn plan_only() -> bool {
 /// Why an append log that diverged is held: its union is the #294 lane's.
 const APPEND_LOG_PENDING: &str = "append-log: diverged, and the JSONL union (#294) has not landed";
 /// Why a `SQLite` store (or its `-wal`, `-shm`, `-journal`) is held: its
-/// union is the #278 lane's row stream (`--sqlite-rows`), never this file
+/// union is the row stream (`sqlite_union`, `--sqlite-rows`), never this file
 /// path.
-const SQLITE_PENDING: &str = "sqlite: the row union (#278) has not landed";
+const SQLITE_PENDING: &str = "sqlite: a store is merged by the row union, never this file path";
 /// Why a transcript the destination holds under another project key is
 /// held: a second copy of one session is a duplicate (SPEC rule 3), and
 /// the union into the one live file is the #294 lane's.
@@ -6602,8 +6616,16 @@ impl<W: Write> Inbound<'_, W> {
         use crate::consolidate::{union_of, Class};
         let class = Class::of(&row.rel_path, false);
         let plan = settings.plan_only;
+        // A store and its sidecars never take the file path: the row union
+        // merges the store over its own serve session (operator ruling
+        // 2026-10-20; SPEC, the Codex SQLite row).
         if class == Class::Sqlite && union_of(class).is_none() {
-            return self.hold_seat(row, class, None, SQLITE_PENDING, plan);
+            if plan {
+                self.plan_seat(row, class.word(), "row-union", None, None);
+            } else {
+                self.stats.sqlite_routed.push(row.rel_path.clone());
+            }
+            return Ok(Decision::Skip);
         }
         let identity = match self.target.identity(row) {
             Ok(identity) => identity,

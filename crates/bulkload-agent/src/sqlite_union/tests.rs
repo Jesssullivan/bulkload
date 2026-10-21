@@ -139,9 +139,9 @@ impl Fixture {
     }
 
     fn ledger<T>(&self, read: impl FnOnce(&Ledger<'_>) -> T) -> T {
-        let conn = super::ledger::open_store(&self.state).unwrap();
+        let homes = crate::consolidate::Ledger::open(&self.state).unwrap();
         let ledger = Ledger::new(
-            &conn,
+            homes.connection(),
             "neo",
             &format!("neo:{}", self.source.display()),
             &self.dest.to_string_lossy(),
@@ -548,7 +548,10 @@ fn an_absent_destination_store_is_created_by_the_row_union() {
     drop(source);
 
     let created = fixture.pass(false);
-    assert_eq!(super::action(&created), Some(super::Action::Created));
+    assert_eq!(
+        super::action(&created),
+        Some(crate::consolidate::Action::Created)
+    );
     let created = created.unwrap();
     assert!(created.created, "{created:?}");
     // The store, its sidecars, nothing else: no temporary, no copy.
@@ -594,7 +597,9 @@ fn a_corrupt_source_store_is_held_and_nothing_is_written() {
     );
     assert_eq!(
         super::action(&held),
-        Some(super::Action::Held("SQLITE_UNION_SOURCE_UNREADABLE"))
+        Some(crate::consolidate::Action::Held(
+            "SQLITE_UNION_SOURCE_UNREADABLE"
+        ))
     );
     assert_eq!(count(&dest, "threads"), 0);
     assert!(fixture
@@ -704,9 +709,9 @@ fn a_threads_rows_in_another_store_follow_its_later_side_as_one() {
         ),
         ["T 200", "U 300"]
     );
-    let conn = super::ledger::open_store(&fixture.state).unwrap();
+    let homes = crate::consolidate::Ledger::open(&fixture.state).unwrap();
     let ledger = Ledger::new(
-        &conn,
+        homes.connection(),
         "neo",
         &format!("neo:{}", source_history.display()),
         &dest_history.to_string_lossy(),
@@ -844,7 +849,7 @@ fn a_surrogate_batch_found_committed_after_an_interruption_is_never_inserted_aga
             Ok((row.get(0)?, row.get(1)?))
         })
         .unwrap();
-    let ledger_file = fixture.state.join(super::ledger::FILE);
+    let ledger_file = fixture.state.join("consolidate.sqlite");
     Connection::open(&ledger_file)
         .unwrap()
         .execute(
@@ -945,9 +950,9 @@ fn a_diverged_thread_keeps_both_sides_extras_and_a_colliding_one_holds_it() {
         ),
         ["i1", "i2"]
     );
-    let conn = super::ledger::open_store(&fixture.state).unwrap();
+    let homes = crate::consolidate::Ledger::open(&fixture.state).unwrap();
     let ledger = Ledger::new(
-        &conn,
+        homes.connection(),
         "neo",
         &format!("neo:{}", source_history.display()),
         &dest_history.to_string_lossy(),
@@ -964,4 +969,162 @@ fn a_diverged_thread_keeps_both_sides_extras_and_a_colliding_one_holds_it() {
         ledger.winners().unwrap().get(b"H".as_slice()),
         Some(&super::ledger::Winner::Held)
     );
+}
+
+#[test]
+fn a_sessions_skipped_seats_become_stores_state_first_with_their_clock() {
+    let routed = super::routed(&[
+        b".codex/thread_history_1.sqlite".to_vec(),
+        b".codex/logs_2.sqlite-wal".to_vec(),
+        b".codex/state_5.sqlite-wal".to_vec(),
+        b".codex/state_5.sqlite".to_vec(),
+        b".codex/logs_2.sqlite".to_vec(),
+        b".codex/state_5.sqlite-shm".to_vec(),
+    ]);
+    let stores: Vec<&[u8]> = routed
+        .iter()
+        .map(|routed| routed.store.as_slice())
+        .collect();
+    assert_eq!(
+        stores,
+        [
+            b".codex/state_5.sqlite".as_slice(),
+            b".codex/logs_2.sqlite",
+            b".codex/thread_history_1.sqlite"
+        ]
+    );
+    assert_eq!(routed[0].clock, None);
+    assert_eq!(
+        routed[0].sidecars,
+        [
+            b".codex/state_5.sqlite-wal".to_vec(),
+            b".codex/state_5.sqlite-shm".to_vec()
+        ]
+    );
+    assert_eq!(
+        routed[1].clock.as_deref(),
+        Some(b".codex/state_5.sqlite".as_slice())
+    );
+    assert_eq!(routed[1].sidecars, [b".codex/logs_2.sqlite-wal".to_vec()]);
+    assert_eq!(
+        routed[2].clock.as_deref(),
+        Some(b".codex/state_5.sqlite".as_slice())
+    );
+
+    // Folded into the session's record: accounted, held typed, or refused.
+    let mut stats = crate::transfer::TransferStats::default();
+    super::fold(&mut stats, &routed[0], &Ok(UnionStats::default()));
+    super::fold(
+        &mut stats,
+        &routed[1],
+        &Err(BulkloadRefusal::SqliteSchemaMismatch),
+    );
+    super::fold(
+        &mut stats,
+        &routed[2],
+        &Err(BulkloadRefusal::HomesConsolidateRaced),
+    );
+    assert_eq!(
+        stats.consolidated,
+        [
+            (b".codex/state_5.sqlite".to_vec(), "consolidate".to_owned()),
+            (
+                b".codex/state_5.sqlite-wal".to_vec(),
+                "consolidate".to_owned()
+            ),
+            (
+                b".codex/state_5.sqlite-shm".to_vec(),
+                "consolidate".to_owned()
+            ),
+        ]
+    );
+    assert_eq!(
+        stats.held,
+        [
+            (b".codex/logs_2.sqlite".to_vec(), "SQLITE_SCHEMA_MISMATCH"),
+            (
+                b".codex/logs_2.sqlite-wal".to_vec(),
+                "SQLITE_SCHEMA_MISMATCH"
+            ),
+        ]
+    );
+    assert!(stats.refusals.contains(&(
+        b".codex/thread_history_1.sqlite".to_vec(),
+        "HOMES_CONSOLIDATE_RACED".to_owned()
+    )));
+}
+
+#[test]
+fn a_consolidating_copy_routes_each_store_to_the_row_union_state_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let (source_root, dest_root) = (dir.path().join("neo"), dir.path().join("sting"));
+    let (source_state, dest_state) = (dir.path().join("neo-state"), dir.path().join("sting-state"));
+    std::fs::create_dir_all(source_root.join(".codex")).unwrap();
+    std::fs::create_dir_all(dest_root.join(".codex")).unwrap();
+    let neo = store(&source_root.join(".codex/state_5.sqlite"), "");
+    thread(&neo, "A", "/Users/jess/git/lab", "neo A", 2_000);
+    drop(neo);
+    let neo_history = history(&source_root.join(".codex/thread_history_1.sqlite"));
+    item(&neo_history, "A", "i1", "neo A i1");
+    drop(neo_history);
+    let sting = store(&dest_root.join(".codex/state_5.sqlite"), "");
+    thread(&sting, "C", "/home/jess/git/x", "sting C", 1_000);
+    drop(sting);
+
+    let settings = crate::transfer::Consolidation {
+        maps: crate::consolidate::Maps::new([(
+            "/Users/jess/git".to_owned(),
+            "/home/jess/git".to_owned(),
+        )]),
+        ledger: dest_state.join("consolidate"),
+        plan_only: false,
+    };
+    let root = dest_root.canonicalize().unwrap();
+    crate::transfer::set_consolidate_for(&root, Some(Some(settings.clone())));
+    let copied = crate::transfer::copy_kind(
+        &source_root,
+        &root,
+        &source_state,
+        &dest_state,
+        crate::transfer::RootKind::Tree,
+    );
+    crate::transfer::set_consolidate_for(&root, None);
+    let mut stats = copied.unwrap();
+    assert!(!stats.sqlite_routed.is_empty(), "{stats:?}");
+    let lines = super::union_routed(
+        &mut stats,
+        &settings,
+        (&source_root, &root),
+        (None, &|source: &Path| format!("local:{}", source.display())),
+        super::local,
+    );
+    assert_eq!(
+        lines,
+        [
+            "sqlite-union-store .codex/state_5.sqlite consolidate",
+            "sqlite-union-store .codex/thread_history_1.sqlite created",
+        ]
+    );
+    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+    assert!(stats
+        .consolidated
+        .contains(&(b".codex/state_5.sqlite".to_vec(), "consolidate".to_owned())));
+    let sting = Connection::open(root.join(".codex/state_5.sqlite")).unwrap();
+    assert_eq!(
+        rows(&sting, "SELECT id || ' ' || cwd FROM threads ORDER BY id"),
+        ["A /home/jess/git/lab", "C /home/jess/git/x"]
+    );
+    let sting_history = Connection::open(root.join(".codex/thread_history_1.sqlite")).unwrap();
+    assert_eq!(
+        rows(&sting_history, "SELECT item_json FROM thread_items"),
+        ["neo A i1"]
+    );
+    // The live stores and nothing beside them.
+    let mut names: Vec<String> = std::fs::read_dir(root.join(".codex"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.ends_with("-wal") && !name.ends_with("-shm"))
+        .collect();
+    names.sort();
+    assert_eq!(names, ["state_5.sqlite", "thread_history_1.sqlite"]);
 }

@@ -124,3 +124,26 @@ corrupt-copy landing.
 
 The `pull --consolidate` order (state_5 first) has gone to #297's dispatch
 lane.
+
+## 2026-10-21: main 3d4fca5 (#297) merged; dispatch wired
+
+Merge `32032d9` was signed with no rebase. The refusal codes of both sides
+are kept.
+
+- **Dispatch.** `copy`/`pull --consolidate` skips a store and its sidecars
+  on the file path (`TransferStats::sqlite_routed`, nothing read).
+  `sqlite_union::union_routed` then merges each store, one serve session
+  per store (`pull`: its ssh child; `copy`: in process), `state_*.sqlite`
+  first and as the clock of its directory's other stores.
+  `sqlite_union::fold` writes each outcome into the transfer record before
+  it is written.
+- **Ledger.** `consolidate::Ledger::open(..).connection()`; this lane's own
+  opener is gone.
+- **Outcomes.** These are #297's `Action`: `Consolidated`, `Covered`
+  (unchanged), `Created`, or `Held(code)`. A write lock busy past the batch
+  wall, or a live store replaced mid-pass, is `HOMES_CONSOLIDATE_RACED`.
+- **#297's test.** It now expects a store and its `-wal` to be routed
+  rather than held.
+
+Honey ran targeted tests only (rule of 2026-10-21): fmt, both clippy lanes,
+and lib `sqlite_union consolidate` (38 passed).

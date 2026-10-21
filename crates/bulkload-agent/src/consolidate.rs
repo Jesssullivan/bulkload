@@ -8,7 +8,8 @@
 //! Each file [`Class`] has its own [`Union`]:
 //! - append logs: the #294 lane's JSONL union;
 //! - structured config: [`config`], JSON and TOML merged key by key;
-//! - Codex `SQLite`: the #278 lane's row union;
+//! - Codex `SQLite`: the row union ([`crate::sqlite_union`]), over its own
+//!   serve session per store, never this file path;
 //! - anything else: [`opaque`], equal bytes adopted and differing bytes
 //!   held.
 //!
@@ -206,7 +207,8 @@ pub fn union_of(class: Class) -> Option<Union> {
     match class {
         Class::Config(_) => Some(config::union),
         Class::Opaque => Some(opaque),
-        // The #294 lane's JSONL union and the #278 lane's row union.
+        // The #294 lane's JSONL union; a store takes the row union
+        // (`sqlite_union::union_routed`), never a file union.
         Class::AppendLog | Class::Sqlite => None,
     }
 }
