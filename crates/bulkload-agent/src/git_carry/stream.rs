@@ -381,6 +381,73 @@ fn named(repo: &Path) -> Result<Named> {
     Ok((object_format, refs, worktrees, named))
 }
 
+/// What a consolidation needs of the source's history beside its objects
+/// (B2): the stash, newest first, each entry's commit and message; every
+/// reflog, by ref, as its file's lines; and the root commits, so a
+/// destination can tell a related repository from an unrelated one.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct History {
+    pub stash: Vec<(String, String)>,
+    pub reflogs: Vec<(String, Vec<u8>)>,
+    pub roots: Vec<String>,
+}
+
+/// Read `repo`'s [`History`]. Reads only.
+///
+/// # Errors
+/// Git children's refusals; IO.
+pub fn history(repo: &Path) -> Result<History> {
+    let common = super::common_repository(repo)?;
+    let mut reflogs = Vec::new();
+    let logs = common.join("logs");
+    let mut pending = vec![logs.clone()];
+    while let Some(dir) = pending.pop() {
+        let read = match fs::read_dir(&dir) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(crate::refuse::io(&error, SITE)),
+        };
+        for entry in read {
+            let path = entry.refuse_at(SITE)?.path();
+            let meta = fs::symlink_metadata(&path).refuse_at(SITE)?;
+            if meta.is_dir() {
+                pending.push(path);
+            } else if meta.is_file() {
+                let name = path
+                    .strip_prefix(&logs)
+                    .map_err(|_| BulkloadRefusal::PathEscapesRoot)?
+                    .to_string_lossy()
+                    .into_owned();
+                reflogs.push((name, fs::read(&path).refuse_at(SITE)?));
+            }
+        }
+    }
+    reflogs.sort();
+    let mut stash = Vec::new();
+    if let Some((_, lines)) = reflogs.iter().find(|(name, _)| name == "refs/stash") {
+        for line in String::from_utf8_lossy(lines).lines().rev() {
+            let mut words = line.splitn(3, ' ');
+            let (_, Some(new)) = (words.next(), words.next()) else {
+                continue;
+            };
+            let message = line.split_once('\t').map_or("", |(_, message)| message);
+            if oid(new) {
+                stash.push((new.to_owned(), message.to_owned()));
+            }
+        }
+    }
+    let roots = text(git(repo).args(["rev-list", "--max-parents=0", "--all"]))?
+        .lines()
+        .filter(|line| oid(line))
+        .map(str::to_owned)
+        .collect();
+    Ok(History {
+        stash,
+        reflogs,
+        roots,
+    })
+}
+
 /// The source end of a fetch: `git upload-pack` of `repo`, its stdin and
 /// stdout this process's, until the destination is done. Read-only on the
 /// source: no ref, lock, reflog or configuration write.

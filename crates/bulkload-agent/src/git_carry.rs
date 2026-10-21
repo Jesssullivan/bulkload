@@ -67,6 +67,7 @@ pub mod shared;
 )]
 mod source_inert_tests;
 pub mod stream;
+pub mod union;
 
 /// The one Git hardening table (WP1 PR 1, S2; OI-1003-Q16). Every Git child
 /// the v1 carry and the estimate spawn is built from it by [`git`], and the
@@ -277,6 +278,12 @@ fn writing_privately<'a>(command: &'a mut Command, private: &Path) -> &'a mut Co
 // `objects`, a live destination store (the streamed capture, B1).
 fn into_store(command: &mut Command, objects: &Path) {
     command.env("GIT_OBJECT_DIRECTORY", objects);
+}
+
+// Point `command` at the index file `index` (B2: an index's entries read
+// apart from the one its worktree uses).
+fn with_index(command: &mut Command, index: &Path) {
+    command.env("GIT_INDEX_FILE", index);
 }
 
 /// Whether the repository at `repo` is a partial clone.
@@ -844,6 +851,16 @@ fn canonical_tail(tail: &str) -> bool {
     let snapshot = parts.next().unwrap_or_default();
     let suffix = parts.next().unwrap_or_default();
     source_slug(source) && snapshot.len() == 64 && oid(snapshot) && !suffix.is_empty()
+}
+
+/// `git rev-parse --git-path NAME` of `repo`, absolute: where its
+/// administration keeps `NAME` (a linked worktree's index lives in the
+/// main's administration).
+///
+/// # Errors
+/// Git's refusal.
+pub fn git_path(repo: &Path, name: &str) -> Result<String> {
+    text(git(repo).args(["rev-parse", "--path-format=absolute", "--git-path", name]))
 }
 
 /// Canonical common repository used to serialize applies sharing Git storage.

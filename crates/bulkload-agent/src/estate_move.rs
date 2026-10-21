@@ -905,9 +905,25 @@ fn move_pass(run: &Move) -> Result<()> {
         );
         run.transfer_into(from, to, &name)
     };
+    let scratch = run.state.join("scratch");
+    let consolidation = || -> Result<bulkload_agent::transfer::Consolidation> {
+        let text = |path: &Path| path.to_string_lossy().into_owned();
+        Ok(bulkload_agent::transfer::Consolidation {
+            maps: bulkload_agent::consolidate::Maps::new(
+                run.maps
+                    .iter()
+                    .map(|(from, to)| (text(from), text(to)))
+                    .collect(),
+            ),
+            ledger: run.state.join("consolidate"),
+            plan_only: false,
+        })
+    };
     let reach = estate::streamed::Reach {
         upload_pack: upload_pack.as_deref().unwrap_or_default(),
         transfer: &transfer,
+        scratch: &scratch,
+        consolidation: &consolidation,
     };
     let mut landed = Vec::new();
     let mut first_refusal: Option<BulkloadRefusal> = None;
@@ -929,14 +945,20 @@ fn move_pass(run: &Move) -> Result<()> {
             moving::presence(place),
             moving::Presence::Absent | moving::Presence::Empty
         );
-        if !(clear || ours) {
+        // A related repository of the destination's own: consolidated (B2).
+        let related = !clear
+            && !ours
+            && matches!(moving::presence(place), moving::Presence::Git)
+            && bulkload_agent::git_carry::union::related(place, &snapshot.history.roots)
+                .unwrap_or(false);
+        if !(clear || ours || related) {
             let refusal = BulkloadRefusal::GitDestinationOccupied;
             estate::streamed::record_outcome(
                 &private,
                 &row.item,
                 "refused",
                 Some(&refusal),
-                Some("held: the live path holds another version (consolidate, B2)".to_owned()),
+                Some("held: the live path holds another, unrelated repository or tree".to_owned()),
             )?;
             out(&format!(
                 "estate-move item={} outcome=held code={} live={place:?}",
@@ -946,7 +968,7 @@ fn move_pass(run: &Move) -> Result<()> {
             first_refusal.get_or_insert(refusal);
             continue;
         }
-        landing.push((row, snapshot));
+        landing.push((row, snapshot, related));
     }
     // The objects first, every item's fetch in parallel (`--jobs`), each
     // timed for the race against rclone.
@@ -959,7 +981,7 @@ fn move_pass(run: &Move) -> Result<()> {
             use rayon::prelude::*;
             landing
                 .par_iter()
-                .map(|(_, snapshot)| {
+                .map(|(_, snapshot, _)| {
                     let started = std::time::Instant::now();
                     let fetched = upload_pack
                         .as_ref()
@@ -971,10 +993,88 @@ fn move_pass(run: &Move) -> Result<()> {
                 })
                 .collect()
         });
-    // Then each item's seats, host-path files and proof, mains first.
-    for ((row, snapshot), (fetched, fetch_ms)) in landing.iter().zip(fetched) {
+    // Then each item's seats, host-path files and proof, mains first; a
+    // related repository of the destination's own is consolidated.
+    for ((row, snapshot, related), (fetched, fetch_ms)) in landing.iter().zip(fetched) {
         let place = row.item.workspace.as_ref().unwrap_or(&row.item.repository);
         let started = std::time::Instant::now();
+        if *related {
+            let converged = fetched.and_then(|fetched| {
+                estate::streamed::converge(snapshot, &reach, fetched, &run.source)
+            });
+            match converged {
+                Ok(done) => {
+                    for (name, action) in &done.refs {
+                        if let bulkload_agent::git_carry::union::RefAction::Tracked(at) = action {
+                            out(&format!(
+                                "estate-move item={} ref={name} union=tracked at={at}",
+                                row.id
+                            ))?;
+                        }
+                    }
+                    let count = |word: &str| {
+                        done.refs
+                            .iter()
+                            .filter(|(_, action)| action.word() == word)
+                            .count()
+                    };
+                    let (outcome, refusal) = if done.seats_held {
+                        (
+                            "refused",
+                            Some(BulkloadRefusal::HomesConsolidateUnsupported),
+                        )
+                    } else {
+                        estate::streamed::journal(&private, snapshot, &run.source)?;
+                        ("workspace-restored", None)
+                    };
+                    estate::streamed::record_outcome(
+                        &private,
+                        &row.item,
+                        outcome,
+                        refusal.as_ref(),
+                        done.seats_held
+                            .then(|| "consolidated; differing seats held typed".to_owned()),
+                    )?;
+                    if let Some(refusal) = refusal {
+                        first_refusal.get_or_insert(refusal);
+                    }
+                    out(&format!(
+                        "estate-move item={} outcome={} union=consolidated refs_created={} refs_forwarded={} refs_switched={} refs_tracked={} refs_kept={} stash_added={} reflog_added={} seats_held={} object_bytes={} fetch_ms={fetch_ms} land_ms={} live={place:?}",
+                        row.id,
+                        if done.seats_held { "held" } else { outcome },
+                        count("created"),
+                        count("forwarded"),
+                        count("switched"),
+                        count("tracked"),
+                        count("kept"),
+                        done.stash_added,
+                        done.reflog_added,
+                        done.seats_held,
+                        done.object_bytes,
+                        started.elapsed().as_millis(),
+                    ))?;
+                    if !done.seats_held {
+                        landed.push(row.id.clone());
+                    }
+                }
+                Err(refusal) => {
+                    estate::streamed::record_outcome(
+                        &private,
+                        &row.item,
+                        "refused",
+                        Some(&refusal),
+                        None,
+                    )?;
+                    out(&format!(
+                        "estate-move item={} outcome=refused code={} live={place:?}",
+                        row.id,
+                        refusal.code()
+                    ))?;
+                    first_refusal.get_or_insert(refusal);
+                }
+            }
+            continue;
+        }
         let landing = fetched
             .and_then(|fetched| estate::streamed::land(snapshot, &private, &map, &reach, fetched));
         match landing {
@@ -987,7 +1087,7 @@ fn move_pass(run: &Move) -> Result<()> {
                 };
                 estate::streamed::record_outcome(&private, &row.item, outcome, None, None)?;
                 out(&format!(
-                    "estate-move item={} outcome={outcome} object_batches={} object_batches_skipped={} object_bytes={} fetch_ms={fetch_ms} topped_up={} missing_at_source={} unreachable_not_carried={} land_ms={} live={place:?}",
+                    "estate-move item={} outcome={outcome} object_batches={} object_batches_skipped={} object_bytes={} fetch_ms={fetch_ms} topped_up={} missing_at_source={} unreachable_not_carried={} index={} land_ms={} live={place:?}",
                     row.id,
                     done.batches,
                     done.skipped,
@@ -995,6 +1095,7 @@ fn move_pass(run: &Move) -> Result<()> {
                     done.topped_up,
                     done.missing_at_source,
                     snapshot.snapshot.unreachable,
+                    done.index,
                     started.elapsed().as_millis(),
                 ))?;
                 landed.push(row.id.clone());
