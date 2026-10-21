@@ -270,12 +270,18 @@ fn out(repo: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&ran.stdout).into_owned()
 }
 
-// The receipt line of `item` on the destination half's stdout.
+// The receipt line of `item` on the destination half's stdout (receipts
+// print paths escaped and quoted).
+#[allow(clippy::unnecessary_debug_formatting)]
 fn item_line<'a>(stdout: &'a str, path: &Path) -> &'a str {
     let live = format!("live={path:?}");
     stdout
         .lines()
-        .find(|line| line.starts_with("estate-move item=") && line.ends_with(&live) && line.contains(" outcome="))
+        .find(|line| {
+            line.starts_with("estate-move item=")
+                && line.ends_with(&live)
+                && line.contains(" outcome=")
+        })
         .unwrap_or_else(|| panic!("no receipt for {live}:\n{stdout}"))
 }
 
@@ -307,8 +313,14 @@ fn a_streamed_pass_lands_every_absent_item_with_no_payload_anywhere() {
     holds_no_payload(&world.source_state(), 3);
     let moved = world.moved();
     let both = format!("{}\n{}", moved.stdout, moved.stderr);
-    assert!(moved.stdout.contains("estate-move phase=pull outcome=ok"), "{both}");
-    assert!(moved.stdout.contains("estate-move phase=apply outcome=ok"), "{both}");
+    assert!(
+        moved.stdout.contains("estate-move phase=pull outcome=ok"),
+        "{both}"
+    );
+    assert!(
+        moved.stdout.contains("estate-move phase=apply outcome=ok"),
+        "{both}"
+    );
     let (src, dst) = (world.src(), world.dst());
     for name in ["land", "land-wt", "other"] {
         assert!(
@@ -319,11 +331,20 @@ fn a_streamed_pass_lands_every_absent_item_with_no_payload_anywhere() {
     // History, refs and stash exactly as on the source; no custody refs.
     for name in ["land", "other"] {
         assert_eq!(
-            out(&dst.join(name), &["for-each-ref", "--format=%(objectname) %(refname)"]),
-            out(&src.join(name), &["for-each-ref", "--format=%(objectname) %(refname)"]),
+            out(
+                &dst.join(name),
+                &["for-each-ref", "--format=%(objectname) %(refname)"]
+            ),
+            out(
+                &src.join(name),
+                &["for-each-ref", "--format=%(objectname) %(refname)"]
+            ),
             "{name}: {both}"
         );
-        out(&dst.join(name), &["fsck", "--connectivity-only", "--no-dangling"]);
+        out(
+            &dst.join(name),
+            &["fsck", "--connectivity-only", "--no-dangling"],
+        );
     }
     assert_eq!(
         out(&dst.join("land"), &["stash", "list"]),
@@ -348,10 +369,17 @@ fn a_streamed_pass_lands_every_absent_item_with_no_payload_anywhere() {
         "wt"
     );
     let listed = out(&dst.join("land"), &["worktree", "list", "--porcelain"]);
-    assert!(listed.contains(&format!("worktree {}", dst.join("land-wt").display())), "{listed}");
+    assert!(
+        listed.contains(&format!("worktree {}", dst.join("land-wt").display())),
+        "{listed}"
+    );
     assert!(!listed.contains("prunable"), "{listed}");
     // Neither state holds payload; the closure line says so.
-    assert_eq!(state_line(&moved.stdout, "estate-move")["state_payload_bytes"], "0", "{both}");
+    assert_eq!(
+        state_line(&moved.stdout, "estate-move")["state_payload_bytes"],
+        "0",
+        "{both}"
+    );
     assert_eq!(closure(&moved.stdout)["unaccounted"], "0", "{both}");
     holds_no_payload(&world.state(), 3);
     holds_no_payload(&world.source_state(), 3);

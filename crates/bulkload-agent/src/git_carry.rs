@@ -58,7 +58,6 @@ mod refs_scale_tests;
 pub mod registered;
 mod shallow;
 pub mod shared;
-pub mod stream;
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -67,6 +66,7 @@ pub mod stream;
     clippy::unwrap_used
 )]
 mod source_inert_tests;
+pub mod stream;
 
 /// The one Git hardening table (WP1 PR 1, S2; OI-1003-Q16). Every Git child
 /// the v1 carry and the estimate spawn is built from it by [`git`], and the

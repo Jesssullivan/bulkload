@@ -463,6 +463,28 @@ pub fn record_outcome(
     )
 }
 
+/// Write a bare repository's administration at `path` by hand: a HEAD,
+/// its configuration (`object_format`) and empty ref and object
+/// directories. A streamed fetch runs in it, its objects written into a
+/// live store, never here.
+///
+/// # Errors
+/// IO; `GIT_INVENTORY_MALFORMED` for an object format that is not a word.
+pub(crate) fn bare_layout(path: &Path, object_format: &str) -> Result<()> {
+    for dir in ["refs/heads", "refs/tags", "objects/info", "objects/pack"] {
+        fs::create_dir_all(path.join(dir)).refuse_at(SITE)?;
+    }
+    fs::write(path.join("HEAD"), b"ref: refs/heads/main\n").refuse_at(SITE)?;
+    let config = match object_format {
+        "sha1" => "[core]\n\trepositoryformatversion = 0\n\tbare = true\n".to_owned(),
+        format if format.bytes().all(|byte| byte.is_ascii_alphanumeric()) => format!(
+            "[core]\n\trepositoryformatversion = 1\n\tbare = true\n[extensions]\n\tobjectformat = {format}\n"
+        ),
+        _ => return Err(BulkloadRefusal::GitInventoryMalformed),
+    };
+    fs::write(path.join(CONFIG), config).refuse_at(SITE)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {

@@ -462,21 +462,7 @@ fn scratch(object_format: &str) -> Result<Scratch> {
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let made = Scratch(path.clone());
-    // A bare repository's administration, written whole: a HEAD, its
-    // configuration and empty ref and object directories. Its objects are
-    // never written here (see `into_store`).
-    for dir in ["refs/heads", "refs/tags", "objects/info", "objects/pack"] {
-        fs::create_dir_all(path.join(dir)).refuse_at(SITE)?;
-    }
-    fs::write(path.join("HEAD"), b"ref: refs/heads/main\n").refuse_at(SITE)?;
-    let config = match object_format {
-        "sha1" => "[core]\n\trepositoryformatversion = 0\n\tbare = true\n".to_owned(),
-        format if format.bytes().all(|byte| byte.is_ascii_alphanumeric()) => format!(
-            "[core]\n\trepositoryformatversion = 1\n\tbare = true\n[extensions]\n\tobjectformat = {format}\n"
-        ),
-        _ => return Err(BulkloadRefusal::GitInventoryMalformed),
-    };
-    fs::write(path.join("config"), config).refuse_at(SITE)?;
+    crate::estate::streamed::bare_layout(&path, object_format)?;
     Ok(made)
 }
 

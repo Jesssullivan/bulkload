@@ -3196,7 +3196,12 @@ pub fn ledger_with(
         let journal = if let Some(snapshot) = &streamed {
             unknown_because = None;
             let digest = snapshot.digest();
-            capture = Some(blake3::Hash::from_bytes(digest).to_hex().as_str().to_owned());
+            capture = Some(
+                blake3::Hash::from_bytes(digest)
+                    .to_hex()
+                    .as_str()
+                    .to_owned(),
+            );
             let expected = journal_path(Path::new(""), &identity, source, &digest);
             let name = expected.to_string_lossy().into_owned();
             let found = states
