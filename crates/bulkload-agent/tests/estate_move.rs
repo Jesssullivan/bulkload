@@ -458,7 +458,16 @@ fn a_live_path_holding_another_version_is_held_and_untouched() {
     let before = tree(&mine);
     let head = out(&mine, &["rev-parse", "HEAD"]);
     assert!(world.source().ok);
+    // A fetch scratch a crashed pass left is swept at startup.
+    let left = world.state().join("scratch/bulkload-fetch-1-0");
+    fs::create_dir_all(&left).unwrap();
+    fs::write(left.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+    for dir in [world.state(), world.state().join("scratch")] {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let moved = world.moved();
+    assert!(moved.stdout.contains("estate-move swept="), "{}", moved.stdout);
+    assert!(!left.exists());
     let both = format!("{}\n{}", moved.stdout, moved.stderr);
     let line = item_line(&moved.stdout, &mine);
     assert!(

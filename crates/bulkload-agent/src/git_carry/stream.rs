@@ -480,9 +480,28 @@ impl Drop for Scratch {
     }
 }
 
+/// Where a fetch's scratch repositories are made ([`set_scratch_root`]).
+static SCRATCH_ROOT: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Make every fetch's scratch repository under `root` (a move's own
+/// `MOVE_STATE/scratch`, swept at its startup and counted by its state
+/// guard, so one a crash left shows as payload); `None`: the temporary
+/// directory.
+pub fn set_scratch_root(root: Option<PathBuf>) {
+    *SCRATCH_ROOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = root;
+}
+
 fn scratch(object_format: &str) -> Result<Scratch> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!(
+    let root = SCRATCH_ROOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .unwrap_or_else(std::env::temp_dir);
+    fs::create_dir_all(&root).refuse_at(SITE)?;
+    let path = root.join(format!(
         "bulkload-fetch-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)

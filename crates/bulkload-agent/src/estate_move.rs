@@ -787,6 +787,16 @@ fn move_command(args: &[OsString]) -> Result<()> {
 fn move_pass(run: &Move) -> Result<()> {
     moving::private_dir(&run.state)?;
     let _lock = moving::lock(&run.state)?;
+    // The streamed fetches' scratch repositories: under this state, swept
+    // here (one a crash left), and counted by the state guard if a pass
+    // leaves one.
+    let scratch = run.state.join("scratch");
+    match std::fs::remove_dir_all(&scratch) {
+        Ok(()) => out(&format!("estate-move swept={scratch:?}"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).refuse_at("estate_move::scratch"),
+    }
+    bulkload_agent::git_carry::stream::set_scratch_root(Some(scratch));
     let ledger_path = moving::ledger_path(&run.state);
     let mut ledger = moving::Ledger::open(
         &ledger_path,
