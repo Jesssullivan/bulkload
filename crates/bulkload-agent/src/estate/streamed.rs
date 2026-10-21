@@ -59,6 +59,11 @@ pub struct ItemSnapshot {
     pub host_files: Vec<(Vec<u8>, Vec<u8>)>,
     /// When the pass that read it started (Unix nanoseconds).
     pub started_ns: i128,
+    /// The stash, reflogs and roots a consolidation unions (B2).
+    pub history: stream::History,
+    /// The item's index, as read: written at its live index by a landing
+    /// and compared by entries on later passes (never by the engine).
+    pub index: Option<Vec<u8>>,
 }
 
 impl ItemSnapshot {
@@ -169,12 +174,40 @@ pub fn capture_source(
     }
     excluded.sort();
     excluded.dedup();
+    // The item's own index (a linked worktree's lives in the main's
+    // administration): carried and settled apart from the seats.
+    let index_path = PathBuf::from(crate::git_carry::git_path(source, "index")?);
+    let index = match fs::read(&index_path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(crate::refuse::io(&error, SITE)),
+    };
+    // Every index under this item's administration is settled by its own
+    // item: the main's `index` and each linked worktree's.
+    if let Some(admin) = &admin {
+        excluded.push(rel_bytes(&admin.join("index")));
+        if let Ok(read) = fs::read_dir(common.join("worktrees")) {
+            for entry in read {
+                let entry = entry.refuse_at(SITE)?;
+                excluded.push(rel_bytes(
+                    &admin
+                        .join("worktrees")
+                        .join(entry.file_name())
+                        .join("index"),
+                ));
+            }
+        }
+        excluded.sort();
+        excluded.dedup();
+    }
     Ok(ItemSnapshot {
         item: item.clone(),
         snapshot,
         excluded,
         host_files,
         started_ns,
+        history: stream::history(source)?,
+        index,
     })
 }
 
@@ -264,6 +297,8 @@ pub struct Landed {
     pub topped_up: u64,
     /// Ids the snapshot named that the source no longer held.
     pub missing_at_source: u64,
+    /// What the index settle did.
+    pub index: &'static str,
 }
 
 /// How a landing reaches the source: its repository URL for `git fetch`
@@ -273,6 +308,12 @@ pub struct Reach<'a> {
     pub upload_pack: &'a str,
     /// One recorded seat transfer of `from` (a source path) into `to`.
     pub transfer: &'a dyn Fn(&Path, &Path) -> Result<()>,
+    /// Transient work files (an index read apart): the move's swept
+    /// scratch directory.
+    pub scratch: &'a Path,
+    /// The consolidation a seat transfer into a live worktree that already
+    /// holds its own files runs with (#297's unions).
+    pub consolidation: &'a dyn Fn() -> Result<crate::transfer::Consolidation>,
 }
 
 /// Land `snapshot`'s item at its live path, absent or a landing of this
@@ -333,6 +374,10 @@ pub fn land(
                 write_bytes(&path, &want)?;
             }
         }
+    }
+    // The index, settled by its entries (SPEC rule 8).
+    if item.workspace.is_some() {
+        landed.index = settle_index(snapshot, &live, state, reach.scratch)?;
     }
     // 4. What the landed administration names and the store lacks.
     if owns_store || item.workspace.is_some() {
@@ -413,6 +458,162 @@ pub fn fetch_objects(
         &snapshot.snapshot,
         &marks_path(state, &id(item)?),
     )
+}
+
+/// What a consolidation of a related live repository did ([`converge`]).
+#[derive(Debug, Default, Clone)]
+pub struct Converged {
+    /// Object batches fetched, skipped, and bytes the store grew by.
+    pub batches: u64,
+    pub skipped: u64,
+    pub object_bytes: u64,
+    /// Each source ref and what the union did to it.
+    pub refs: Vec<(String, crate::git_carry::union::RefAction)>,
+    /// Stash and reflog entries added.
+    pub stash_added: u64,
+    pub reflog_added: u64,
+    /// The seat transfer held paths it could not union (typed in its
+    /// record): the item is not consolidated whole.
+    pub seats_held: bool,
+}
+
+/// Consolidate `snapshot`'s item into a related repository at its live path.
+///
+/// The live path holds a repository of the destination's own (B2): the refs, stash and reflogs
+/// unioned ([`crate::git_carry::union`]), then the worktree's seats through
+/// the engine with #297's unions (equal adopted, new created, a differing
+/// file held typed), the destination's administration and index its own.
+/// `source` labels the source's remote-tracking refs.
+///
+/// # Errors
+/// The union's and the transfer's refusals; `CAPTURE_DRIFTED` when the
+/// repository still names a missing object; `STATE_PAYLOAD_LEFT` for a
+/// quarantine left.
+pub fn converge(
+    snapshot: &ItemSnapshot,
+    reach: &Reach<'_>,
+    fetched: stream::Fetched,
+    source: &str,
+) -> Result<Converged> {
+    use crate::git_carry::union;
+    let item = &snapshot.item;
+    let live = item
+        .workspace
+        .clone()
+        .unwrap_or_else(|| item.repository.clone());
+    let mut done = Converged {
+        batches: fetched.batches,
+        skipped: fetched.skipped,
+        object_bytes: fetched.bytes,
+        ..Converged::default()
+    };
+    let owns_store = store_of(snapshot, &live).is_some();
+    if owns_store {
+        done.refs = union::refs(&live, &snapshot.snapshot.refs, source)?;
+        done.stash_added = union::stash(&live, &snapshot.history.stash)?;
+        done.reflog_added = union::reflogs(&live, &snapshot.history.reflogs, &done.refs)?;
+    }
+    if item.workspace.is_some() {
+        // The destination's administration is its own: nothing of the
+        // source's `.git` lands here.
+        let mut excluded = snapshot.excluded.clone();
+        excluded.push(b".git".to_vec());
+        let root = fs::canonicalize(&live).refuse_at(SITE)?;
+        crate::transfer::set_excluded(&root, Some(excluded));
+        crate::transfer::set_consolidate_for(&root, Some(Some((reach.consolidation)()?)));
+        let moved = (reach.transfer)(&item.source, &live);
+        crate::transfer::set_consolidate_for(&root, None);
+        crate::transfer::set_excluded(&root, None);
+        match moved {
+            Ok(()) => {}
+            Err(BulkloadRefusal::ItemsRefused) => done.seats_held = true,
+            Err(refusal) => return Err(refusal),
+        }
+    }
+    if !stream::lacking(&live)?.is_empty() {
+        return Err(BulkloadRefusal::CaptureDrifted);
+    }
+    let objects = stream::objects_dir(&live)?;
+    if let Some(left) = stream::quarantine_left(&objects)?.first() {
+        return Err(BulkloadRefusal::StatePayloadLeft(rel_bytes(left)));
+    }
+    Ok(done)
+}
+
+/// `private/ITEM.converged`: the item's live path holds the destination's
+/// own repository, consolidated (never replaced) on every pass.
+#[must_use]
+pub fn converged_path(state: &Path, identity: &str) -> PathBuf {
+    state.join(format!("{identity}.converged"))
+}
+
+/// Record that the item is consolidated into the destination's own
+/// repository.
+///
+/// # Errors
+/// IO.
+pub fn mark_converged(state: &Path, identity: &str) -> Result<()> {
+    let path = converged_path(state, identity);
+    if path.is_file() {
+        return Ok(());
+    }
+    write_bytes(&path, b"consolidated\n")
+}
+
+/// `private/ITEM.index`: the entries digest of the index a landing last
+/// wrote at the item's live index.
+fn index_mark(state: &Path, identity: &str) -> PathBuf {
+    state.join(format!("{identity}.index"))
+}
+
+/// Settle the item's live index from the source's (SPEC rule 8: compared
+/// by entries, never by stat data or extensions, so a destination `git
+/// status` that refreshed it is no change).
+///
+/// - No live index: the source's is written.
+/// - The live index holds the entries a landing last wrote, or the
+///   source's own: the source's is written when its entries differ.
+/// - The live index holds entries of the destination's own staging: kept,
+///   and the settle says `held`.
+///
+/// # Errors
+/// IO; a Git child's refusal.
+pub fn settle_index(
+    snapshot: &ItemSnapshot,
+    live: &Path,
+    state: &Path,
+    scratch: &Path,
+) -> Result<&'static str> {
+    let Some(bytes) = &snapshot.index else {
+        return Ok("none");
+    };
+    let identity = id(&snapshot.item)?;
+    let index = PathBuf::from(crate::git_carry::git_path(live, "index")?);
+    fs::create_dir_all(scratch).refuse_at(SITE)?;
+    let apart = scratch.join(format!("index-{identity}"));
+    fs::write(&apart, bytes).refuse_at(SITE)?;
+    let source = crate::git_carry::union::index_entries(live, &apart);
+    let _ = fs::remove_file(&apart);
+    let source = source?;
+    let mark = index_mark(state, &identity);
+    let write = |what: &'static str| -> Result<&'static str> {
+        write_bytes(&index, bytes)?;
+        write_bytes(&mark, &source)?;
+        Ok(what)
+    };
+    if !index.try_exists().refuse_at(SITE)? {
+        return write("written");
+    }
+    let held = crate::git_carry::union::index_entries(live, &index)?;
+    if held == source {
+        write_bytes(&mark, &source)?;
+        return Ok("same");
+    }
+    let last = fs::read(&mark).ok();
+    if last.as_deref() == Some(held.as_slice()) {
+        return write("updated");
+    }
+    Ok("held")
 }
 
 /// The journal a finished landing writes (the closure ledger's

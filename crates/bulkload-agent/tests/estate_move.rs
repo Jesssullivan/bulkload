@@ -405,6 +405,9 @@ fn a_streamed_pass_lands_every_absent_item_with_no_payload_anywhere() {
     assert_eq!(closure(&moved.stdout)["unaccounted"], "0", "{both}");
     holds_no_payload(&world.state(), 3);
     holds_no_payload(&world.source_state(), 3);
+    // SPEC rule 8: a `git status` on the destination refreshes the landed
+    // index's stat data; that is no change, and the rerun converges.
+    git(&dst.join("land"), &["status", "--porcelain"]);
     // A rerun of both halves over an unchanged source fetches nothing and
     // changes no ref.
     let refs = out(&dst.join("land"), &["for-each-ref"]);
@@ -414,9 +417,127 @@ fn a_streamed_pass_lands_every_absent_item_with_no_payload_anywhere() {
     for name in ["land", "other"] {
         let line = item_line(&again.stdout, &dst.join(name));
         assert!(line.contains("object_batches=0 "), "{line}\n{both}");
+        assert!(
+            line.contains("outcome=workspace-restored"),
+            "{line}\n{both}"
+        );
+        assert!(line.contains(" index=same "), "{line}\n{both}");
     }
     assert_eq!(out(&dst.join("land"), &["for-each-ref"]), refs);
     holds_no_payload(&world.state(), 3);
+}
+
+/// B2: a live path holding a related repository of the destination's own
+/// is consolidated, never replaced and never landed beside. Refs union by
+/// name: a branch only the source has is created; a checked-out branch the
+/// destination holds behind the source's, its tree clean, is advanced with
+/// its checkout ("switch when clean"); a branch both sides moved keeps the
+/// destination's tip and takes the source's as `refs/remotes/neo/NAME`,
+/// listed. The source's stash joins the destination's. The worktree's new
+/// seats are created and the destination's own files kept; a seat both
+/// sides hold differently is held typed, nothing written to it.
+#[test]
+fn a_related_live_repository_is_consolidated_and_refs_union_by_name() {
+    let world = World::new("union");
+    let (src, dst) = (world.src(), world.dst());
+    let source = src.join("same");
+    repo(&source, "s.txt");
+    git(&source, &["branch", "topic"]);
+    git(
+        &dst,
+        &[
+            "clone",
+            "--quiet",
+            "--template=",
+            source.to_str().unwrap(),
+            "same",
+        ],
+    );
+    let live = dst.join("same");
+    git(&live, &["remote", "remove", "origin"]);
+    git(&live, &["branch", "topic", "refs/heads/main"]);
+    // The destination moves topic on its own, and has a file of its own.
+    git(&live, &["checkout", "--quiet", "topic"]);
+    git(
+        &live,
+        &["commit", "--quiet", "--allow-empty", "-m", "dest topic"],
+    );
+    git(&live, &["checkout", "--quiet", "main"]);
+    fs::write(live.join("dest-only.txt"), b"sting's\n").unwrap();
+    let dest_topic = out(&live, &["rev-parse", "topic"]);
+    // The source moves main ahead, topic its own way, adds a branch, a
+    // stash and an untracked file.
+    fs::write(source.join("s.txt"), "s, second\n").unwrap();
+    git(&source, &["commit", "--quiet", "-am", "src main"]);
+    git(&source, &["checkout", "--quiet", "topic"]);
+    git(
+        &source,
+        &["commit", "--quiet", "--allow-empty", "-m", "src topic"],
+    );
+    git(&source, &["checkout", "--quiet", "main"]);
+    git(&source, &["branch", "fresh"]);
+    fs::write(source.join("s.txt"), "s, stashed\n").unwrap();
+    git(
+        &source,
+        &["stash", "push", "--quiet", "-m", "parked on neo"],
+    );
+    fs::write(source.join("new.txt"), b"untracked on neo\n").unwrap();
+    let src_main = out(&source, &["rev-parse", "main"]);
+    let src_topic = out(&source, &["rev-parse", "topic"]);
+    assert!(world.source().ok);
+    let moved = world.moved();
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    let receipt = item_line(&moved.stdout, &live);
+    assert!(receipt.contains("union=consolidated"), "{receipt}\n{both}");
+    assert!(
+        receipt.contains("outcome=workspace-restored"),
+        "{receipt}\n{both}"
+    );
+    assert!(receipt.contains("refs_created=1 "), "{receipt}\n{both}");
+    assert!(receipt.contains("refs_switched=1 "), "{receipt}\n{both}");
+    assert!(receipt.contains("refs_tracked=1 "), "{receipt}\n{both}");
+    assert!(receipt.contains("stash_added=1 "), "{receipt}\n{both}");
+    assert!(
+        moved
+            .stdout
+            .contains("ref=refs/heads/topic union=tracked at=refs/remotes/neo/topic"),
+        "{both}"
+    );
+    assert_eq!(out(&live, &["rev-parse", "main"]), src_main, "switched");
+    assert_eq!(fs::read(live.join("s.txt")).unwrap(), b"s, second\n");
+    assert_eq!(out(&live, &["rev-parse", "topic"]), dest_topic, "kept");
+    assert_eq!(
+        out(&live, &["rev-parse", "refs/remotes/neo/topic"]),
+        src_topic
+    );
+    assert_eq!(
+        out(&live, &["rev-parse", "fresh"]),
+        out(&source, &["rev-parse", "fresh"])
+    );
+    assert!(
+        out(&live, &["stash", "list"]).contains("parked on neo"),
+        "{both}"
+    );
+    assert_eq!(
+        fs::read(live.join("new.txt")).unwrap(),
+        b"untracked on neo\n"
+    );
+    assert_eq!(fs::read(live.join("dest-only.txt")).unwrap(), b"sting's\n");
+    out(&live, &["fsck", "--connectivity-only", "--no-dangling"]);
+    holds_no_payload(&world.state(), 1);
+    // A seat both sides hold differently is held typed, nothing written.
+    fs::write(source.join("new.txt"), b"neo changed it\n").unwrap();
+    fs::write(live.join("new.txt"), b"sting changed it\n").unwrap();
+    assert!(world.source().ok);
+    let again = world.moved();
+    let both = format!("{}\n{}", again.stdout, again.stderr);
+    let receipt = item_line(&again.stdout, &live);
+    assert!(receipt.contains("outcome=held"), "{receipt}\n{both}");
+    assert!(receipt.contains("seats_held=true"), "{receipt}\n{both}");
+    assert_eq!(
+        fs::read(live.join("new.txt")).unwrap(),
+        b"sting changed it\n"
+    );
 }
 
 /// A shallow source is a typed hold until it has a test: refused on the

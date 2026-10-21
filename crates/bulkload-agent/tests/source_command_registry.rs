@@ -522,9 +522,25 @@ const WRITERS: &[(&str, usize, &str)] = &[
     ),
     (
         "update-ref",
-        9,
+        10,
         "The capture's private repository, a chain's scratch repository, a \
-         bundle's envelope, and the destination of an import or restore.",
+         bundle's envelope, and the destination of an import or restore. Ten \
+         since the streamed capture's B2 (SPEC rule 2 reset): \
+         `union::refs` creates, fast-forwards or tracks a source ref in the \
+         live destination repository, compare-and-swap.",
+    ),
+    (
+        "merge",
+        1,
+        "`union::refs` (B2, \"switch when clean\"): `merge --ff-only` of a \
+         destination worktree whose checked-out branch the source holds \
+         ahead, its tree clean; the destination only.",
+    ),
+    (
+        "stash",
+        1,
+        "`union::stash` (B2): `stash store` of a source stash entry into \
+         the live destination repository's stash; the destination only.",
     ),
     (
         "worktree (writing form)",
