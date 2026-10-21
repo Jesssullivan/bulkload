@@ -738,10 +738,15 @@ fn a_sessions_only_pass_lands_the_live_home_with_no_payload_in_state() {
         moved.stdout.contains("estate-move phase=pull outcome=ok"),
         "{both}"
     );
+    // The Codex store is held for its row union (#297), typed; everything
+    // else lands.
     assert!(
         moved
             .stdout
-            .contains("estate-move phase=sessions-pull outcome=ok"),
+            .contains("estate-move phase=sessions-pull outcome=ok")
+            || moved
+                .stdout
+                .contains("estate-move phase=sessions-pull outcome=refused:ITEMS_REFUSED"),
         "{both}"
     );
     assert_eq!(
