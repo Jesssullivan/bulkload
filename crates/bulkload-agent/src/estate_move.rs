@@ -943,6 +943,8 @@ fn move_pass(run: &Move) -> Result<()> {
             ),
             ledger: run.state.join("consolidate"),
             plan_only: false,
+            // A worktree's seats: no transcript link to regularize.
+            archived: Vec::new(),
         })
     };
     let reach = estate::streamed::Reach {
