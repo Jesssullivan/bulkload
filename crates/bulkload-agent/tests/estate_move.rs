@@ -521,7 +521,7 @@ fn thread_cwds(path: &Path) -> Vec<(String, String)> {
 /// The homes pass under SPEC rule 2: `estate-move --sessions` over a source
 /// half that planned no Git item runs, landing `.claude` and `.codex` at
 /// the LIVE destination home (no landing area), with only the plan and
-/// marks pulled into MOVE_STATE and no payload in either state.
+/// marks pulled into `MOVE_STATE` and no payload in either state.
 #[test]
 fn a_sessions_only_pass_lands_the_live_home_with_no_payload_in_state() {
     let world = World::new("homes");
