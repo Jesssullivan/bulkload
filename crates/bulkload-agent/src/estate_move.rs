@@ -842,6 +842,7 @@ fn move_pass(run: &Move) -> Result<()> {
     // live source repository into the live store, its seats through the
     // engine into the live path. A live path holding anything else is held,
     // typed, for the consolidate path (B2): nothing is written there.
+    moving::private_dir(&private)?;
     let map = estate::streamed::path_map(&items);
     let upload_pack = upload_pack_program(run);
     let transfer = |from: &Path, to: &Path| -> Result<()> {
