@@ -159,6 +159,8 @@ const PRIVATE_SUFFIXES: &[&str] = &[
     ".refs-in",
     ".parents",
     ".exclude-union",
+    // The entries digest of the index a landing last wrote (rule 8).
+    ".index",
     ".done",
     ".carried",
     // A streamed fetch's resume marks (B1).
