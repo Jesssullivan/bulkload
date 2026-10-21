@@ -847,7 +847,7 @@ fn move_pass(run: &Move) -> Result<()> {
     let upload_pack = upload_pack_program(run);
     let transfer = |from: &Path, to: &Path| -> Result<()> {
         let name = format!("item-{}", blake3::hash(to.as_os_str().as_bytes()).to_hex());
-        run.transfer(from, to, &name)
+        run.transfer_into(from, to, &name)
     };
     let reach = estate::streamed::Reach {
         upload_pack: upload_pack.as_deref().unwrap_or_default(),

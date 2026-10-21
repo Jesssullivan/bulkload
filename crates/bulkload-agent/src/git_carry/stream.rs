@@ -358,7 +358,7 @@ fn named(repo: &Path) -> Result<Named> {
 /// `GIT_CHILD_FAILED` when `upload-pack` fails; IO.
 pub fn serve_upload_pack(repo: &Path) -> Result<()> {
     let status = git(repo)
-        .args(["-c", UPLOAD_PACK_CONFIG, "upload-pack", "--strict"])
+        .args(["-c", UPLOAD_PACK_CONFIG, "upload-pack"])
         .arg(repo)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
