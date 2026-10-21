@@ -389,13 +389,15 @@ pub fn refuse_retired(states: &[&Path], print: &mut dyn FnMut(&Path) -> Result<(
         for path in retired(state)? {
             if fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
                 match fs::remove_dir(&path) {
-                    Ok(()) => continue,
                     Err(error)
-                        if matches!(
+                        if !matches!(
                             error.raw_os_error(),
                             Some(libc::ENOTEMPTY | libc::EEXIST)
-                        ) => {}
-                    Err(error) => return Err(crate::refuse::io(&error, SITE)),
+                        ) =>
+                    {
+                        return Err(crate::refuse::io(&error, SITE));
+                    }
+                    _ => {}
                 }
             }
         }
