@@ -893,7 +893,12 @@ mod tests {
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .arg("-C")
             .arg(&repo)
-            .args(["fsck", "--unreachable", "--connectivity-only", "--no-progress"])
+            .args([
+                "fsck",
+                "--unreachable",
+                "--connectivity-only",
+                "--no-progress",
+            ])
             .output()
             .unwrap();
         assert!(!plain.status.success(), "the stale graph fails plain fsck");

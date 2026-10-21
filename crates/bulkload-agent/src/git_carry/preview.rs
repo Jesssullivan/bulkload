@@ -166,20 +166,18 @@ pub fn held(repo: &Path, ids: &[String]) -> Result<BTreeSet<String>> {
 // the commit-graph off when it fails otherwise (a stale graph).
 fn code(repo: &Path, args: &[&str]) -> Option<i32> {
     let ran = git(repo).args(args).output().ok()?;
-    match ran.status.code() {
-        Some(code @ (0 | 1)) => Some(code),
-        _ => {
-            let mut again = git(repo);
-            again.envs(super::git_env::GRAPH_OFF.iter().copied());
-            again
-                .args(args)
-                .output()
-                .ok()?
-                .status
-                .code()
-                .filter(|code| matches!(code, 0 | 1))
-        }
+    if let Some(code @ (0 | 1)) = ran.status.code() {
+        return Some(code);
     }
+    let mut again = git(repo);
+    again.envs(super::git_env::GRAPH_OFF.iter().copied());
+    again
+        .args(args)
+        .output()
+        .ok()?
+        .status
+        .code()
+        .filter(|code| matches!(code, 0 | 1))
 }
 
 /// Whether `ancestor` is an ancestor of `of` in `repo`; `None` when Git
@@ -609,7 +607,8 @@ pub fn frame<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 pub fn unframe<T: for<'de> Deserialize<'de>>(reader: &mut impl std::io::Read) -> Result<T> {
     let mut length = [0u8; 8];
     reader.read_exact(&mut length).refuse_at(SITE)?;
-    let length = usize::try_from(u64::from_le_bytes(length)).map_err(|_| BulkloadRefusal::FrameCodec)?;
+    let length =
+        usize::try_from(u64::from_le_bytes(length)).map_err(|_| BulkloadRefusal::FrameCodec)?;
     let mut body = vec![0u8; length];
     reader.read_exact(&mut body).refuse_at(SITE)?;
     postcard::from_bytes(&body).map_err(|_| BulkloadRefusal::FrameCodec)
@@ -623,7 +622,14 @@ mod tests {
     #[test]
     fn only_contained_paths_are_read() {
         assert!(contained(b"a/b"));
-        for path in [&b""[..], b"/etc/passwd", b"../x", b"a/../b", b"a//b", b"./a"] {
+        for path in [
+            &b""[..],
+            b"/etc/passwd",
+            b"../x",
+            b"a/../b",
+            b"a//b",
+            b"./a",
+        ] {
             assert!(!contained(path), "{path:?}");
         }
     }

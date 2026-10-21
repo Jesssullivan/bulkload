@@ -1081,11 +1081,15 @@ const READ_ONLY_SUBCOMMANDS: &[&str] = &[
 /// that did not already set configuration through the environment; whether
 /// it did.
 fn commit_graph_retry(command: &mut Command) -> bool {
-    let (count, _) = super::git_env::GRAPH_OFF[0];
+    let set = |name: &std::ffi::OsStr| {
+        super::git_env::GRAPH_OFF
+            .iter()
+            .any(|(key, _)| std::ffi::OsStr::new(key) == name)
+    };
     if command.get_program() != "git"
         || command
             .get_envs()
-            .any(|(key, value)| key == count && value.is_some())
+            .any(|(key, value)| set(key) && value.is_some())
     {
         return false;
     }
