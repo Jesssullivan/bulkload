@@ -7,8 +7,11 @@
 //! - An append log is extended (a live prefix), covered (the live file holds
 //!   the source's bytes), or consolidated by the #294 lane's JSONL union:
 //!   one file, the source's bytes then the live file's lines it lacks.
-//! - An opaque file, a `SQLite` store and a live path of another kind are
-//!   held `HOMES_CONSOLIDATE_UNSUPPORTED`, with nothing written.
+//! - An opaque file and a live path of another kind are held
+//!   `HOMES_CONSOLIDATE_UNSUPPORTED`, with nothing written. A `SQLite`
+//!   store and its sidecars are routed to the row union
+//!   (`sqlite_union::union_routed`), nothing read or written on the file
+//!   path.
 //! - An unchanged rerun reads 0 source bytes.
 //! - The destination state holds no payload byte.
 //! - `--plan-only` writes nothing and lists every seat.
@@ -275,7 +278,7 @@ fn an_append_log_is_extended_covered_or_consolidated() {
 }
 
 #[test]
-fn opaque_files_sqlite_stores_and_other_kinds_are_held_never_beside() {
+fn opaque_files_and_other_kinds_are_held_and_sqlite_stores_routed_never_beside() {
     let run = Consolidating::new(false);
     let (source, destination) = (run.source(), run.destination());
     std::fs::write(source.join("blob.bin"), noise(411, 100_000)).unwrap();
@@ -291,14 +294,12 @@ fn opaque_files_sqlite_stores_and_other_kinds_are_held_never_beside() {
     run.settle();
 
     let stats = run.run();
+    assert_eq!(held(&stats), ["blob.bin", "linked.json"]);
+    let mut routed = stats.sqlite_routed;
+    routed.sort();
     assert_eq!(
-        held(&stats),
-        [
-            "blob.bin",
-            "linked.json",
-            "state_5.sqlite",
-            "state_5.sqlite-wal"
-        ]
+        routed,
+        [b"state_5.sqlite".to_vec(), b"state_5.sqlite-wal".to_vec()]
     );
     assert_eq!(std::fs::read(destination.join("new.bin")).unwrap(), b"new");
     assert!(!destination.join("state_5.sqlite").exists());

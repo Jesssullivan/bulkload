@@ -15,6 +15,7 @@
 pub mod frame;
 pub mod refusal;
 pub mod row;
+pub mod rows;
 
 pub use frame::{Control, Decision, Frame, PROTO_VERSION};
 pub use refusal::{BulkloadRefusal, StderrClass};
