@@ -2686,3 +2686,44 @@ fn reseat(
     ]);
     super::reseat_run(&args)
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn item(source: &str, repository: &str, workspace: &str) -> estate::Item {
+        estate::Item {
+            source: PathBuf::from(source),
+            repository: PathBuf::from(repository),
+            workspace: Some(PathBuf::from(workspace)),
+        }
+    }
+
+    // The default home map (2026-10-21): under the source's home it lands
+    // under this host's; mapped paths stay; from another host, a path no
+    // map and no home covers is held (`None`), never landed raw.
+    #[test]
+    fn the_default_home_map_places_or_holds() {
+        let homes = (PathBuf::from("/Users/jess"), PathBuf::from("/home/jess"));
+        let cache = item(
+            "/Users/jess/.cache/lanes/wt",
+            "/srv/git/repo",
+            "/Users/jess/.cache/lanes/wt",
+        );
+        let placed = remap_item(&cache, Some(&homes), false).unwrap();
+        assert_eq!(
+            placed.workspace,
+            Some(PathBuf::from("/home/jess/.cache/lanes/wt"))
+        );
+        assert_eq!(placed.repository, PathBuf::from("/srv/git/repo"));
+        assert_eq!(placed.source, cache.source);
+        let mapped = item("/Users/jess/git/a", "/srv/git/a", "/srv/git/a");
+        assert_eq!(remap_item(&mapped, Some(&homes), false).unwrap(), mapped);
+        let nowhere = item("/opt/work/x", "/opt/work/x", "/opt/work/x");
+        assert_eq!(remap_item(&nowhere, Some(&homes), false), None);
+        assert_eq!(remap_item(&cache, None, false), None);
+        // This host's plan is this host's paths already.
+        assert_eq!(remap_item(&nowhere, Some(&homes), true).unwrap(), nowhere);
+    }
+}

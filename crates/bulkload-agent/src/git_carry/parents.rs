@@ -240,9 +240,10 @@ fn create_mode(absent: &[PathBuf], mode: u32) -> (Vec<PathBuf>, Result<()>) {
     (created, outcome)
 }
 
-/// Make the absent parents of `destination` inside `home`, the destination
-/// home's real directory (estate-move's default home map, 2026-10-21):
-/// each level 0700, race-safe as [`FirstTarget::place`]'s, and only where
+/// Make the absent parents of `destination` inside `home`.
+///
+/// `home` is the destination home's real directory (estate-move's default
+/// home map, 2026-10-21): each level 0700, race-safe as [`FirstTarget::place`]'s, and only where
 /// the nearest existing ancestor is a directory inside `home` this user
 /// owns. Returns how many levels it made.
 ///
@@ -276,7 +277,7 @@ pub fn make_home_parents(home: &Path, destination: &Path) -> Result<u64> {
     Ok(u64::try_from(created.len()).unwrap_or(u64::MAX))
 }
 
-fn create_into(absent: &[PathBuf], mode: u32, created: &mut Vec<PathBuf>) -> Result<()> {
+fn create_into(absent: &[PathBuf], level_mode: u32, created: &mut Vec<PathBuf>) -> Result<()> {
     const SITE: &str = "git_carry::parents::create";
     let Some(first) = absent.first() else {
         return Ok(());
@@ -298,7 +299,7 @@ fn create_into(absent: &[PathBuf], mode: u32, created: &mut Vec<PathBuf>) -> Res
             .file_name()
             .ok_or(BulkloadRefusal::GitDestinationParentMissing)?;
         let name = crate::io::c_name(name.as_bytes()).refuse_at(SITE)?;
-        let made = make_level(&parent, &name, mode).map_err(typed)?;
+        let made = make_level(&parent, &name, level_mode).map_err(typed)?;
         let child =
             fs::File::from(crate::io::sys::open_dir_at(parent.as_fd(), &name).map_err(typed)?);
         parent.sync_dir_counted().refuse_at(SITE)?;
@@ -312,7 +313,7 @@ fn create_into(absent: &[PathBuf], mode: u32, created: &mut Vec<PathBuf>) -> Res
 
 // One level `name` in `parent`: `true` when this call made it, `false` when
 // it was there already (another writer's).
-fn make_level(parent: &fs::File, name: &std::ffi::CStr, mode: u32) -> std::io::Result<bool> {
+fn make_level(parent: &fs::File, name: &std::ffi::CStr, level_mode: u32) -> std::io::Result<bool> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let temporary = crate::io::c_name(
         format!(
@@ -324,7 +325,7 @@ fn make_level(parent: &fs::File, name: &std::ffi::CStr, mode: u32) -> std::io::R
     )?;
     crate::io::sys::mkdirat(parent.as_fd(), &temporary, 0o700)?;
     let settled = crate::io::sys::open_dir_at(parent.as_fd(), &temporary).and_then(|made| {
-        crate::io::sys::fchmod(made.as_fd(), mode)?;
+        crate::io::sys::fchmod(made.as_fd(), level_mode)?;
         fs::File::from(made).sync_dir_counted()
     });
     let renamed = settled.and_then(|()| crate::io::rename_exclusive(parent, &temporary, name));
@@ -335,10 +336,10 @@ fn make_level(parent: &fs::File, name: &std::ffi::CStr, mode: u32) -> std::io::R
             if error.raw_os_error() == Some(libc::EEXIST) {
                 Ok(false)
             } else if crate::io::rename_unsupported(&error) {
-                match crate::io::sys::mkdirat(parent.as_fd(), name, mode) {
+                match crate::io::sys::mkdirat(parent.as_fd(), name, level_mode) {
                     Ok(()) => {
                         let made = crate::io::sys::open_dir_at(parent.as_fd(), name)?;
-                        crate::io::sys::fchmod(made.as_fd(), mode)?;
+                        crate::io::sys::fchmod(made.as_fd(), level_mode)?;
                         fs::File::from(made).sync_dir_counted()?;
                         Ok(true)
                     }

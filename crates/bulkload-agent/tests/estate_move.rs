@@ -3148,3 +3148,282 @@ fn homes_links_are_resolved_and_folded_through() {
         bytes
     );
 }
+
+fn agent_home(args: &[OsString], home: &Path) -> Ran {
+    let out = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .arg("--min-free-percent=0")
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("HOME", home)
+        .output()
+        .unwrap();
+    Ran {
+        ok: out.status.success(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+impl World {
+    fn planned(&self) -> Ran {
+        agent(&os(&[
+            &"estate-move",
+            &"--label",
+            &LABEL,
+            &"--source",
+            &"neo",
+            &"--plan-only",
+            &"-",
+            &self.source_state(),
+            &self.state(),
+        ]))
+    }
+}
+
+// The `key=value` words of `line`.
+fn words(line: &str) -> BTreeMap<String, String> {
+    line.split(' ')
+        .filter_map(|word| word.split_once('='))
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect()
+}
+
+// The plan's line for the item at `path`.
+#[allow(clippy::unnecessary_debug_formatting)]
+fn plan_line<'a>(stdout: &'a str, path: &Path) -> &'a str {
+    let live = format!("live={path:?}");
+    stdout
+        .lines()
+        .find(|line| {
+            line.starts_with("estate-move item=") && line.ends_with(&live) && line.contains(" action=")
+        })
+        .unwrap_or_else(|| panic!("no plan line for {live}:\n{stdout}"))
+}
+
+/// The coordinator, 2026-10-21 ("the plan prints the B2 decisions"):
+/// `--plan-only` says, per item, what the pass would do: the action, the
+/// ref union (created, tracked at refs/remotes/neo), the files to land
+/// with their three-way merges and conflicts, the duplicates rule 3
+/// retires, and the bytes to fetch; the per-file rows go to `diff.jsonl`,
+/// read from the B1 ledgers. Nothing is written to the live repository,
+/// and the state holds no payload.
+#[test]
+fn the_plan_prints_every_b2_decision_and_writes_nothing() {
+    let world = World::new("b2plan");
+    let (source, live) = (world.src().join("p"), world.dst().join("p"));
+    fs::create_dir_all(&source).unwrap();
+    git(&source, &["init", "--quiet", "--template=", "-b", "main"]);
+    fs::write(source.join("f.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+    fs::write(source.join("g.txt"), "alpha\nbeta\ngamma\n").unwrap();
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "--quiet", "-m", "c0"]);
+    git(
+        &world.dst(),
+        &["clone", "--quiet", "--template=", source.to_str().unwrap(), "p"],
+    );
+    git(&live, &["remote", "remove", "origin"]);
+    // A branch only neo has; one both moved apart.
+    git(&source, &["branch", "topic"]);
+    git(&source, &["checkout", "--quiet", "topic"]);
+    git(&source, &["commit", "--quiet", "--allow-empty", "-m", "topic work"]);
+    git(&source, &["checkout", "--quiet", "-b", "div", "main"]);
+    git(&source, &["commit", "--quiet", "--allow-empty", "-m", "neo div"]);
+    git(&source, &["checkout", "--quiet", "main"]);
+    git(&live, &["branch", "div"]);
+    git(&live, &["checkout", "--quiet", "div"]);
+    git(&live, &["commit", "--quiet", "--allow-empty", "-m", "sting div"]);
+    git(&live, &["checkout", "--quiet", "main"]);
+    // Uncommitted on both sides: f.txt merges, g.txt conflicts; neo's new
+    // file lands.
+    fs::write(source.join("f.txt"), "one\ntwo\nthree\nfour\nFIVE neo\n").unwrap();
+    fs::write(live.join("f.txt"), "ONE sting\ntwo\nthree\nfour\nfive\n").unwrap();
+    fs::write(source.join("g.txt"), "alpha\nBETA neo\ngamma\n").unwrap();
+    fs::write(live.join("g.txt"), "alpha\nBETA sting\ngamma\n").unwrap();
+    fs::write(source.join("new.txt"), "neo only\n").unwrap();
+    // A duplicate an older pass left beside the live path.
+    fs::create_dir_all(world.dst().join("p.neo-20261016")).unwrap();
+    let refs_before = out(&live, &["for-each-ref"]);
+    let files_before = tree_files(&live);
+    assert!(world.source().ok);
+    let planned = world.planned();
+    let both = format!("{}\n{}", planned.stdout, planned.stderr);
+    assert!(planned.ok, "{both}");
+    let line = words(plan_line(&planned.stdout, &live));
+    assert_eq!(line["action"], "consolidate", "{both}");
+    assert_eq!(line["refs_created"], "1", "{both}");
+    assert_eq!(line["refs_tracked"], "1", "{both}");
+    assert_eq!(line["merges"], "1", "{both}");
+    assert_eq!(line["conflicts"], "1", "{both}");
+    assert_eq!(line["land"], "1", "{both}");
+    assert_eq!(line["untracked"], "1", "{both}");
+    assert_eq!(line["changed"], "2", "{both}");
+    assert_eq!(line["asides"], "1", "{both}");
+    assert_eq!(line["worktree"], "main", "{both}");
+    assert!(
+        planned
+            .stdout
+            .contains("ref=refs/heads/div union=tracked at=refs/remotes/neo/div"),
+        "{both}"
+    );
+    assert!(planned.stdout.contains("action=retire-beside"), "{both}");
+    let repository = planned
+        .stdout
+        .lines()
+        .find(|line| line.starts_with("estate-move repository="))
+        .unwrap_or_else(|| panic!("{both}"));
+    let fetch: u64 = words(repository)["fetch_bytes"].parse().unwrap();
+    assert!(fetch > 0, "{repository}");
+    let summary = words(
+        planned
+            .stdout
+            .lines()
+            .find(|line| line.starts_with("estate-move plan items="))
+            .unwrap(),
+    );
+    assert_eq!(summary["consolidate"], "1", "{both}");
+    assert_eq!(summary["conflicts"], "1", "{both}");
+    let rows = fs::read_to_string(world.state().join("diff.jsonl")).unwrap();
+    for (path, verdict) in [("f.txt", "merge"), ("g.txt", "conflict"), ("new.txt", "land")] {
+        assert!(
+            rows.lines().any(|row| row.contains(&format!("\"path\":\"{path}\""))
+                && row.contains(&format!("\"verdict\":\"{verdict}\""))),
+            "{path} {verdict}:\n{rows}"
+        );
+    }
+    // Nothing written: the live refs and files as they were, no scratch.
+    assert_eq!(out(&live, &["for-each-ref"]), refs_before);
+    assert_eq!(tree_files(&live), files_before);
+    assert!(!world.state().join("scratch").exists());
+    holds_no_payload(&world.state(), 1);
+}
+
+/// SPEC rule 3 (no duplicates; the coordinator, 2026-10-21: "no
+/// carry-beside on any path"): a capture the source refused is a typed
+/// hold. Nothing is carried as files, beside an occupied live path or at
+/// an absent one, and the plan names the source's code.
+#[test]
+fn a_refused_capture_is_held_and_nothing_is_written_beside_or_live() {
+    let world = World::new("nobeside");
+    world.estate();
+    let src = world.src();
+    for name in ["other", "solo"] {
+        if name == "solo" {
+            repo(&src.join("solo"), "s.txt");
+        }
+        let at = src.join(name);
+        git(&at, &["config", "core.repositoryformatversion", "1"]);
+        git(&at, &["config", "remote.origin.url", "/nowhere"]);
+        git(&at, &["config", "remote.origin.promisor", "true"]);
+        git(&at, &["config", "extensions.partialClone", "origin"]);
+    }
+    let occupied = world.dst().join("other");
+    repo(&occupied, "mine.txt");
+    let before = tree(&world.dst());
+    let sourced = world.source();
+    assert!(
+        sourced.stdout.contains("code=GIT_SOURCE_PARTIAL_CLONE"),
+        "{}\n{}",
+        sourced.stdout,
+        sourced.stderr
+    );
+    let planned = world.planned();
+    let both = format!("{}\n{}", planned.stdout, planned.stderr);
+    for live in [&occupied, &world.dst().join("solo")] {
+        let line = words(plan_line(&planned.stdout, live));
+        assert_eq!(line["action"], "held", "{both}");
+        assert_eq!(line["code"], "GIT_SOURCE_PARTIAL_CLONE", "{both}");
+    }
+    let moved = world.moved();
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    for live in [&occupied, &world.dst().join("solo")] {
+        assert!(
+            moved
+                .stdout
+                .lines()
+                .any(|line| line.contains("outcome=held code=CAPTURE_ABSENT")
+                    && line.contains("capture_code=GIT_SOURCE_PARTIAL_CLONE")),
+            "{} {both}",
+            live.display()
+        );
+    }
+    assert!(!world.dst().join("solo").exists(), "{both}");
+    let after = tree(&world.dst());
+    for rel in &after {
+        let name = rel.to_string_lossy();
+        assert!(
+            !name.contains(&format!(".{LABEL}")) && !name.starts_with("other."),
+            "a copy beside: {name}\n{both}"
+        );
+    }
+    let mine: Vec<_> = before.iter().filter(|rel| rel.starts_with("other")).collect();
+    let still: Vec<_> = after.iter().filter(|rel| rel.starts_with("other")).collect();
+    assert_eq!(mine, still, "the occupied live path is untouched");
+}
+
+/// The coordinator, 2026-10-21: a path outside every `--map` (a worktree
+/// under the source's home, outside `~/git`) is placed by the default home
+/// map, SOURCE_HOME=DEST_HOME, its absent parents made 0700 under the
+/// destination home; never at the source's raw path.
+#[test]
+fn a_path_outside_the_maps_lands_under_the_destination_home() {
+    let world = World::new("homemap");
+    let (src_home, dst_home) = (world.base.join("src"), world.base.join("dst"));
+    let land = world.src().join("land");
+    repo(&land, "a.txt");
+    let outside = src_home.join(".cache/lanes/wt");
+    git(
+        &land,
+        &["worktree", "add", "--quiet", "-b", "wt", outside.to_str().unwrap()],
+    );
+    let map = format!("{}={}", world.src().display(), world.dst().display());
+    let sourced = agent_home(
+        &os(&[
+            &"estate-move-source",
+            &"--map",
+            &map,
+            &world.source_state(),
+            &world.src(),
+        ]),
+        &src_home,
+    );
+    assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
+    let args = |plan: bool| {
+        let mut args = os(&[
+            &"estate-move",
+            &"--label",
+            &LABEL,
+            &"--source",
+            &"neo",
+            &"--dest-home",
+            &dst_home,
+        ]);
+        if plan {
+            args.push("--plan-only".into());
+        }
+        args.extend(os(&[&"-", &world.source_state(), &world.state()]));
+        args
+    };
+    let mapped = dst_home.join(".cache/lanes/wt");
+    let planned = agent_home(&args(true), &dst_home);
+    let both = format!("{}\n{}", planned.stdout, planned.stderr);
+    let line = words(plan_line(&planned.stdout, &mapped));
+    assert_eq!(line["action"], "create", "{both}");
+    assert_eq!(line["parents"], "2", "{both}");
+    assert_eq!(line["under_home"], "true", "{both}");
+    assert!(!dst_home.join(".cache").exists(), "the plan makes nothing");
+    let moved = agent_home(&args(false), &dst_home);
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    assert!(mapped.join("a.txt").is_file(), "{both}");
+    for level in [dst_home.join(".cache"), dst_home.join(".cache/lanes")] {
+        let mode = fs::symlink_metadata(&level).unwrap().mode() & 0o7777;
+        assert_eq!(mode, 0o700, "{} {both}", level.display());
+    }
+    assert_eq!(
+        out(&world.dst().join("land"), &["worktree", "list", "--porcelain"])
+            .lines()
+            .filter(|line| line.starts_with("worktree "))
+            .count(),
+        2,
+        "{both}"
+    );
+}

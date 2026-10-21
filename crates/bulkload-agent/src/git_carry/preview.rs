@@ -1,5 +1,6 @@
-//! The plan's preview of a B2 consolidation (SPEC rules 3, 4 and 7;
-//! 2026-10-21): what a pass would do to each item, from the source's item
+//! The plan's preview of a B2 consolidation.
+//!
+//! SPEC rules 3, 4 and 7 (2026-10-21): what a pass would do to each item, from the source's item
 //! snapshot, the live repository, and one read-only negotiation with the
 //! source ([`answer`], the `negotiate` verb). Nothing here writes a
 //! repository: every Git child is a read, the source's included.
@@ -20,7 +21,9 @@ const SITE: &str = "git_carry::preview";
 /// a larger one is counted unknown.
 pub const FILE_CAP: u64 = 4 << 20;
 
-/// One repository's refs question to the source: for each `(live, source)`
+/// One repository's refs question to the source.
+///
+/// For each `(live, source)`
 /// value pair, whether the live value is an ancestor of the source's; and
 /// the bytes the source would send for `wants` when the destination has
 /// `haves`.
@@ -353,8 +356,9 @@ fn files_answer(ask: &FilesAsk) -> FilesAnswer {
         held(&ask.worktree, &[head.to_owned()]).is_ok_and(|held| held.contains(head))
     });
     let mut diff_known = dest_head.is_none() || dest_head == source_head.as_deref();
-    let mut base = None;
-    if let (Some(dest), Some(ours), true) = (dest_head, source_head.as_deref(), held_head) {
+    let base = if let (Some(dest), Some(ours), true) =
+        (dest_head, source_head.as_deref(), held_head)
+    {
         if dest != ours {
             if let Ok(names) =
                 output(git(&ask.worktree).args(["diff", "--name-only", "-z", dest, ours]))
@@ -368,11 +372,13 @@ fn files_answer(ask: &FilesAsk) -> FilesAnswer {
                 diff_known = true;
             }
         }
-        base = output(git(&ask.worktree).args(["merge-base", dest, ours]))
+        output(git(&ask.worktree).args(["merge-base", dest, ours]))
             .ok()
             .map(|out| String::from_utf8_lossy(&out).trim().to_owned())
-            .filter(|base| oid(base));
-    }
+            .filter(|base| oid(base))
+    } else {
+        None
+    };
     let files = candidates
         .into_iter()
         .filter(|path| contained(path))
@@ -435,7 +441,8 @@ pub struct RefPreview {
     pub after: String,
 }
 
-/// Preview [`super::union::refs`] for `source_refs` into the live `repo`:
+/// Preview [`super::union::refs`] for `source_refs` into the live `repo`.
+///
 /// `forwards(live, source)` says whether the live value is an ancestor of
 /// the source's (the source's answer); the reverse is read here, where the
 /// live store must hold the source's value.

@@ -686,6 +686,9 @@ pub struct Row {
     pub kept: bool,
 }
 
+/// An item at its destination paths, or `None` when it maps nowhere.
+pub type Remap<'a> = &'a dyn Fn(&Item) -> Option<Item>;
+
 /// What [`decide`] reads besides the plan.
 #[derive(Clone, Copy)]
 pub struct Inputs<'a> {
@@ -702,7 +705,7 @@ pub struct Inputs<'a> {
     /// (the default home map, 2026-10-21): the item at its destination
     /// paths, or `None` when it maps nowhere (held `DESTINATION_UNMAPPED`).
     /// Without it every item is taken as planned.
-    pub remap: Option<&'a dyn Fn(&Item) -> Option<Item>>,
+    pub remap: Option<Remap<'a>>,
 }
 
 /// Decide every item of `items` (the pulled plan) against the destination.
