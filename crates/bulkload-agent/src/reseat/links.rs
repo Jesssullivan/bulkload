@@ -1,8 +1,8 @@
 //! Links in a live home that the homes pass resolves before it pulls
 //! (operator interview and A-055, 2026-10-21).
 //!
-//! - **Live links** ([`live_links`]): a home directory that is a link to a
-//!   directory under a declared live-link root (sting's `agent-notes-rescue`
+//! - **Live links** ([`live_links`]): a link in a home, at any depth, to a
+//!   directory or file under a declared live-link root (sting's `agent-notes-rescue`
 //!   into `/srv/data/jess/fast-local-relocated`) is the live directory
 //!   itself. The pull merges the source's files there, at its real path, by
 //!   the normal consolidate rules; the link stays as it is, one copy, no new
@@ -58,24 +58,59 @@ fn target_under(path: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
         .then_some(target)
 }
 
-/// The entries directly in the live home `root` that are links to a
-/// directory under one of the live-link `roots`: each name, with its real
-/// directory.
+/// A link in a live home into a declared live-link root
+/// ([`live_links`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LiveLink {
+    /// Its path relative to the home's real root.
+    pub rel: PathBuf,
+    /// Its target, resolved to its real path.
+    pub target: PathBuf,
+    /// Whether the target is a directory (else a regular file).
+    pub dir: bool,
+}
+
+/// Every link in the live home `root`, at any depth (links are never
+/// followed), whose target is a directory or regular file under one of the
+/// live-link `roots`.
+///
+/// Each is the live file or directory itself: the source's same path is
+/// merged into its target, and the link stays (operator interview
+/// 2026-10-21, "Merge in place at link targets").
 #[must_use]
-pub fn live_links(root: &Path, roots: &[PathBuf]) -> Vec<(OsString, PathBuf)> {
+pub fn live_links(root: &Path, roots: &[PathBuf]) -> Vec<LiveLink> {
     let roots = real_roots(roots);
+    let mut found = Vec::new();
     if roots.is_empty() {
-        return Vec::new();
+        return found;
     }
-    let mut found: Vec<(OsString, PathBuf)> = std::fs::read_dir(root)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| {
-            let target = target_under(&entry.path(), &roots)?;
-            target.is_dir().then(|| (entry.file_name(), target))
-        })
-        .collect();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let Some(target) = target_under(&path, &roots) else {
+                continue;
+            };
+            let Ok(rel) = path.strip_prefix(root) else {
+                continue;
+            };
+            let dir = target.is_dir();
+            if dir || target.is_file() {
+                found.push(LiveLink {
+                    rel: rel.to_path_buf(),
+                    target,
+                    dir,
+                });
+            }
+        }
+    }
     found.sort();
     found
 }

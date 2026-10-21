@@ -2951,7 +2951,7 @@ fn homes_links_are_resolved_and_folded_through() {
     let src_claude = src_home.join(".claude");
     let dst_claude = dst_home.join(".claude");
     fs::create_dir_all(&dst_claude).unwrap();
-    fs::create_dir_all(src_home.join(".codex")).unwrap();
+    fs::create_dir_all(src_home.join(".codex/sessions")).unwrap();
 
     // The relocated live directory and its link.
     let relocated = base.join("relocated");
@@ -2965,6 +2965,38 @@ fn homes_links_are_resolved_and_folded_through() {
     fs::create_dir_all(src_claude.join("agent-notes-rescue")).unwrap();
     fs::write(src_claude.join("agent-notes-rescue/a.md"), b"sting\n").unwrap();
     fs::write(src_claude.join("agent-notes-rescue/b.md"), b"neo\n").unwrap();
+
+    // Deeper live links (operator interview 2026-10-21, "Merge in place at
+    // link targets"): a session directory under the lane's key, and a Codex
+    // rollout file, each a link into a second live-link root.
+    let second_root = base.join("stage2");
+    let sid2 = "5e5e5e5e-2222-4222-8333-444444444444";
+    let session_dir = second_root.join("forks").join(sid2);
+    fs::create_dir_all(session_dir.join("subagents")).unwrap();
+    fs::write(session_dir.join("subagents/a.jsonl"), b"{\"uuid\":\"s\"}\n").unwrap();
+    let src_session = src_claude
+        .join("projects")
+        .join(key(&src_lane))
+        .join(sid2)
+        .join("subagents");
+    fs::create_dir_all(&src_session).unwrap();
+    fs::write(
+        src_session.join("a.jsonl"),
+        b"{\"uuid\":\"s\"}\n{\"uuid\":\"n\"}\n",
+    )
+    .unwrap();
+    fs::write(src_session.join("b.jsonl"), b"{\"uuid\":\"b\"}\n").unwrap();
+    let rollout = second_root.join("live/rollout.jsonl");
+    fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+    fs::write(&rollout, b"{\"r\":1}\n").unwrap();
+    fs::write(
+        src_home.join(".codex/sessions/rollout.jsonl"),
+        b"{\"r\":1}\n{\"r\":2}\n",
+    )
+    .unwrap();
+    let dst_codex = dst_home.join(".codex");
+    fs::create_dir_all(dst_codex.join("sessions")).unwrap();
+    std::os::unix::fs::symlink(&rollout, dst_codex.join("sessions/rollout.jsonl")).unwrap();
 
     // A file-history link into the repair stage.
     let repair_stage = base.join("stage");
@@ -2993,6 +3025,7 @@ fn homes_links_are_resolved_and_folded_through() {
     fs::write(src_projects.join(format!("{SID}.jsonl")), &bytes).unwrap();
     let lane_projects = dst_claude.join("projects").join(key(&dst_lane));
     fs::create_dir_all(&lane_projects).unwrap();
+    std::os::unix::fs::symlink(&session_dir, lane_projects.join(sid2)).unwrap();
     fs::write(lane_projects.join(format!("{SID}.jsonl")), &bytes).unwrap();
     let archive = base.join("archive");
     fs::create_dir_all(&archive).unwrap();
@@ -3018,7 +3051,7 @@ fn homes_links_are_resolved_and_folded_through() {
         if plan {
             args.push(&"--plan-only");
         }
-        args.extend::<[&dyn AsRef<std::ffi::OsStr>; 16]>([
+        args.extend::<[&dyn AsRef<std::ffi::OsStr>; 18]>([
             &"--label",
             &LABEL,
             &"--source",
@@ -3033,6 +3066,8 @@ fn homes_links_are_resolved_and_folded_through() {
             &map,
             &"--live-link-root",
             &relocated,
+            &"--live-link-root",
+            &second_root,
             &"--regularize-link-root",
             &repair_stage,
         ]);
@@ -3049,7 +3084,7 @@ fn homes_links_are_resolved_and_folded_through() {
     // The plan: the lane is derived, the regularization and the live link
     // are named, nothing is written.
     let homes = || {
-        [&dst_home, &relocated, &repair_stage, &archive]
+        [&dst_home, &relocated, &repair_stage, &archive, &second_root]
             .iter()
             .map(|root| tree_files(root))
             .collect::<Vec<_>>()
@@ -3136,6 +3171,27 @@ fn homes_links_are_resolved_and_folded_through() {
         "{}",
         moved.stdout
     );
+    // The deeper live links: merged into their targets through the key map
+    // backwards; the links stay.
+    assert!(fs::symlink_metadata(lane_projects.join(sid2))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        fs::read(session_dir.join("subagents/a.jsonl")).unwrap(),
+        b"{\"uuid\":\"s\"}\n{\"uuid\":\"n\"}\n"
+    );
+    assert_eq!(
+        fs::read(session_dir.join("subagents/b.jsonl")).unwrap(),
+        b"{\"uuid\":\"b\"}\n"
+    );
+    assert!(
+        fs::symlink_metadata(dst_codex.join("sessions/rollout.jsonl"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read(&rollout).unwrap(), b"{\"r\":1}\n{\"r\":2}\n");
     // The neo-key link folded through: its name gone, its target kept, the
     // lane's file as it was.
     assert!(fs::symlink_metadata(neo_key_dir.join(format!("{SID}.jsonl"))).is_err());
