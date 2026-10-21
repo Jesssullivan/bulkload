@@ -243,8 +243,8 @@ delta-lever:
 # batched group seal (S1, OI-1003-Q107; compiled for Linux only, where it
 # fails rather than skips). A name filter that matches nothing still reports
 # `0 passed`, so this recipe fails unless every proof for this platform ran:
-# on a cargo failure, on anything but one `N passed; 0 failed` result (N = 8
-# on Linux, 7 elsewhere), or when a proof
+# on a cargo failure, on anything but one `N passed; 0 failed` result (N = 9
+# on Linux, 8 elsewhere), or when a proof
 # is not among the passing tests (#74 round 2 N2, R-N122).
 resume-power-loss:
     #!/usr/bin/env bash
@@ -257,7 +257,7 @@ resume-power-loss:
         echo "resume-power-loss: cargo test failed with status $status" >&2
         exit "$status"
     fi
-    proofs=(an_adopted_fallback_directory_is_sealed_before_its_record_binds a_directory_adopted_by_its_bound_record_is_sealed_before_outputs_commit an_unrowed_output_is_adopted_without_source_reads a_level_crashed_after_its_commit_is_swept_and_its_records_cleared a_level_crashed_after_some_renames_adopts_the_renamed_and_makes_the_rest a_finish_crashed_after_some_seals_completes_every_directory_in_one_commit a_batch_waits_for_a_held_adoptable_directory_before_making_inside_it)
+    proofs=(an_adopted_fallback_directory_is_sealed_before_its_record_binds a_directory_adopted_by_its_bound_record_is_sealed_before_outputs_commit an_unrowed_output_is_adopted_without_source_reads a_level_crashed_after_its_commit_is_swept_and_its_records_cleared a_level_crashed_after_some_renames_adopts_the_renamed_and_makes_the_rest a_finish_crashed_after_some_seals_completes_every_directory_in_one_commit a_batch_waits_for_a_held_adoptable_directory_before_making_inside_it one_inode_bound_by_two_live_records_is_a_violation)
     if [[ $(uname -s) == Linux ]]; then
         proofs+=(a_batched_group_names_no_output_before_its_data_is_durable)
     fi

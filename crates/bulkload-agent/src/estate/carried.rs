@@ -936,7 +936,8 @@ fn carry_one(
                 match &first.outcome {
                     transfer_outcome::EntryOutcome::Refused { refusal, .. } => refusal.code(),
                     transfer_outcome::EntryOutcome::SidecarCovered
-                    | transfer_outcome::EntryOutcome::AppliedBeside { .. } => "",
+                    | transfer_outcome::EntryOutcome::AppliedBeside { .. }
+                    | transfer_outcome::EntryOutcome::Consolidated { .. } => "",
                 },
                 gits.len(),
             ),

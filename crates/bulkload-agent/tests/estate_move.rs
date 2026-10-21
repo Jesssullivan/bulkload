@@ -35,6 +35,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -622,15 +623,21 @@ fn a_sessions_only_pass_lands_the_live_home_with_no_payload_in_state() {
 /// LIVE destination home with `--beside .LABEL` (C9: no landing stage):
 /// nothing there is overwritten, a differing settings file and the live
 /// Codex index's snapshot land beside, new transcripts and rollouts land in
-/// place, the re-seat runs although one path was refused (C10) and re-keys
-/// the source's session under the lane's destination key while the
-/// destination's own session is in place, and the closure counts the
-/// session transfers and the re-seat (C11): the refused path holds the gate
-/// until it is resolved, and the beside placements stay accounted on the
-/// rerun that then passes.
+/// `estate-move --sessions` consolidates the source's `.claude` and
+/// `.codex` into the LIVE destination home (operator ruling 2026-10-20;
+/// C9: no landing stage, no beside).
+///
+/// - Differing config files are merged in place.
+/// - New transcripts and rollouts land in place.
+/// - The Codex store is held for its row union, which holds the gate.
+/// - The re-seat runs although one path was held (C10). It re-keys the
+///   source's session under the lane's destination key, and the
+///   destination's own session is in place.
+/// - The closure counts the session transfers and the re-seat (C11).
+/// - An unchanged rerun rewrites nothing.
 #[test]
 #[ignore = "waits for the streamed capture (PR B): SPEC rule 2 refuses the git capture and corpus pull this pass needs"]
-fn sessions_land_in_the_live_home_beside_and_the_gate_reads_them() {
+fn sessions_are_consolidated_into_the_live_home_and_the_gate_reads_them() {
     let base = std::env::temp_dir().join(format!("bulkload-move-home-{}", std::process::id()));
     let _ = fs::remove_dir_all(&base);
     fs::create_dir_all(&base).unwrap();
@@ -762,8 +769,9 @@ fn sessions_land_in_the_live_home_beside_and_the_gate_reads_them() {
         ]))
     };
 
-    // Pass 1: the plugin file is refused (its beside path is taken), so the
-    // sessions pull ends ITEMS_REFUSED; the re-seat still runs.
+    // Pass 1 (operator ruling 2026-10-20): the homes are consolidated.
+    // The Codex store is the row union's (#278), held typed until it lands,
+    // so the sessions pull ends ITEMS_REFUSED; the re-seat still runs.
     let moved = move_pass();
     assert!(!moved.ok, "{}\n{}", moved.stdout, moved.stderr);
     assert!(
@@ -778,24 +786,17 @@ fn sessions_land_in_the_live_home_beside_and_the_gate_reads_them() {
         "{}",
         moved.stdout
     );
-    assert!(
-        !moved.stdout.contains("skipped:sessions-pull-refused"),
-        "{}",
-        moved.stdout
-    );
-    // Nothing live was overwritten; the differing files landed beside.
+    // The differing config files are merged in place, key by key, and
+    // nothing lands beside them.
     assert_eq!(
-        fs::read(dst_claude.join("settings.json")).unwrap(),
-        dst_settings
+        fs::read_to_string(dst_claude.join("settings.json")).unwrap(),
+        "{\"cleanupPeriodDays\": 3650, \"theme\": \"neo\"}\n"
     );
     assert_eq!(
-        fs::read(dst_claude.join(format!("settings.json.{LABEL}"))).unwrap(),
-        src_settings
+        fs::read_to_string(dst_claude.join("plugins/config.json")).unwrap(),
+        "{\"sting\":true,\"neo\":true}\n"
     );
-    assert_eq!(
-        fs::read(dst_claude.join("plugins/config.json")).unwrap(),
-        b"{\"sting\":true}\n"
-    );
+    assert!(!dst_claude.join(format!("settings.json.{LABEL}")).exists());
     assert_eq!(fs::read(&foreign).unwrap(), b"someone else's\n");
     assert_eq!(
         fs::read(dst_claude.join("history.jsonl")).unwrap(),
@@ -828,68 +829,67 @@ fn sessions_land_in_the_live_home_beside_and_the_gate_reads_them() {
         "the destination's own session is in place:\n{}",
         moved.stdout
     );
-    assert!(
-        !moved.stdout.contains("RESEAT_LANE_UNMAPPED"),
-        "{}",
-        moved.stdout
-    );
     assert!(!state.join("landing").exists(), "no intermediary stage");
-    // Codex: the live index kept with its sidecar, the snapshot beside it,
-    // the rollout in place, and the thread registered for the lane.
-    assert_ne!(
-        fs::read(dst_codex.join("state_5.sqlite")).unwrap(),
-        live_index,
-        "the live index gained the re-seated row"
-    );
+    // SPEC rule 2: the pass leaves no payload byte in MOVE_STATE, and no
+    // temporary beside a live path.
+    for (name, bytes) in tree_files(&state) {
+        for payload in [b"reply NEO".as_slice(), b"neo prompt", b"{\"neo\":true}"] {
+            assert!(
+                !bytes.windows(payload.len()).any(|window| window == payload),
+                "{name} holds payload bytes"
+            );
+        }
+    }
+    for root in [&dst_claude, &dst_home.join(".codex")] {
+        for (name, _) in tree_files(root) {
+            // bulkload's private names: a staged temporary, a union's.
+            let leaf = name.rsplit('/').next().unwrap_or_default();
+            assert!(
+                !leaf.starts_with(".bulkload") && !leaf.contains(".bulkload-consolidate."),
+                "{name} left beside a live path"
+            );
+        }
+    }
+    // Codex: the live index and its sidecar are never written by the pull,
+    // and nothing lands beside them; the source's rollout lands in place and
+    // the re-seat registers its thread for the lane from its header.
     assert!(dst_codex.join("state_5.sqlite-wal").exists());
-    assert!(dst_codex.join(format!("state_5.sqlite.{LABEL}")).is_file());
+    assert!(!dst_codex.join(format!("state_5.sqlite.{LABEL}")).exists());
+    assert!(
+        moved
+            .stderr
+            .contains("held state_5.sqlite: HOMES_CONSOLIDATE_UNSUPPORTED"),
+        "{}",
+        moved.stderr
+    );
     assert_eq!(
         fs::read_to_string(dst_codex.join(&rollout_rel)).unwrap(),
         rollout_bytes
     );
     let cwds = thread_cwds(&dst_codex.join("state_5.sqlite"));
-    assert_eq!(
-        cwds,
-        [
-            (THREAD.to_owned(), dst_lane.to_str().unwrap().to_owned()),
-            (DEST_THREAD.to_owned(), dst_lane.to_str().unwrap().to_owned()),
-        ],
-        "the source's thread registered for the lane; the rowless destination rollout left as it was:\n{}",
+    assert!(
+        cwds.contains(&(
+            DEST_THREAD.to_owned(),
+            dst_lane.to_str().unwrap().to_owned()
+        )),
+        "{cwds:?}\n{}",
         moved.stdout
     );
-    assert_eq!(
-        fs::read_to_string(&dest_rollout).unwrap(),
-        dest_meta(DEST_THREAD)
+    assert_ne!(
+        fs::read(dst_codex.join("state_5.sqlite")).unwrap(),
+        live_index
     );
     assert_eq!(
         fs::read_to_string(&rowless_rollout).unwrap(),
         dest_meta(ROWLESS_THREAD)
     );
-    assert!(
-        moved
-            .stdout
-            .lines()
-            .filter(|line| line.contains("\"kind\":\"thread\"")
-                && line.contains("\"outcome\":\"in-place\""))
-            .count()
-            == 2,
-        "the destination's own rollouts are in place:\n{}",
-        moved.stdout
-    );
-    // The closure: the two session transfers joined, their beside rows
-    // accounted, the refused plugin pending review, the re-seat accounted.
+    // The closure: the session transfers joined, the merged configs
+    // accounted (covered), the held store pending review: the gate fails.
     let first = closure(&moved.stdout);
     assert_eq!(first["sessions"], "claude,codex", "{}", moved.stdout);
-    assert_eq!(first["applied_beside"], "2", "{}", moved.stdout);
+    assert_eq!(first["applied_beside"], "0", "{}", moved.stdout);
     assert_eq!(first["refused_pending_review"], "1", "{}", moved.stdout);
     assert_eq!(first["unaccounted"], "0", "{}", moved.stdout);
-    assert_eq!(first["reseat_unaccounted"], "0", "{}", moved.stdout);
-    assert_eq!(first["reseat_held"], "none", "{}", moved.stdout);
-    assert!(
-        first["transfer_rows"].parse::<u64>().unwrap() >= 5,
-        "{}",
-        moved.stdout
-    );
     assert!(
         moved.stdout.contains("estate-move gate=fail"),
         "{}",
@@ -897,59 +897,55 @@ fn sessions_land_in_the_live_home_beside_and_the_gate_reads_them() {
     );
     let closure_json = fs::read_to_string(state.join("closure.json")).unwrap();
     assert!(
-        closure_json.contains("\"transfer_outcome\":\"applied-beside\""),
+        closure_json.contains("\"transfer_outcome\":\"consolidated\""),
         "{closure_json}"
     );
     assert!(
-        closure_json.contains(&format!("\"beside\":\"settings.json.{LABEL}\"")),
+        closure_json.contains("\"consolidation\":\"consolidate\""),
+        "{closure_json}"
+    );
+    assert!(
+        closure_json.contains("\"HOMES_CONSOLIDATE_UNSUPPORTED\""),
         "{closure_json}"
     );
 
-    // Pass 2: the foreign beside file resolved by its owner; the plugin
-    // file lands beside, every placement is reused, and the gate passes.
-    fs::remove_file(&foreign).unwrap();
+    // Pass 2: unchanged. The merged configs are reused, nothing is
+    // rewritten, and the store is still held.
+    let settings_inode = fs::metadata(dst_claude.join("settings.json"))
+        .unwrap()
+        .ino();
     source_pass();
     let again = move_pass();
-    assert!(again.ok, "{}\n{}", again.stdout, again.stderr);
-    assert!(
-        again
-            .stdout
-            .contains("estate-move phase=sessions-pull outcome=ok"),
-        "{}",
-        again.stdout
-    );
-    assert_eq!(fs::read(&foreign).unwrap(), b"{\"neo\":true}\n");
-    let second = closure(&again.stdout);
-    assert_eq!(second["applied_beside"], "3", "{}", again.stdout);
-    assert_eq!(second["refused_pending_review"], "0", "{}", again.stdout);
-    assert_eq!(second["unaccounted"], "0", "{}", again.stdout);
-    assert_eq!(second["reseat_unaccounted"], "0", "{}", again.stdout);
-    assert!(
-        again.stdout.contains("estate-move gate=pass"),
-        "{}",
-        again.stdout
-    );
     assert_eq!(
-        fs::read(dst_claude.join("settings.json")).unwrap(),
-        dst_settings
+        fs::metadata(dst_claude.join("settings.json"))
+            .unwrap()
+            .ino(),
+        settings_inode
+    );
+    let second = closure(&again.stdout);
+    assert_eq!(second["refused_pending_review"], "1", "{}", again.stdout);
+    assert_eq!(second["unaccounted"], "0", "{}", again.stdout);
+    // SPEC rule 3: no `<path>.LABEL` copy anywhere in the homes; the one
+    // there is the destination's own, untouched.
+    assert_eq!(
+        label_copies(&dst_home),
+        [format!(".claude/plugins/config.json.{LABEL}")]
     );
     assert_eq!(
         fs::read_to_string(dst_projects.join(format!("{DEST_SID}.jsonl"))).unwrap(),
         dest_transcript
     );
-    assert_eq!(thread_cwds(&dst_codex.join("state_5.sqlite")), cwds);
 }
 
-/// Review of #280, findings 6 and 7: a destination with no Codex index.
-/// The pull never writes the live index: the source's snapshot lands
-/// beside it as `state_5.sqlite.LABEL`, and the re-seat seeds the live
-/// index from that snapshot (its thread rows left out) and registers the
-/// lane's thread under the destination's `cwd` and rollout path, never
-/// reading a live index as the snapshot. A destination session with no
+/// A destination with no Codex index (review of #280, findings 6 and 7, as
+/// the operator ruling of 2026-10-20 reshapes them). The source's store is
+/// the row union's (#278): never landed as a file, nor beside, and held
+/// typed until that union lands. The symlinked homes are resolved once
+/// (N1), the rollout lands in place, and a destination session with no
 /// `cwd` under a destination key is in place and holds nothing.
 #[test]
 #[ignore = "waits for the streamed capture (PR B): SPEC rule 2 refuses the git capture and corpus pull this pass needs"]
-fn sessions_into_a_destination_with_no_codex_index_seed_it() {
+fn sessions_into_a_destination_with_no_codex_index_hold_the_store() {
     let base = std::env::temp_dir().join(format!("bulkload-move-fresh-{}", std::process::id()));
     let _ = fs::remove_dir_all(&base);
     fs::create_dir_all(&base).unwrap();
@@ -1054,9 +1050,26 @@ fn sessions_into_a_destination_with_no_codex_index_seed_it() {
         &source_state,
         &state,
     ]));
-    assert!(moved.ok, "{}\n{}", moved.stdout, moved.stderr);
+    // The source's Codex store is the row union's (#278), never landed as
+    // a file, not even where the destination has none: held typed, so the
+    // pull ends ITEMS_REFUSED and the gate holds until that union lands.
+    assert!(!moved.ok, "{}\n{}", moved.stdout, moved.stderr);
     assert!(
-        moved.stdout.contains("estate-move gate=pass"),
+        moved
+            .stdout
+            .contains("estate-move phase=sessions-pull outcome=refused:ITEMS_REFUSED"),
+        "{}",
+        moved.stdout
+    );
+    assert!(
+        moved
+            .stderr
+            .contains("held state_5.sqlite: HOMES_CONSOLIDATE_UNSUPPORTED"),
+        "{}",
+        moved.stderr
+    );
+    assert!(
+        moved.stdout.contains("estate-move gate=fail"),
         "{}",
         moved.stdout
     );
@@ -1076,109 +1089,44 @@ fn sessions_into_a_destination_with_no_codex_index_seed_it() {
             .file_type()
             .is_symlink());
     }
-    let snapshot = dst_codex.join(format!("state_5.sqlite.{LABEL}"));
-    assert!(
-        snapshot.is_file(),
-        "the snapshot lands beside, live path absent"
-    );
-    assert!(
-        moved.stdout.contains("\"kind\":\"index\"")
-            && moved.stdout.contains("\"outcome\":\"seeded\""),
-        "{}",
-        moved.stdout
-    );
-    let live = dst_codex.join("state_5.sqlite");
-    assert_eq!(
-        thread_cwds(&live),
-        [(THREAD.to_owned(), dst_lane.to_str().unwrap().to_owned())],
-        "registered for the lane, not copied with the source's cwd:\n{}",
-        moved.stdout
-    );
-    let rollout_path: String = rusqlite::Connection::open_with_flags(
-        format!("file:{}?immutable=1", live.display()),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-    )
-    .unwrap()
-    .query_row("SELECT rollout_path FROM threads", [], |row| row.get(0))
-    .unwrap();
-    assert_eq!(
-        rollout_path,
-        fs::canonicalize(&dst_codex)
-            .unwrap()
-            .join(&rollout_rel)
-            .to_str()
-            .unwrap()
-    );
+    assert!(!dst_codex.join("state_5.sqlite").exists());
+    assert!(!dst_codex.join(format!("state_5.sqlite.{LABEL}")).exists());
     assert!(
         state_dir.join("codex").join(&rollout_rel).is_file(),
         "landed under the real path the link names"
-    );
-    let backfill: String = rusqlite::Connection::open_with_flags(
-        format!("file:{}?immutable=1", live.display()),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-    )
-    .unwrap()
-    .query_row("SELECT status FROM backfill_state", [], |row| row.get(0))
-    .unwrap();
-    assert_eq!(
-        backfill, "complete",
-        "the destination Codex never backfills"
-    );
-    assert_eq!(
-        thread_cwds(&snapshot),
-        [(THREAD.to_owned(), src_lane.to_str().unwrap().to_owned())],
-        "the snapshot itself is the source's, untouched"
     );
     // The destination's own cwd-less session: in place, nothing held.
     assert_eq!(
         fs::read_to_string(own_projects.join(format!("{DEST_SID}.jsonl"))).unwrap(),
         no_cwd
     );
-    let totals = closure(&moved.stdout);
-    assert_eq!(totals["reseat_unaccounted"], "0", "{}", moved.stdout);
-    assert_eq!(totals["unaccounted"], "0", "{}", moved.stdout);
-
-    // The rerun reads the snapshot this pass reused, and changes nothing.
-    let again = agent(&os(&[
-        &"estate-move",
-        &"--label",
-        &LABEL,
-        &"--source",
-        &"neo",
-        &"--sessions",
-        &src_home,
-        &"--dest-home",
-        &dst_home,
-        &"--map",
-        &map,
-        &"-",
-        &source_state,
-        &state,
-    ]));
-    assert!(again.ok, "{}\n{}", again.stdout, again.stderr);
+    // With no index at the destination and the store held, the re-seat has
+    // no index to register threads in until the row union lands: typed.
     assert!(
-        !again.stdout.contains("\"outcome\":\"seeded\""),
+        moved
+            .stdout
+            .contains("estate-move phase=reseat outcome=refused:RESEAT_INDEX_ABSENT"),
         "{}",
-        again.stdout
+        moved.stdout
     );
-    assert_eq!(
-        thread_cwds(&live),
-        [(THREAD.to_owned(), dst_lane.to_str().unwrap().to_owned())]
-    );
+    let totals = closure(&moved.stdout);
+    assert_eq!(totals["refused_pending_review"], "1", "{}", moved.stdout);
+    assert_eq!(totals["unaccounted"], "0", "{}", moved.stdout);
 }
 
-/// Second review of #280, N2, N4 and N5, on sting's shapes. The
-/// destination's own transcripts and rollouts that are symlinks into an
-/// archive are never read.
-/// - When neo has the same session (A-106: "neo's version wins; fork stays
-///   in archive"), neo's copy becomes the file the picker reads at the live
-///   key, the link replaced, the archived fork left in the archive.
-/// - A link under a neo key with neo's copy landed beside it: the copy is
-///   re-keyed to the lane, the link stays.
-/// - A link neo has no copy of is the destination's own and stays,
-///   `in-place`.
-/// - The destination's own `.jsonl.gz` and oddly named rollouts are
-///   `in-place`.
+/// Second review of #280, N2, N4 and N5, on sting's shapes, under the
+/// operator ruling of 2026-10-20 (consolidated, never beside; A-106 a
+/// union). The destination's own transcripts and rollouts that are
+/// symlinks into an archive are never read or written through.
+/// - When neo has the same session at the lane's key, the destination's
+///   fork stays what the picker reads there (its archive link regularized
+///   in place, the archive untouched). Neo's copy is held at the pull and
+///   written at no key (SPEC rule 3, one session one file) until the
+///   append-log union merges it; the plan lists that hold first.
+/// - Neo's copy whose live path is such a link is held at the pull, never
+///   landed beside.
+/// - A link neo has no copy of is the destination's own and stays.
+/// - The destination's own `.jsonl.gz` and oddly named rollouts stay.
 /// - A source session with no lane is `RESEAT_LANE_UNMAPPED`, typed, and
 ///   holds the gate.
 #[test]
@@ -1331,6 +1279,33 @@ fn archive_links_follow_a106_and_destination_links_stay() {
         &src_git,
     ]));
     assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
+    // The plan names the fork's hold before anything lands.
+    let planned = agent(&os(&[
+        &"estate-move",
+        &"--plan-only",
+        &"--label",
+        &LABEL,
+        &"--source",
+        &"neo",
+        &"--sessions",
+        &src_home,
+        &"--dest-home",
+        &dst_home,
+        &"--map",
+        &map,
+        &"-",
+        &source_state,
+        &state,
+    ]));
+    assert!(planned.ok, "{}\n{}", planned.stdout, planned.stderr);
+    assert!(
+        planned.stdout.lines().any(|line| line.starts_with(&format!(
+            "planned projects/{}/{SID_FORK}.jsonl class=append-log action=hold ",
+            key(&src_lane)
+        )) && line.contains("under another key")),
+        "{}",
+        planned.stdout
+    );
     let moved = agent(&os(&[
         &"estate-move",
         &"--label",
@@ -1367,60 +1342,97 @@ fn archive_links_follow_a106_and_destination_links_stay() {
         moved.stdout,
         moved.stderr
     );
-    // A-106: neo's copy is what the picker reads at the lane's key; the
-    // archived fork stays in the archive.
-    let at_live = dst_projects.join(format!("{SID_FORK}.jsonl"));
+    // A-106 is a union now (operator ruling 2026-10-20), never neo's copy
+    // replacing the destination's: until the append-log union (#294)
+    // lands, the archive link at the lane's key stays, the archived fork is
+    // untouched, and the placement is `occupied`, holding the gate.
     assert!(
-        fs::symlink_metadata(&at_live).unwrap().is_file(),
+        moved.stdout.contains("estate-move a106=union-pending"),
         "{}",
         moved.stdout
     );
-    assert_eq!(fs::read_to_string(&at_live).unwrap(), neo(SID_FORK));
+    // The live name holds the destination's fork (the re-seat regularizes
+    // its archive link in place, OI-1003-Q198), never neo's copy. Neo's
+    // copy is held at the pull, typed, and written nowhere: one session,
+    // one file on sting (SPEC rule 3), until the append-log union merges
+    // them.
+    let at_live = dst_projects.join(format!("{SID_FORK}.jsonl"));
+    assert_eq!(fs::read_to_string(&at_live).unwrap(), fork_bytes);
     assert_eq!(
         fs::read_to_string(archive.join("fork.jsonl")).unwrap(),
         fork_bytes
     );
     assert!(
-        moved.stdout.contains("replaced-archived"),
+        moved.stderr.contains(&format!(
+            "held projects/{}/{SID_FORK}.jsonl: HOMES_CONSOLIDATE_UNSUPPORTED",
+            key(&src_lane)
+        )),
+        "{}",
+        moved.stderr
+    );
+    let copies: Vec<String> = tree_files(&dst_claude)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name.contains(SID_FORK))
+        .collect();
+    assert_eq!(
+        copies,
+        [format!("projects/{}/{SID_FORK}.jsonl", key(&dst_lane))],
+        "nothing new at any key"
+    );
+    assert!(
+        !moved.stdout.contains("RESEAT_DEST_DIVERGED"),
         "{}",
         moved.stdout
     );
-    // Under the neo key: the link stays, neo's copy (landed beside it) is
-    // re-keyed to the lane.
-    assert!(
-        fs::symlink_metadata(neo_key_dir.join(format!("{SID_NEO_KEY}.jsonl")))
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
+    // Under the neo key: the destination's link is held at the pull (a live
+    // path of another kind), never landed beside; the live name keeps the
+    // destination's archived bytes, never neo's copy.
     assert_eq!(
-        fs::read_to_string(dst_projects.join(format!("{SID_NEO_KEY}.jsonl"))).unwrap(),
-        neo(SID_NEO_KEY)
+        fs::read_to_string(neo_key_dir.join(format!("{SID_NEO_KEY}.jsonl"))).unwrap(),
+        transcript(SID_NEO_KEY, &src_lane, "OLD")
     );
-    // The destination's own link stays a link.
     assert!(
-        fs::symlink_metadata(dst_projects.join(format!("{SID_DEST}.jsonl")))
-            .unwrap()
-            .file_type()
-            .is_symlink()
+        moved.stderr.contains(&format!(
+            "held projects/{}/{SID_NEO_KEY}.jsonl: HOMES_CONSOLIDATE_UNSUPPORTED",
+            key(&src_lane)
+        )),
+        "{}",
+        moved.stderr
     );
-    // Codex: neo's rollout replaces the archive link; the archived one stays.
+    assert!(!neo_key_dir
+        .join(format!("{SID_NEO_KEY}.jsonl.{LABEL}"))
+        .exists());
+    // The destination's own session keeps its own bytes.
+    assert_eq!(
+        fs::read_to_string(dst_projects.join(format!("{SID_DEST}.jsonl"))).unwrap(),
+        transcript(SID_DEST, &dst_lane, "OWN")
+    );
+    // Codex: the archive link at neo's rollout path is held too; it and the
+    // archived rollout are untouched.
     let live_rollout = dst_codex.join(&fork_rel);
     assert!(
-        fs::symlink_metadata(&live_rollout).unwrap().is_file(),
+        fs::symlink_metadata(&live_rollout)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
         "{}",
         moved.stdout
     );
-    assert_eq!(fs::read_to_string(&live_rollout).unwrap(), neo_rollout);
     assert_eq!(
         fs::read(archive.join("rollout-fork.jsonl")).unwrap(),
         archived_rollout
     );
     assert_eq!(fs::read(&gz).unwrap(), b"\x1f\x8b old");
     assert_eq!(fs::read(&odd).unwrap(), b"an odd name\n");
-    // N4: the two neo sessions with no lane hold the gate, typed and
-    // reviewable, the one outside neo's home included (by provenance, not
-    // by its key's shape); nothing else does.
+    // SPEC rule 3: nothing lands beside a link either.
+    assert!(
+        label_copies(&dst_home).is_empty(),
+        "{:?}",
+        label_copies(&dst_home)
+    );
+    // N4: the two neo sessions with no lane are typed and reviewable, the
+    // one outside neo's home included (by provenance), and hold the gate.
     let totals = closure(&moved.stdout);
     assert_eq!(
         totals["reseat_held"], "claude/RESEAT_LANE_UNMAPPED:2",
@@ -1634,4 +1646,217 @@ fn listed_then_pruned_sessions_with_no_lane_stay_typed() {
         "{}",
         String::from_utf8_lossy(&listing)
     );
+}
+
+/// Every regular file under `root`, by relative path, with its bytes.
+fn tree_files(root: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            let meta = fs::symlink_metadata(&path).unwrap();
+            if meta.is_dir() {
+                pending.push(path);
+            } else if meta.is_file() {
+                let name = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((name, fs::read(&path).unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Operator ruling 2026-10-20, item 3: `estate-move --plan-only --sessions`
+/// lists every file of the homes with its class, its action and the sizes
+/// on both sides before anything lands, and writes nothing to them.
+#[test]
+fn the_homes_plan_lists_every_file_and_writes_nothing() {
+    let base = std::env::temp_dir().join(format!("bulkload-move-plan-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    let world = World {
+        base: fs::canonicalize(&base).unwrap(),
+    };
+    let base = &world.base;
+    let src_home = base.join("src/home");
+    let dst_home = base.join("dst/home");
+    let (src_git, dst_git) = (src_home.join("git"), dst_home.join("git"));
+    fs::create_dir_all(&src_git).unwrap();
+    fs::create_dir_all(&dst_git).unwrap();
+    repo(&src_git.join("lab"), "l.txt");
+    let src_lane = src_git.join("lab");
+    let src_claude = src_home.join(".claude");
+    let src_projects = src_claude.join("projects").join(key(&src_lane));
+    fs::create_dir_all(&src_projects).unwrap();
+    fs::write(
+        src_projects.join(format!("{SID}.jsonl")),
+        transcript(SID, &src_lane, "NEO"),
+    )
+    .unwrap();
+    fs::write(src_claude.join("settings.json"), b"{\"theme\": \"neo\"}\n").unwrap();
+    fs::write(src_claude.join("same.txt"), b"same\n").unwrap();
+    fs::write(src_claude.join("blob.bin"), b"neo bytes").unwrap();
+    fs::write(src_home.join(".claude.json"), b"{\"numStartups\": 40}\n").unwrap();
+    let src_codex = src_home.join(".codex");
+    fs::create_dir_all(&src_codex).unwrap();
+    fs::write(src_codex.join("config.toml"), b"model = \"gpt-5\"\n").unwrap();
+
+    let dst_claude = dst_home.join(".claude");
+    fs::create_dir_all(&dst_claude).unwrap();
+    fs::write(dst_claude.join("settings.json"), b"{\"model\": \"opus\"}\n").unwrap();
+    fs::write(dst_claude.join("same.txt"), b"same\n").unwrap();
+    fs::write(dst_claude.join("blob.bin"), b"sting bytes").unwrap();
+    fs::write(dst_home.join(".claude.json"), b"{\"numStartups\": 12}\n").unwrap();
+    let dst_codex = dst_home.join(".codex");
+    fs::create_dir_all(&dst_codex).unwrap();
+    fs::write(dst_codex.join("config.toml"), b"# sting\n").unwrap();
+    let before = tree_files(&dst_home);
+
+    let source_state = base.join("move-src");
+    let state = base.join("move-dst");
+    let map = format!("{}={}", src_git.display(), dst_git.display());
+    let sourced = agent(&os(&[
+        &"estate-move-source",
+        &"--map",
+        &map,
+        &source_state,
+        &src_git,
+    ]));
+    assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
+    let planned = agent(&os(&[
+        &"estate-move",
+        &"--plan-only",
+        &"--label",
+        &LABEL,
+        &"--source",
+        &"neo",
+        &"--sessions",
+        &src_home,
+        &"--dest-home",
+        &dst_home,
+        &"--map",
+        &map,
+        &"-",
+        &source_state,
+        &state,
+    ]));
+    assert!(planned.ok, "{}\n{}", planned.stdout, planned.stderr);
+    let line = |path: &str, action: &str| {
+        planned.stdout.lines().any(|line| {
+            line.starts_with(&format!("planned {path} "))
+                && line.contains(&format!(" action={action} "))
+        })
+    };
+    for (path, action) in [
+        ("settings.json", "consolidate"),
+        ("same.txt", "adopt"),
+        ("blob.bin", "hold"),
+        (
+            &format!("projects/{}/{SID}.jsonl", key(&src_lane)) as &str,
+            "create",
+        ),
+        (".claude.json", "consolidate"),
+        ("config.toml", "consolidate"),
+    ] {
+        assert!(line(path, action), "{path} {action}:\n{}", planned.stdout);
+    }
+    assert!(
+        planned
+            .stdout
+            .contains("planned blob.bin class=opaque action=hold source_size=9 live_size=11 reason=\"opaque: the bytes differ\""),
+        "{}",
+        planned.stdout
+    );
+    // Nothing landed, merged, made or recorded.
+    assert_eq!(tree_files(&dst_home), before);
+    assert!(!dst_claude.join("projects").exists());
+    assert!(!state.join("pull").join("claude").exists());
+}
+
+/// Every name under `root` ending in `.LABEL`, the beside form (SPEC rule 3
+/// forbids it in a home).
+fn label_copies(root: &Path) -> Vec<String> {
+    let suffix = format!(".{LABEL}");
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            let name = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            if name.ends_with(&suffix) {
+                found.push(name);
+            }
+            if fs::symlink_metadata(&path).unwrap().is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// SPEC rule 3 ("no beside copies"): `--beside` is gone from `copy` and
+/// `pull`, refused before anything is written, in either spelling.
+#[test]
+fn no_option_writes_a_label_copy_in_a_home() {
+    let base = std::env::temp_dir().join(format!("bulkload-move-nolabel-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    let world = World {
+        base: fs::canonicalize(&base).unwrap(),
+    };
+    let base = &world.base;
+    let (src, dst) = (base.join("src"), base.join("dst"));
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+    fs::write(src.join("settings.json"), b"{\"a\": 1}\n").unwrap();
+    fs::write(dst.join("settings.json"), b"{\"b\": 2}\n").unwrap();
+    let suffix = format!(".{LABEL}");
+    for flags in [
+        vec![OsString::from("--beside"), OsString::from(&suffix)],
+        vec![OsString::from(format!("--beside={suffix}"))],
+        vec![
+            OsString::from("--consolidate"),
+            OsString::from("--beside"),
+            OsString::from(&suffix),
+        ],
+    ] {
+        let mut args = vec![OsString::from("copy")];
+        args.extend(flags);
+        args.extend([
+            src.clone().into_os_string(),
+            dst.clone().into_os_string(),
+            base.join("src-state").into_os_string(),
+            base.join("dst-state").into_os_string(),
+        ]);
+        let ran = agent(&args);
+        assert!(!ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+        assert!(
+            ran.stderr.contains("FIELD_DOMAIN_VIOLATION"),
+            "{}",
+            ran.stderr
+        );
+    }
+    assert!(label_copies(&dst).is_empty());
+    assert_eq!(
+        fs::read(dst.join("settings.json")).unwrap(),
+        b"{\"b\": 2}\n"
+    );
+    assert!(!base.join("dst-state").exists());
 }

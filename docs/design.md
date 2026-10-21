@@ -341,20 +341,15 @@ same report, totals and gate:
   prints `basis: ruled-default` with the ruling;
 - one **covered** row per live `-wal`, `-shm` or `-journal` the source
   reported beside a database carried as a snapshot (`covered`, accounted);
-- one **applied-beside** row per seat a `copy` or `pull` with `--beside
-  SUFFIX` landed beside a differing live destination file (plan of record
-  2026-10-19, C1/C2; `applied-beside`, accounted and counted in
-  `applied_beside`, the row printing `beside`, the path it landed at).
-  Under the flag a file bulkload did not write is still adopted when its
-  bytes are the seat's and extended when it is a verified byte prefix
-  (M2r2 A-103); one with other bytes, a differing symlink and a database
-  with a live sidecar beside it land at `<path>SUFFIX` under the beside
-  path's own row, so a rerun reuses them reading nothing. A beside path
-  holding a foreign file with other bytes refuses `DESTINATION_OCCUPIED`;
-  only the store's own beside output is superseded (WP0(d)).
-  `estate-move --sessions` pulls both agent homes this way into the live
-  home, joins both records into its closure, and holds its gate on any
-  re-seat outcome that leaves a session not resumable (C9 to C11).
+- one **consolidated** row per seat a `copy` or `pull` with
+  `--consolidate` merged into, or found covered by, a differing live file
+  (operator ruling 2026-10-20; `consolidated`, accounted as `covered`, the
+  row printing `consolidation`: `consolidate` or `covered`). A seat whose
+  class has no union, or that its union cannot carry, is a typed
+  `HOMES_CONSOLIDATE_UNSUPPORTED` refusal row, pending review, with
+  nothing written. `--beside` on `copy` and `pull` is retired (SPEC rule
+  3, "no beside copies"): an **applied-beside** row of a record written
+  while it existed still decodes and stays accounted.
 
 A transfer row's identity (`item`, 64 hex) is a digest of the transfer's
 source (`SOURCE`, or `HOST:SOURCE` for `pull`), its destination, the path
