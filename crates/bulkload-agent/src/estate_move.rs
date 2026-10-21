@@ -744,6 +744,7 @@ impl Move {
             maps: bulkload_agent::consolidate::Maps::new(pairs),
             ledger: self.state.join("consolidate"),
             plan_only,
+            git: None,
         })
     }
 }
@@ -914,6 +915,7 @@ fn move_pass(run: &Move) -> Result<()> {
             ),
             ledger: run.state.join("consolidate"),
             plan_only: false,
+            git: None,
         })
     };
     let reach = estate::streamed::Reach {
@@ -1020,7 +1022,18 @@ fn move_pass(run: &Move) -> Result<()> {
                             .count()
                     };
                     estate::streamed::mark_converged(&private, &row.id)?;
-                    let (outcome, refusal) = if done.seats_held {
+                    if let Some((ours, theirs)) = &done.branches_held {
+                        out(&format!(
+                            "estate-move item={} branches=held destination={ours} source={theirs}",
+                            row.id
+                        ))?;
+                    }
+                    if let Some(branch) = &done.switched_to {
+                        out(&format!("estate-move item={} switched={branch}", row.id))?;
+                    }
+                    let (outcome, refusal) = if done.branches_held.is_some() {
+                        ("refused", Some(BulkloadRefusal::GitDestinationDiverged))
+                    } else if done.seats_held {
                         (
                             "refused",
                             Some(BulkloadRefusal::HomesConsolidateUnsupported),
@@ -1034,8 +1047,15 @@ fn move_pass(run: &Move) -> Result<()> {
                         &row.item,
                         outcome,
                         refusal.as_ref(),
-                        done.seats_held
-                            .then(|| "consolidated; differing seats held typed".to_owned()),
+                        if done.branches_held.is_some() {
+                            Some(
+                                "held: a different branch on each side, the destination not clean"
+                                    .to_owned(),
+                            )
+                        } else {
+                            done.seats_held
+                                .then(|| "consolidated; differing seats held typed".to_owned())
+                        },
                     )?;
                     if let Some(refusal) = refusal {
                         first_refusal.get_or_insert(refusal);
@@ -1043,7 +1063,7 @@ fn move_pass(run: &Move) -> Result<()> {
                     out(&format!(
                         "estate-move item={} outcome={} union=consolidated refs_created={} refs_forwarded={} refs_switched={} refs_tracked={} refs_kept={} stash_added={} reflog_added={} seats_held={} object_bytes={} fetch_ms={fetch_ms} land_ms={} live={place:?}",
                         row.id,
-                        if done.seats_held { "held" } else { outcome },
+                        if done.seats_held || done.branches_held.is_some() { "held" } else { outcome },
                         count("created"),
                         count("forwarded"),
                         count("switched"),
@@ -1055,7 +1075,7 @@ fn move_pass(run: &Move) -> Result<()> {
                         done.object_bytes,
                         started.elapsed().as_millis(),
                     ))?;
-                    if !done.seats_held {
+                    if !done.seats_held && done.branches_held.is_none() {
                         landed.push(row.id.clone());
                     }
                 }

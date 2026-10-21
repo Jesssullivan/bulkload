@@ -24,6 +24,7 @@ use std::path::Path;
 pub mod config;
 pub mod json;
 pub mod ledger;
+pub mod merge3;
 pub mod toml;
 pub mod value;
 

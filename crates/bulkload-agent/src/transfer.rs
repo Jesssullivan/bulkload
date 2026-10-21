@@ -1353,6 +1353,10 @@ pub struct Consolidation {
     /// `--plan-only`: every seat is decided and reported
     /// ([`TransferStats::planned`]); nothing is staged, written or recorded.
     pub plan_only: bool,
+    /// A Git worktree's consolidation (B2): every file both sides hold
+    /// differently takes Git's three-way merge against this merge base,
+    /// in place of its class's union.
+    pub git: Option<crate::consolidate::merge3::Base>,
 }
 
 static CONSOLIDATE: Mutex<Option<Arc<Consolidation>>> = Mutex::new(None);
@@ -7588,6 +7592,30 @@ impl<W: Write> Inbound<'_, W> {
             .flatten()
             .and_then(|(file, _)| file.metadata().ok())
             .map(|found| StatIdentity::from_metadata(&found));
+        // A Git worktree (B2): Git's three-way merge against the merge base,
+        // whatever the file's class.
+        if let Some(base) = &settings.git {
+            let name = row
+                .rel_path
+                .rsplit(|byte| *byte == b'/')
+                .next()
+                .unwrap_or(&row.rel_path);
+            let live_path = self
+                .target
+                .path()
+                .join(std::ffi::OsStr::from_bytes(&row.rel_path));
+            let outcome = crate::consolidate::merge3::union(
+                &crate::consolidate::Live {
+                    dir: parent,
+                    name,
+                    path: &live_path,
+                    rel: &row.rel_path,
+                },
+                bytes,
+                base,
+            )?;
+            return Ok((outcome, before));
+        }
         let Some(union) = crate::consolidate::union_of(class) else {
             let reason = if class == crate::consolidate::Class::Sqlite {
                 SQLITE_PENDING

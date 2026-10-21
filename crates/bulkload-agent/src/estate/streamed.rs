@@ -64,6 +64,10 @@ pub struct ItemSnapshot {
     /// The item's index, as read: written at its live index by a landing
     /// and compared by entries on later passes (never by the engine).
     pub index: Option<Vec<u8>>,
+    /// The item's checked-out branch (`refs/heads/NAME`; `None` detached)
+    /// and HEAD's commit: what a consolidation switches to when clean.
+    pub head_branch: Option<String>,
+    pub head: String,
 }
 
 impl ItemSnapshot {
@@ -176,6 +180,7 @@ pub fn capture_source(
     excluded.dedup();
     // The item's own index (a linked worktree's lives in the main's
     // administration): carried and settled apart from the seats.
+    let (head_branch, head) = crate::git_carry::union::head(source)?;
     let index_path = PathBuf::from(crate::git_carry::git_path(source, "index")?);
     let index = match fs::read(&index_path) {
         Ok(bytes) => Some(bytes),
@@ -208,6 +213,8 @@ pub fn capture_source(
         started_ns,
         history: stream::history(source)?,
         index,
+        head_branch,
+        head,
     })
 }
 
@@ -475,6 +482,12 @@ pub struct Converged {
     /// The seat transfer held paths it could not union (typed in its
     /// record): the item is not consolidated whole.
     pub seats_held: bool,
+    /// The destination's checkout was switched to the source's branch.
+    pub switched_to: Option<String>,
+    /// The two sides have different branches checked out and the
+    /// destination's tree is not clean (or the source's branch is not the
+    /// destination's at its tip): held typed, both listed, no seat landed.
+    pub branches_held: Option<(String, String)>,
 }
 
 /// Consolidate `snapshot`'s item into a related repository at its live path.
@@ -514,13 +527,43 @@ pub fn converge(
         done.reflog_added = union::reflogs(&live, &snapshot.history.reflogs, &done.refs)?;
     }
     if item.workspace.is_some() {
+        // A different branch on each side (the GloriousFlywheel case): the
+        // destination switches to the source's when its tree is clean and
+        // that branch is the source's at its tip; else held, both listed.
+        let (dest_branch, _) = union::head(&live)?;
+        if let Some(theirs) = &snapshot.head_branch {
+            if dest_branch.as_deref() != Some(theirs.as_str()) {
+                let tip = union::value(&live, theirs)?;
+                if union::is_clean(&live)? && tip.as_deref() == Some(snapshot.head.as_str()) {
+                    union::switch(&live, theirs)?;
+                    done.switched_to = Some(theirs.clone());
+                } else {
+                    done.branches_held = Some((
+                        dest_branch.unwrap_or_else(|| "HEAD (detached)".to_owned()),
+                        theirs.clone(),
+                    ));
+                    return Ok(done);
+                }
+            }
+        }
+        // Each file both sides changed merges three-way against the merge
+        // base of the two HEADs.
+        let (_, ours) = union::head(&live)?;
+        let mut settings = (reach.consolidation)()?;
+        if let Some(commit) = union::merge_base(&live, &ours, &snapshot.head)? {
+            settings.git = Some(crate::consolidate::merge3::Base {
+                repo: live.clone(),
+                commit,
+                scratch: reach.scratch.to_path_buf(),
+            });
+        }
         // The destination's administration is its own: nothing of the
         // source's `.git` lands here.
         let mut excluded = snapshot.excluded.clone();
         excluded.push(b".git".to_vec());
         let root = fs::canonicalize(&live).refuse_at(SITE)?;
         crate::transfer::set_excluded(&root, Some(excluded));
-        crate::transfer::set_consolidate_for(&root, Some(Some((reach.consolidation)()?)));
+        crate::transfer::set_consolidate_for(&root, Some(Some(settings)));
         let moved = (reach.transfer)(&item.source, &live);
         crate::transfer::set_consolidate_for(&root, None);
         crate::transfer::set_excluded(&root, None);

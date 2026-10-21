@@ -317,7 +317,7 @@ pub fn union(live: &Live<'_>, source: &Source<'_>, ledger: &Ledger) -> Result<su
 }
 
 /// A read of the live file.
-enum Read {
+pub(crate) enum Read {
     Absent,
     /// A writer changed it while it was read.
     Changed,
@@ -325,7 +325,7 @@ enum Read {
 }
 
 /// The live file's identity and bytes.
-fn read_live(dir: &File, name: &CStr) -> Result<Read> {
+pub(crate) fn read_live(dir: &File, name: &CStr) -> Result<Read> {
     let fd = match sys::open_read_at(dir, name) {
         Ok(fd) => fd,
         Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(Read::Absent),
@@ -372,7 +372,13 @@ fn temp_name(name: &CStr, attempt: usize) -> Result<CString> {
 /// Write `bytes` under a private name, durable, then trade it for the live
 /// file if the live file is still `stat`. `false`: a writer changed it, the
 /// trade is undone (or never made) and nothing of this attempt remains.
-fn swap_in(dir: &File, name: &CStr, stat: &Stat, bytes: &[u8], attempt: usize) -> Result<bool> {
+pub(crate) fn swap_in(
+    dir: &File,
+    name: &CStr,
+    stat: &Stat,
+    bytes: &[u8],
+    attempt: usize,
+) -> Result<bool> {
     let temp = temp_name(name, attempt)?;
     let file = File::from(
         sys::create_excl_at(dir.as_fd(), &temp, stat.mode & 0o7777)

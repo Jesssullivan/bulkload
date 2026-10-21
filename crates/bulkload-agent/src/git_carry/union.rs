@@ -344,6 +344,140 @@ pub fn index_entries(worktree: &Path, index: &Path) -> Result<[u8; 32]> {
     Ok(*blake3::hash(&listed).as_bytes())
 }
 
+/// `repo`'s checked-out branch (`refs/heads/NAME`), or `None` for a
+/// detached HEAD; and HEAD's commit (empty when unborn).
+///
+/// # Errors
+/// A Git child's refusal.
+pub fn head(repo: &Path) -> Result<(Option<String>, String)> {
+    let symbolic = git(repo)
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .output()
+        .refuse_at(SITE)?;
+    let branch = symbolic
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&symbolic.stdout).trim().to_owned());
+    let commit = git(repo)
+        .args(["rev-parse", "--verify", "-q", "HEAD"])
+        .output()
+        .refuse_at(SITE)?;
+    Ok((
+        branch,
+        String::from_utf8_lossy(&commit.stdout).trim().to_owned(),
+    ))
+}
+
+/// The value of the ref `name` in `repo`, if it exists.
+///
+/// # Errors
+/// A Git child's refusal.
+pub fn value(repo: &Path, name: &str) -> Result<Option<String>> {
+    Ok(values(repo)?.remove(name))
+}
+
+/// Whether `worktree`'s tracked files are clean (untracked files aside).
+///
+/// # Errors
+/// A Git child's refusal.
+pub fn is_clean(worktree: &Path) -> Result<bool> {
+    clean(worktree)
+}
+
+/// Switch the clean `worktree` to `branch` (`refs/heads/NAME`): its HEAD,
+/// index and files ("switch when clean", the operator's ruling).
+///
+/// # Errors
+/// A Git child's refusal.
+pub fn switch(worktree: &Path, branch: &str) -> Result<()> {
+    let name = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+    let mut command = git(worktree);
+    durable(&mut command);
+    output(command.args(["checkout", "--quiet", name])).map(drop)
+}
+
+/// The blob at `commit:rel` in `repo`, if the commit's tree holds a file
+/// there.
+///
+/// # Errors
+/// A Git child's refusal other than "no such path".
+pub fn blob_at(repo: &Path, commit: &str, rel: &[u8]) -> Result<Option<Vec<u8>>> {
+    use std::os::unix::ffi::OsStringExt as _;
+    let mut spec = format!("{commit}:").into_bytes();
+    spec.extend_from_slice(rel);
+    let ran = git(repo)
+        .args(["cat-file", "blob"])
+        .arg(std::ffi::OsString::from_vec(spec))
+        .output()
+        .refuse_at(SITE)?;
+    if ran.status.success() {
+        Ok(Some(ran.stdout))
+    } else if ran.status.code() == Some(128) {
+        Ok(None)
+    } else {
+        Err(super::estimate::child_failed(&ran.stderr))
+    }
+}
+
+/// Git's three-way merge of `ours` and `theirs` against `base`
+/// (`merge-file -p`), its inputs written apart under `scratch` and removed:
+/// the merged bytes, or `None` when a hunk conflicts.
+///
+/// # Errors
+/// IO; a Git child's failure.
+pub fn merge_file(
+    scratch: &Path,
+    base: &[u8],
+    ours: &[u8],
+    theirs: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fs::create_dir_all(scratch).refuse_at(SITE)?;
+    let at = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let paths: Vec<PathBuf> = ["ours", "base", "theirs"]
+        .iter()
+        .map(|side| scratch.join(format!("merge-{}-{at}.{side}", std::process::id())))
+        .collect();
+    let cleanup = |paths: &[PathBuf]| {
+        for path in paths {
+            let _ = fs::remove_file(path);
+        }
+    };
+    for (path, bytes) in paths.iter().zip([ours, base, theirs]) {
+        if let Err(error) = fs::write(path, bytes) {
+            cleanup(&paths);
+            return Err(crate::refuse::io(&error, SITE));
+        }
+    }
+    let ran = git(scratch)
+        .args(["merge-file", "-p", "-q"])
+        .args(&paths)
+        .output();
+    cleanup(&paths);
+    let ran = ran.refuse_at(SITE)?;
+    match ran.status.code() {
+        Some(0) => Ok(Some(ran.stdout)),
+        Some(code) if (1..=127).contains(&code) => Ok(None),
+        _ => Err(super::estimate::child_failed(&ran.stderr)),
+    }
+}
+
+/// The merge base of `ours` and `theirs` in `repo`, if they share history.
+///
+/// # Errors
+/// A Git child's refusal.
+pub fn merge_base(repo: &Path, ours: &str, theirs: &str) -> Result<Option<String>> {
+    let ran = git(repo)
+        .args(["merge-base", ours, theirs])
+        .output()
+        .refuse_at(SITE)?;
+    match ran.status.code() {
+        Some(0) => Ok(Some(String::from_utf8_lossy(&ran.stdout).trim().to_owned())),
+        Some(1) => Ok(None),
+        _ => Err(super::estimate::child_failed(&ran.stderr)),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
@@ -367,5 +501,28 @@ mod tests {
             tracking_name("refs/notes/commits", "neo"),
             "refs/remotes/neo/notes/commits"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod merge_tests {
+    use super::*;
+
+    #[test]
+    fn a_clean_three_way_merge_and_a_conflict() {
+        let scratch = std::env::temp_dir().join(format!("bulkload-merge3-{}", std::process::id()));
+        let base = b"one\ntwo\nthree\nfour\nfive\n";
+        let ours = b"ONE\ntwo\nthree\nfour\nfive\n";
+        let theirs = b"one\ntwo\nthree\nfour\nFIVE\n";
+        assert_eq!(
+            merge_file(&scratch, base, ours, theirs).unwrap().unwrap(),
+            b"ONE\ntwo\nthree\nfour\nFIVE\n".to_vec()
+        );
+        let clash = b"uno\ntwo\nthree\nfour\nfive\n";
+        assert_eq!(merge_file(&scratch, base, ours, clash).unwrap(), None);
+        // The inputs written apart are gone.
+        assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0);
+        let _ = fs::remove_dir_all(&scratch);
     }
 }
