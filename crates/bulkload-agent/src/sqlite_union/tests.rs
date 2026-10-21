@@ -1078,6 +1078,7 @@ fn a_consolidating_copy_routes_each_store_to_the_row_union_state_first() {
         )]),
         ledger: dest_state.join("consolidate"),
         plan_only: false,
+        archived: Vec::new(),
     };
     let root = dest_root.canonicalize().unwrap();
     crate::transfer::set_consolidate_for(&root, Some(Some(settings.clone())));
