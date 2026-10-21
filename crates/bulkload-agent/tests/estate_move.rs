@@ -3536,15 +3536,30 @@ fn a_copy_beside_the_live_path_is_consolidated_and_removed() {
     let dup = world.dst().join("p.neo-20261016");
     git(
         &world.dst(),
-        &["clone", "--quiet", "--template=", live.to_str().unwrap(), "p.neo-20261016"],
+        &[
+            "clone",
+            "--quiet",
+            "--template=",
+            live.to_str().unwrap(),
+            "p.neo-20261016",
+        ],
     );
     git(&dup, &["remote", "remove", "origin"]);
     git(&dup, &["checkout", "--quiet", "-b", "only-in-copy"]);
-    git(&dup, &["commit", "--quiet", "--allow-empty", "-m", "copy work"]);
+    git(
+        &dup,
+        &["commit", "--quiet", "--allow-empty", "-m", "copy work"],
+    );
     let copy_work = out(&dup, &["rev-parse", "HEAD"]);
     git(&dup, &["checkout", "--quiet", "main"]);
-    git(&dup, &["commit", "--quiet", "--allow-empty", "-m", "copy main"]);
-    git(&live, &["commit", "--quiet", "--allow-empty", "-m", "live main"]);
+    git(
+        &dup,
+        &["commit", "--quiet", "--allow-empty", "-m", "copy main"],
+    );
+    git(
+        &live,
+        &["commit", "--quiet", "--allow-empty", "-m", "live main"],
+    );
     let live_main = out(&live, &["rev-parse", "main"]);
     let copy_main = out(&dup, &["rev-parse", "main"]);
     fs::write(dup.join("f.txt"), "one\ntwo\nthree\nfour\nFIVE copy\n").unwrap();
@@ -3552,7 +3567,13 @@ fn a_copy_beside_the_live_path_is_consolidated_and_removed() {
     let held = world.dst().join("p.sting-1015");
     git(
         &world.dst(),
-        &["clone", "--quiet", "--template=", live.to_str().unwrap(), "p.sting-1015"],
+        &[
+            "clone",
+            "--quiet",
+            "--template=",
+            live.to_str().unwrap(),
+            "p.sting-1015",
+        ],
     );
     git(&held, &["remote", "remove", "origin"]);
     fs::write(held.join("f.txt"), "ONE held\ntwo\nthree\nfour\nfive\n").unwrap();
@@ -3567,7 +3588,10 @@ fn a_copy_beside_the_live_path_is_consolidated_and_removed() {
         "{both}"
     );
     assert!(!dup.exists(), "{both}");
-    assert_eq!(out(&live, &["rev-parse", "refs/heads/only-in-copy"]), copy_work);
+    assert_eq!(
+        out(&live, &["rev-parse", "refs/heads/only-in-copy"]),
+        copy_work
+    );
     assert_eq!(out(&live, &["rev-parse", "main"]), live_main, "{both}");
     assert_eq!(
         out(&live, &["rev-parse", "refs/remotes/neo-20261016/main"]),
@@ -3580,8 +3604,10 @@ fn a_copy_beside_the_live_path_is_consolidated_and_removed() {
         "{both}"
     );
     assert!(
-        moved.stdout.lines().any(|line| line.contains("p.sting-1015")
-            && line.contains("outcome=held")),
+        moved
+            .stdout
+            .lines()
+            .any(|line| line.contains("p.sting-1015") && line.contains("outcome=held")),
         "{both}"
     );
     assert!(held.join("f.txt").is_file(), "the conflicting copy is kept");
