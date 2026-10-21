@@ -157,21 +157,24 @@ pub struct Live<'a> {
     pub rel: &'a [u8],
 }
 
-/// The source's version of the file: a private, unpublished file the
-/// receive staged in the live file's directory (never at a published path,
-/// and removed once the union returns).
+/// The source's version of the file, as the receive gathered it.
+///
+/// Its bytes are in memory, never staged on disk on either machine (SPEC
+/// rule 2), and dropped once the union returns. A file over
+/// [`IN_MEMORY_LIMIT`] is never gathered: it is held.
 #[derive(Clone, Copy)]
 pub struct Source<'a> {
-    pub file: &'a File,
-    /// Its path, for a union that must open it by path (`SQLite`).
-    pub path: &'a Path,
-    pub size: u64,
+    pub bytes: &'a [u8],
     /// The source's modification time: a value both sides hold differently
     /// takes the side modified last.
     pub mtime_ns: i128,
     /// The `--map` set: a source host path is the destination's.
     pub maps: &'a Maps,
 }
+
+/// The largest file the receive gathers in memory for a union (64 MiB); a
+/// larger one is held typed, so a big file never balloons memory.
+pub const IN_MEMORY_LIMIT: u64 = 64 << 20;
 
 /// What a [`Union`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,9 +223,9 @@ pub fn opaque(live: &Live<'_>, source: &Source<'_>, _ledger: &Ledger) -> crate::
     let fd = crate::io::sys::open_read_at(live.dir, &name).refuse_at("consolidate::opaque")?;
     let held = File::from(fd);
     let stat = crate::io::sys::fstat(&held).refuse_at("consolidate::opaque")?;
-    let same = stat.is_file()
-        && stat.size == source.size
-        && crate::transfer::same_bytes(&held, source.file, source.size)?;
+    let mut live = vec![0_u8; usize::try_from(stat.size).unwrap_or(0)];
+    let read = crate::io::sys::pread_full(&held, &mut live, 0).refuse_at("consolidate::opaque")?;
+    let same = stat.is_file() && read as u64 == stat.size && live.as_slice() == source.bytes;
     Ok(Outcome {
         action: if same {
             Action::Adopted

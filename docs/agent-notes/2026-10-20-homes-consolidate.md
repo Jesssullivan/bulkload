@@ -136,13 +136,17 @@ that differs from the seat is decided by its class
 | append log, holds the seat's bytes as its first bytes | `covered`, nothing written |
 | append log, a proven prefix of the seat's | extended in place (A-103) |
 | append log, diverged | held until the #294 union lands |
-| JSON or TOML | received **in memory** (`memfd`), merged by `config::union`, dropped |
+| JSON or TOML | gathered **in memory** (a `Vec<u8>`, at most 64 MiB, else held), merged by `config::union`, dropped |
 | SQLite store or sidecar | held at the decision (adjustment a) |
 | anything else | held |
 
 - **No payload copy (SPEC rule 2, adjustment b).** A config's received
-  bytes are never on disk: `Destination::stage_in_memory` fills a
-  `memfd_create` file. The only temp beside the live file is the union's
+  bytes are never on disk: `Plan::Gather` fills a plain `Vec<u8>` (local
+  chunks, then the wire), the same on Linux and Darwin, capped at
+  `consolidate::IN_MEMORY_LIMIT` (64 MiB; larger is held typed), so memory
+  never balloons (pzm review 2026-10-21 replaced the earlier `memfd`,
+  which Darwin lacks). The union's `Source` is those bytes. The only temp
+  beside the live file is the union's
   atomic-rename temp of the merged result, which the exchange swaps in.
   The tests check both:
   - no payload byte in MOVE_STATE or in the destination state;
@@ -244,8 +248,6 @@ go to this ledger (`Ledger::connection()`).
   that lost its manifest chunks) is staged as a stream is, on disk, before
   it is judged. That temp is removed after the merge or hold. It is the one
   path where rule 2's "no payload copy" holds only transiently.
-- On Darwin there is no `memfd`: a differing config is held typed there.
-  The homes destination is Linux.
 - With the Codex store held and no destination index, the re-seat refuses
   `RESEAT_INDEX_ABSENT` until the row union lands. Where the destination
   has an index, the source's rollouts are registered from their headers.
@@ -280,3 +282,15 @@ Items 1 and 3 with `--beside` removed, after the merge of main `c2da575`
 | `cargo clippy -p bulkload-agent --all-targets --locked -- -D warnings` | ok |
 | `cargo test -p bulkload-agent --locked` (full suite) | 1306 passed, 0 failed |
 | `cargo test -p bulkload-proto --locked` | 18 passed |
+
+Configs gathered in a `Vec<u8>` (memfd dropped), after the merge of main
+`6f2d33f`. Targeted tests only, per the coordinator's honey-load rule; the
+whole suite runs in the coordinator's merge gate:
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all -- --check` | ok |
+| `cargo clippy -p bulkload-agent --all-targets --locked -- -D warnings` | ok |
+| `--lib -- transfer:: consolidate:: closure:: materialize:: transfer_store::` | 255 passed |
+| `--test estate_move` | 7 passed |
+| `--test refusal_taxonomy`, `bulkload-proto` | 5, 18 passed |

@@ -18,13 +18,23 @@
 //!   line, counted. Both branches of a session continued on both hosts are
 //!   kept.
 //!
-//! An extension (the live file a prefix of the source's) appends the missing
-//! tail in place, to the same inode, through `O_APPEND`. A true union (the
-//! live file holds records the source lacks) is written under a private
-//! name, made durable and traded in for the live file by
-//! [`super::config`]'s crash-safe trade, checked against the live file as
-//! read (a writer that changed it is merged again; one that changes it on
-//! every read is `HOMES_CONSOLIDATE_RACED`). A live file a
+//! Nothing is held wholly in memory (a transcript can be over 100 MB, and
+//! passes run in parallel): the comparison streams both files, a record's
+//! identity is kept as its BLAKE3, and the output is written by streaming.
+//! - **Extension** (the live file a prefix of the source's): the missing
+//!   tail is streamed onto the same inode through `O_APPEND`.
+//! - **Union** (the live file holds records the source lacks): the source's
+//!   bytes are the output's head. The receive streams the wire straight
+//!   into the result's private temporary in the live file's directory
+//!   ([`Feed::Staged`]); a fold copies its source there. The live file's
+//!   extra records are appended, and the temporary is made durable and
+//!   traded in for the live file, checked against the live file as read (a
+//!   writer that changed it is merged again; one that changes it on every
+//!   read is `HOMES_CONSOLIDATE_RACED`).
+//! - **Covered and equal** are decided by the streamed comparison: nothing
+//!   is written.
+//!
+//! A live file a
 //! process holds open ([`crate::procs::inside`], or where that cannot be
 //! said) or that ends inside a line (a writer at it) is
 //! `HOMES_CONSOLIDATE_RACED` too, retryable, nothing written: a writer's
@@ -33,11 +43,13 @@
 //! inputs' and the output's BLAKE3, the record counts) once its bytes are
 //! durable.
 
-use std::ffi::CStr;
+use std::collections::{HashMap, HashSet};
+use std::ffi::{CStr, CString};
 use std::fs::File;
+use std::os::fd::AsFd as _;
 use std::path::Path;
 
-use super::config::{self, Target};
+use super::config;
 use super::{Action, Ledger, Live, Outcome, Source};
 use crate::io::{self, sys, Stat};
 use crate::refuse::RefuseAt as _;
@@ -150,8 +162,273 @@ pub fn plan_at(rel: &[u8], live: &[u8], source: &[u8]) -> Plan {
     })
 }
 
-/// The append-log [`super::Union`]: merge `source` into `live` and trade the
-/// union in, crash-safely (see the module).
+/// Where a streaming union's source bytes are.
+#[derive(Clone, Copy)]
+pub enum Feed<'a> {
+    /// The receive's staged file: a private temporary in the live file's
+    /// directory, `name` there, holding the source's bytes. A union is
+    /// written into it (its extra records appended) and it is traded in, so
+    /// the source's bytes are never copied a second time. It is the caller's
+    /// to discard after.
+    Staged { file: &'a File, name: &'a CStr },
+    /// An existing file (a fold's source): copied into a private temporary
+    /// only when a union is written.
+    File(&'a File),
+    /// Bytes in memory (#297's [`Source`]).
+    Bytes(&'a [u8]),
+}
+
+impl Feed<'_> {
+    fn read_at(&self, buffer: &mut [u8], at: u64) -> Result<usize> {
+        match self {
+            Self::Staged { file, .. } | Self::File(file) => {
+                sys::pread_full(*file, buffer, at).refuse_at(SITE)
+            }
+            Self::Bytes(bytes) => {
+                let start = usize::try_from(at).unwrap_or(usize::MAX).min(bytes.len());
+                let piece = bytes.get(start..).unwrap_or_default();
+                let length = piece.len().min(buffer.len());
+                if let (Some(to), Some(from)) = (buffer.get_mut(..length), piece.get(..length)) {
+                    to.copy_from_slice(from);
+                }
+                Ok(length)
+            }
+        }
+    }
+}
+
+/// Bytes read per step.
+const PIECE: usize = 1 << 20;
+
+/// A positioned read of one side: bytes into the buffer from an offset.
+type ReadAt<'a> = &'a dyn Fn(&mut [u8], u64) -> Result<usize>;
+
+/// Read `[at, end)` of `read` piece by piece.
+fn pieces(
+    read: &dyn Fn(&mut [u8], u64) -> Result<usize>,
+    (mut at, end): (u64, u64),
+    each: &mut dyn FnMut(u64, &[u8]) -> Result<()>,
+) -> Result<()> {
+    let mut buffer = vec![0_u8; PIECE];
+    while at < end {
+        let want = usize::try_from(end - at).unwrap_or(PIECE).min(PIECE);
+        let slot = buffer.get_mut(..want).unwrap_or_default();
+        let got = read(slot, at)?;
+        if got == 0 {
+            return Err(BulkloadRefusal::HomesConsolidateRaced);
+        }
+        each(at, slot.get(..got).unwrap_or_default())?;
+        at += got as u64;
+    }
+    Ok(())
+}
+
+/// Every line of `[from, end)`, with its offset.
+fn lines(
+    read: &dyn Fn(&mut [u8], u64) -> Result<usize>,
+    (from, end): (u64, u64),
+    each: &mut dyn FnMut(u64, &[u8]) -> Result<()>,
+) -> Result<()> {
+    let mut carry: Vec<u8> = Vec::new();
+    let mut start = from;
+    pieces(read, (from, end), &mut |_, piece| {
+        let mut rest = piece;
+        while let Some(at) = rest.iter().position(|byte| *byte == b'\n') {
+            let (line, after) = rest.split_at(at + 1);
+            carry.extend_from_slice(line);
+            each(start, &carry)?;
+            start += carry.len() as u64;
+            carry.clear();
+            rest = after;
+        }
+        carry.extend_from_slice(rest);
+        Ok(())
+    })?;
+    if !carry.is_empty() {
+        each(start, &carry)?;
+    }
+    Ok(())
+}
+
+/// A record's identity: its `uuid` (keyed logs), else its exact line.
+enum Id {
+    Uuid([u8; 32]),
+    Line([u8; 32]),
+}
+
+fn id(line: &[u8], keyed: bool) -> Id {
+    keyed
+        .then(|| crate::reseat::json::nested_string(line, &["uuid"]))
+        .flatten()
+        .map_or_else(
+            || Id::Line(*blake3::hash(line).as_bytes()),
+            |uuid| Id::Uuid(*blake3::hash(uuid.as_bytes()).as_bytes()),
+        )
+}
+
+/// One side's records: every `uuid`, and the exact lines past the common
+/// prefix, counted.
+#[derive(Default)]
+struct Records {
+    uuids: HashSet<[u8; 32]>,
+    lines: HashMap<[u8; 32], u64>,
+    count: u64,
+}
+
+impl Records {
+    fn of(
+        read: &dyn Fn(&mut [u8], u64) -> Result<usize>,
+        size: u64,
+        common: u64,
+        keyed: bool,
+    ) -> Result<Self> {
+        let mut records = Self::default();
+        lines(read, (0, size), &mut |at, line| {
+            records.count += 1;
+            match id(line, keyed) {
+                Id::Uuid(uuid) => {
+                    records.uuids.insert(uuid);
+                }
+                Id::Line(line) if at >= common => *records.lines.entry(line).or_default() += 1,
+                Id::Line(_) => {}
+            }
+            Ok(())
+        })?;
+        Ok(records)
+    }
+
+    /// Whether `line` (past the common prefix of the other side) is one of
+    /// these records; a counted line is taken.
+    fn holds(&mut self, line: &[u8], keyed: bool) -> bool {
+        match id(line, keyed) {
+            Id::Uuid(uuid) => self.uuids.contains(&uuid),
+            Id::Line(line) => match self.lines.get_mut(&line) {
+                Some(count) if *count > 0 => {
+                    *count -= 1;
+                    true
+                }
+                _ => false,
+            },
+        }
+    }
+}
+
+/// What the streamed comparison decided.
+enum Decided {
+    Adopted,
+    Covered,
+    Extended,
+    /// The live file's records past `common` the source lacks, as `(offset,
+    /// length)`, with the counts.
+    Union {
+        keep: Vec<(u64, u64)>,
+        source_records: u64,
+    },
+}
+
+/// Compare the live file and the source, streaming (see the module).
+/// `None`: either ends inside a line and neither holds the other.
+fn decide(
+    live: &dyn Fn(&mut [u8], u64) -> Result<usize>,
+    live_size: u64,
+    source: &dyn Fn(&mut [u8], u64) -> Result<usize>,
+    size: u64,
+    keyed: bool,
+) -> Result<Option<Decided>> {
+    // The common prefix, and its last line end.
+    let both = live_size.min(size);
+    let (mut shared, mut cut) = (0_u64, 0_u64);
+    let mut other = vec![0_u8; PIECE];
+    let mut differs = false;
+    pieces(source, (0, both), &mut |at, piece| {
+        if differs {
+            return Ok(());
+        }
+        let theirs = other.get_mut(..piece.len()).unwrap_or_default();
+        if live(theirs, at)? != piece.len() {
+            return Err(BulkloadRefusal::HomesConsolidateRaced);
+        }
+        let same = piece
+            .iter()
+            .zip(theirs.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(piece.len());
+        if let Some(nl) = piece
+            .get(..same)
+            .and_then(|head| head.iter().rposition(|byte| *byte == b'\n'))
+        {
+            cut = at + nl as u64 + 1;
+        }
+        shared = at + same as u64;
+        differs = same < piece.len();
+        Ok(())
+    })?;
+    if shared == size && live_size == size {
+        return Ok(Some(Decided::Adopted));
+    }
+    if shared == size {
+        return Ok(Some(Decided::Covered));
+    }
+    let ends_whole =
+        |read: &dyn Fn(&mut [u8], u64) -> Result<usize>, length: u64| -> Result<bool> {
+            if length == 0 {
+                return Ok(true);
+            }
+            let mut byte = [0_u8; 1];
+            Ok(read(&mut byte, length - 1)? == 1 && byte == [b'\n'])
+        };
+    if !ends_whole(live, live_size)? || !ends_whole(source, size)? {
+        return Ok(None);
+    }
+    if shared == live_size {
+        return Ok(Some(Decided::Extended));
+    }
+    // Every source record already held: covered.
+    let mut held = Records::of(live, live_size, cut, keyed)?;
+    let mut lacking = false;
+    lines(source, (cut, size), &mut |_, line| {
+        lacking = lacking || !held.holds(line, keyed);
+        Ok(())
+    })?;
+    if !lacking {
+        return Ok(Some(Decided::Covered));
+    }
+    drop(held);
+    let mut offered = Records::of(source, size, cut, keyed)?;
+    let mut keep = Vec::new();
+    let mut kept: HashSet<[u8; 32]> = HashSet::new();
+    lines(live, (cut, live_size), &mut |at, line| {
+        let new = match id(line, keyed) {
+            Id::Uuid(uuid) => !offered.uuids.contains(&uuid) && kept.insert(uuid),
+            Id::Line(_) => !offered.holds(line, keyed),
+        };
+        if new {
+            keep.push((at, line.len() as u64));
+        }
+        Ok(())
+    })?;
+    Ok(Some(Decided::Union {
+        keep,
+        source_records: offered.count,
+    }))
+}
+
+/// The append-log [`super::Union`] over #297's in-memory [`Source`] (a
+/// small file); the receive and the folds stream ([`union_stream`]).
+///
+/// # Errors
+/// As [`union_stream`].
+pub fn union(live: &Live<'_>, source: &Source<'_>, ledger: &Ledger) -> Result<Outcome> {
+    union_stream(
+        live,
+        Feed::Bytes(source.bytes),
+        source.bytes.len() as u64,
+        ledger,
+    )
+}
+
+/// Merge the source (`feed`, `size` bytes) into the live append log, by
+/// streaming (see the module).
 ///
 /// # Errors
 /// - `HOMES_CONSOLIDATE_RACED`: a process holds the live file open (or this
@@ -160,90 +437,276 @@ pub fn plan_at(rel: &[u8], live: &[u8], source: &[u8]) -> Plan {
 /// - `DESTINATION_KIND_MISMATCH` for a live name that is no regular file (a
 ///   link is never followed); `PATH_ESCAPES_ROOT` for another user's file;
 ///   `DESTINATION_EXCHANGE_UNSUPPORTED` where two names cannot be traded.
-/// - `SOURCE_CHANGED_AFTER_SNAPSHOT` for a staged source that reads short;
-///   the I/O and ledger refusals.
-pub fn union(live: &Live<'_>, source: &Source<'_>, ledger: &Ledger) -> Result<Outcome> {
-    let held = |reason| {
-        Ok(Outcome {
-            action: Action::Held(reason),
-            written: 0,
-            recorded: 0,
-        })
-    };
-    if source.size > SIZE_LIMIT {
-        return held("append-log: over the size limit");
-    }
-    let offered = read_source(source)?;
+/// - The I/O and ledger refusals.
+pub fn union_stream(
+    live: &Live<'_>,
+    feed: Feed<'_>,
+    size: u64,
+    ledger: &Ledger,
+) -> Result<Outcome> {
     let name = io::c_name(live.name).refuse_at(SITE)?;
     let keyed = by_uuid(live.rel);
-    for attempt in 1..=config::ATTEMPTS {
-        let (stat, bytes) = match read_live(live.dir, &name)? {
-            Read::Absent => {
-                let target = Target {
-                    dir: live.dir,
-                    name: live.name,
-                    rel: live.rel,
-                };
-                let created = config::create(&target, &name, &offered, attempt)?;
-                return Ok(Outcome {
-                    action: created.action,
-                    written: created.written,
-                    recorded: 0,
-                });
+    let source = |buffer: &mut [u8], at: u64| feed.read_at(buffer, at);
+    for _attempt in 1..=config::ATTEMPTS {
+        let file = match sys::open_read_at(live.dir, &name) {
+            Ok(fd) => File::from(fd),
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                return create(live, &name, feed, size);
             }
-            Read::Over => return held("append-log: over the size limit"),
-            Read::Changed => continue,
-            Read::Live(stat, bytes) => (stat, bytes),
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                return Err(BulkloadRefusal::DestinationKindMismatch);
+            }
+            Err(error) => return Err(error).refuse_at(SITE),
         };
-        let Some(plan) = plan(&bytes, &offered, keyed) else {
+        let stat = sys::fstat(&file).refuse_at(SITE)?;
+        check_own(&stat)?;
+        let read_live =
+            |buffer: &mut [u8], at: u64| sys::pread_full(&file, buffer, at).refuse_at(SITE);
+        let Some(decided) = decide(&read_live, stat.size, &source, size, keyed)? else {
             return Err(BulkloadRefusal::HomesConsolidateRaced);
         };
-        let Some(output) = plan.bytes.as_deref() else {
-            return Ok(Outcome {
-                action: plan.action,
-                written: 0,
-                recorded: 0,
-            });
-        };
-        if !free(live.path)? {
-            return Err(BulkloadRefusal::HomesConsolidateRaced);
-        }
-        if plan.action == Action::Extended {
-            // SPEC: the missing tail is appended in place. The same inode,
-            // so a writer's open handle never writes into a file traded out.
-            let tail = output.get(bytes.len()..).unwrap_or_default();
-            if append_tail(live.dir, &name, &stat, tail)? {
-                record(ledger, live.rel, &plan, (&bytes, &offered, output))?;
-                return Ok(Outcome {
-                    action: plan.action,
-                    written: tail.len() as u64,
-                    recorded: 1,
-                });
-            }
+        let after = sys::fstat(&file).refuse_at(SITE)?;
+        if after.size != stat.size || after.mtime_ns != stat.mtime_ns {
             continue;
         }
-        if config::swap_in(live.dir, &name, &stat, output, attempt)? {
-            record(ledger, live.rel, &plan, (&bytes, &offered, output))?;
-            return Ok(Outcome {
-                action: plan.action,
-                written: output.len() as u64,
-                recorded: 1,
-            });
+        let nothing = |action| Outcome {
+            action,
+            written: 0,
+            recorded: 0,
+        };
+        match decided {
+            Decided::Adopted => return Ok(nothing(Action::Adopted)),
+            Decided::Covered => return Ok(nothing(Action::Covered)),
+            Decided::Extended => {
+                if !free(live.path)? {
+                    return Err(BulkloadRefusal::HomesConsolidateRaced);
+                }
+                if append_tail(live.dir, &name, &stat, (&source, stat.size, size))? {
+                    // The live file now: the source's bytes, its own inode.
+                    record(
+                        ledger,
+                        live.rel,
+                        "extend",
+                        [(&read_live, stat.size), (&source, size), (&read_live, size)],
+                        (0, 0),
+                    )?;
+                    return Ok(Outcome {
+                        action: Action::Extended,
+                        written: size - stat.size,
+                        recorded: 1,
+                    });
+                }
+            }
+            Decided::Union {
+                keep,
+                source_records,
+            } => {
+                if !free(live.path)? {
+                    return Err(BulkloadRefusal::HomesConsolidateRaced);
+                }
+                let extra: u64 = keep.iter().map(|(_, length)| length).sum();
+                let output = Output::open(live.dir, live.name, feed, (size, &source))?;
+                let wrote = output.append(&read_live, &keep, size);
+                if let Err(refusal) = wrote {
+                    output.discard(live.dir, size);
+                    return Err(refusal);
+                }
+                if output.trade(live.dir, &name, &stat)? {
+                    let made = |buffer: &mut [u8], at: u64| {
+                        sys::pread_full(&output.file, buffer, at).refuse_at(SITE)
+                    };
+                    record(
+                        ledger,
+                        live.rel,
+                        "consolidate",
+                        [
+                            (&read_live, stat.size),
+                            (&source, size),
+                            (&made, size + extra),
+                        ],
+                        (source_records, keep.len() as u64),
+                    )?;
+                    output.retire(live.dir)?;
+                    return Ok(Outcome {
+                        action: Action::Consolidated,
+                        written: size + extra,
+                        recorded: 1,
+                    });
+                }
+                output.discard(live.dir, size);
+            }
         }
     }
     Err(BulkloadRefusal::HomesConsolidateRaced)
 }
 
-/// Append `tail` to the live file in place, through `O_APPEND` (a byte a
-/// writer appended first is never written over), checked against the live
-/// file as read (`stat`) before the write and after it, then made durable.
-/// `false`: the file moved before the write, and nothing was written.
+/// This user's own regular file.
+fn check_own(stat: &Stat) -> Result<()> {
+    if !stat.is_file() {
+        return Err(BulkloadRefusal::DestinationKindMismatch);
+    }
+    if stat.uid != sys::effective_uid() {
+        return Err(BulkloadRefusal::PathEscapesRoot);
+    }
+    Ok(())
+}
+
+/// Land the source where the destination holds no such file, create-only:
+/// the staged file itself, or a durable copy.
+fn create(live: &Live<'_>, name: &CStr, feed: Feed<'_>, size: u64) -> Result<Outcome> {
+    let output = Output::open(
+        live.dir,
+        live.name,
+        feed,
+        (size, &|buffer: &mut [u8], at| feed.read_at(buffer, at)),
+    )?;
+    output.sync()?;
+    match io::publish_noreplace(live.dir, &output.name, name) {
+        Ok(_) => {}
+        Err(error) => {
+            output.discard(live.dir, size);
+            if error.raw_os_error() == Some(libc::EEXIST) {
+                return Err(BulkloadRefusal::HomesConsolidateRaced);
+            }
+            return Err(error).refuse_at(SITE);
+        }
+    }
+    live.dir.sync_all().refuse_at(SITE)?;
+    Ok(Outcome {
+        action: Action::Created,
+        written: size,
+        recorded: 0,
+    })
+}
+
+/// A union's output: the staged file the source was streamed into, or a
+/// private temporary holding a copy of the source.
+struct Output {
+    file: File,
+    name: CString,
+    /// Whether it is the receive's staged file (the caller's to discard).
+    staged: bool,
+}
+
+impl Output {
+    fn open(
+        dir: &File,
+        live_name: &[u8],
+        feed: Feed<'_>,
+        (size, source): (u64, ReadAt<'_>),
+    ) -> Result<Self> {
+        if let Feed::Staged { file, name } = feed {
+            let file = file.try_clone().refuse_at(SITE)?;
+            // The staged file holds the source's bytes and nothing past.
+            file.set_len(size).refuse_at(SITE)?;
+            return Ok(Self {
+                file,
+                name: name.to_owned(),
+                staged: true,
+            });
+        }
+        let mut temp = b".".to_vec();
+        temp.extend_from_slice(live_name);
+        temp.extend_from_slice(format!(".bulkload-union.{}", std::process::id()).as_bytes());
+        let name = io::c_name(&temp).refuse_at(SITE)?;
+        let file = File::from(sys::create_excl_at(dir.as_fd(), &name, 0o600).refuse_at(SITE)?);
+        let output = Self {
+            file,
+            name,
+            staged: false,
+        };
+        let copied = pieces(source, (0, size), &mut |at, piece| {
+            sys::pwrite_all(&output.file, piece, at).refuse_at(SITE)
+        });
+        if let Err(refusal) = copied {
+            output.discard(dir, size);
+            return Err(refusal);
+        }
+        Ok(output)
+    }
+
+    /// Append the live file's `keep` records after the source's `size`
+    /// bytes, then make it durable.
+    fn append(
+        &self,
+        live: &dyn Fn(&mut [u8], u64) -> Result<usize>,
+        keep: &[(u64, u64)],
+        size: u64,
+    ) -> Result<()> {
+        let mut at = size;
+        for (from, length) in keep {
+            pieces(live, (*from, from + length), &mut |_, piece| {
+                sys::pwrite_all(&self.file, piece, at).refuse_at(SITE)?;
+                at += piece.len() as u64;
+                Ok(())
+            })?;
+        }
+        self.sync()
+    }
+
+    fn sync(&self) -> Result<()> {
+        self.file.sync_all().refuse_at(SITE)
+    }
+
+    /// Trade it in for the live file if the live file is still `stat`;
+    /// `false` (traded back, or never traded): a writer changed it.
+    fn trade(&self, dir: &File, name: &CStr, stat: &Stat) -> Result<bool> {
+        let unchanged = |now: &Stat| {
+            now.node == stat.node && now.size == stat.size && now.mtime_ns == stat.mtime_ns
+        };
+        #[cfg(test)]
+        super::tests::before_swap(dir, name);
+        match sys::fstatat_nofollow(dir, name) {
+            Ok(now) if unchanged(&now) && now.ctime_ns == stat.ctime_ns => {}
+            Ok(_) | Err(_) => return Ok(false),
+        }
+        if let Err(error) = io::exchange(dir, &self.name, name) {
+            if io::rename_unsupported(&error) {
+                return Err(BulkloadRefusal::DestinationExchangeUnsupported);
+            }
+            return Err(error).refuse_at(SITE);
+        }
+        let out = sys::fstatat_nofollow(dir, &self.name);
+        if !out.as_ref().is_ok_and(unchanged) {
+            io::exchange(dir, &self.name, name).refuse_at(SITE)?;
+            dir.sync_all().refuse_at(SITE)?;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// After a trade: the old live file, now under the output's name, goes.
+    fn retire(&self, dir: &File) -> Result<()> {
+        sys::unlinkat(dir, &self.name, false).refuse_at(SITE)?;
+        dir.sync_all().refuse_at(SITE)
+    }
+
+    /// Undo an output not traded in: a copy goes; the staged file is cut
+    /// back to the source's bytes (the caller discards it).
+    fn discard(&self, dir: &File, size: u64) {
+        if self.staged {
+            let _ = self.file.set_len(size);
+        } else {
+            let _ = sys::unlinkat(dir, &self.name, false);
+        }
+    }
+}
+
+/// Stream the source's `[from, to)` onto the live file in place, through
+/// `O_APPEND` (a byte a writer appended first is never written over),
+/// checked against the live file as read (`stat`) before and after, then
+/// made durable. `false`: the file moved before the write, nothing written.
 ///
 /// # Errors
 /// `HOMES_CONSOLIDATE_RACED` when a writer appended between the check and
-/// the write: both its bytes and the tail are in the file, in that order,
-/// and the next pass merges again. The I/O refusals.
-fn append_tail(dir: &File, name: &CStr, stat: &Stat, tail: &[u8]) -> Result<bool> {
+/// the write: both its bytes and the tail are in the file, and the next
+/// pass merges again. The I/O refusals.
+fn append_tail(
+    dir: &File,
+    name: &CStr,
+    stat: &Stat,
+    (source, from, to): (ReadAt<'_>, u64, u64),
+) -> Result<bool> {
     let fd = match sys::open_append_at(dir, name) {
         Ok(fd) => fd,
         Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
@@ -261,10 +724,15 @@ fn append_tail(dir: &File, name: &CStr, stat: &Stat, tail: &[u8]) -> Result<bool
     }
     #[cfg(test)]
     tests::before_append(&file);
-    sys::pwrite_all(&file, tail, stat.size).refuse_at(SITE)?;
+    let mut at = stat.size;
+    pieces(source, (from, to), &mut |_, piece| {
+        sys::pwrite_all(&file, piece, at).refuse_at(SITE)?;
+        at += piece.len() as u64;
+        Ok(())
+    })?;
     file.sync_all().refuse_at(SITE)?;
     let after = sys::fstat(&file).refuse_at(SITE)?;
-    if after.node != stat.node || after.size != stat.size + tail.len() as u64 {
+    if after.node != stat.node || after.size != stat.size + (to - from) {
         return Err(BulkloadRefusal::HomesConsolidateRaced);
     }
     Ok(true)
@@ -274,18 +742,15 @@ fn append_tail(dir: &File, name: &CStr, stat: &Stat, tail: &[u8]) -> Result<bool
 /// an archived file, regularized at the live name.
 ///
 /// SPEC; A-055, A-106, TIN-6587: `target`, the link's resolved target under
-/// an archive root, is the live file. The union of the source's bytes and the target's is
-/// written as a regular file at the live name in place of the link
-/// (regularized: Claude Code's picker lists regular files only). The archive
-/// file stays exactly as it is.
-///
-/// The target is read stable, held open by no process, and the union
-/// planned as [`union`] plans it (a target holding every source record
-/// keeps its own bytes; the live name still becomes a regular file). The
-/// file is written under a private name, made durable, and traded for the
-/// link only while the link (its identity and text) and the target are as
-/// read; what the trade took out must be that link, else it goes back. Then
-/// the link is removed. Ledgered once durable.
+/// an archive root, is the live file. The union (streamed, as
+/// [`union_stream`] decides it) is written as a regular file at the live
+/// name in place of the link, so Claude Code's picker lists it; the archive
+/// file stays exactly as it is. The target is held open by no process; the
+/// output is written under a private name (the receive's staged file when
+/// it holds the source), made durable, and traded for the link only while
+/// the link (its identity and text) and the target are as read; what the
+/// trade took out must be that link, else it goes back. Then the link is
+/// removed. Ledgered once durable.
 ///
 /// # Errors
 /// - `HOMES_CONSOLIDATE_RACED`: the target ends inside a line, a process
@@ -296,18 +761,10 @@ fn append_tail(dir: &File, name: &CStr, stat: &Stat, tail: &[u8]) -> Result<bool
 pub fn union_link(
     live: &Live<'_>,
     target: &Path,
-    source: &Source<'_>,
+    feed: Feed<'_>,
+    size: u64,
     ledger: &Ledger,
 ) -> Result<Outcome> {
-    use std::os::fd::AsFd as _;
-    if source.size > SIZE_LIMIT {
-        return Ok(Outcome {
-            action: Action::Held("append-log: over the size limit"),
-            written: 0,
-            recorded: 0,
-        });
-    }
-    let offered = read_source(source)?;
     let name = io::c_name(live.name).refuse_at(SITE)?;
     let link = sys::fstatat_nofollow(live.dir, &name).refuse_at(SITE)?;
     let text = std::fs::read_link(live.path).refuse_at(SITE)?;
@@ -316,86 +773,99 @@ pub fn union_link(
     {
         return Err(BulkloadRefusal::DestinationKindMismatch);
     }
-    let (Some(target_parent), Some(target_name)) = (target.parent(), target.file_name()) else {
-        return Err(BulkloadRefusal::DestinationKindMismatch);
-    };
-    let target_dir = File::open(target_parent).refuse_at(SITE)?;
-    let target_c = io::c_name(target_name.as_encoded_bytes()).refuse_at(SITE)?;
-    let (stat, bytes) = match read_live(&target_dir, &target_c)? {
-        Read::Live(stat, bytes) => (stat, bytes),
-        Read::Over => {
-            return Ok(Outcome {
-                action: Action::Held("append-log: over the size limit"),
-                written: 0,
-                recorded: 0,
-            })
-        }
-        Read::Absent | Read::Changed => return Err(BulkloadRefusal::HomesConsolidateRaced),
-    };
-    let Some(plan) = plan(&bytes, &offered, by_uuid(live.rel)) else {
+    let held = crate::hash::open_nofollow(target)?;
+    let stat = sys::fstat(&held).refuse_at(SITE)?;
+    check_own(&stat)?;
+    let read_target =
+        |buffer: &mut [u8], at: u64| sys::pread_full(&held, buffer, at).refuse_at(SITE);
+    let source = |buffer: &mut [u8], at: u64| feed.read_at(buffer, at);
+    let Some(decided) = decide(&read_target, stat.size, &source, size, by_uuid(live.rel))? else {
         return Err(BulkloadRefusal::HomesConsolidateRaced);
     };
     if !free(target)? || !free(live.path)? {
         return Err(BulkloadRefusal::HomesConsolidateRaced);
     }
-    let output = plan.bytes.clone().unwrap_or_else(|| bytes.clone());
-    let temp = io::c_name(
-        format!(
-            ".{}.bulkload-regularize.{}",
-            String::from_utf8_lossy(live.name),
-            std::process::id()
-        )
-        .as_bytes(),
-    )
-    .refuse_at(SITE)?;
-    let file = File::from(
-        sys::create_excl_at(live.dir.as_fd(), &temp, stat.mode & 0o7777).refuse_at(SITE)?,
-    );
-    let written = sys::pwrite_all(&file, &output, 0)
-        .and_then(|()| sys::fchmod(&file, stat.mode & 0o7777))
-        .and_then(|()| file.sync_all());
-    if let Err(error) = written {
-        let _ = sys::unlinkat(live.dir, &temp, false);
-        return Err(error).refuse_at(SITE);
+    // The regular file the live name is to hold: the target's own bytes
+    // where it covers the source, else the source's, then (a union) the
+    // target's extra records.
+    let (output, base, keep, records, action) = match decided {
+        Decided::Adopted | Decided::Covered => {
+            let copy = Output::open(
+                live.dir,
+                live.name,
+                Feed::File(&held),
+                (stat.size, &read_target),
+            )?;
+            (copy, stat.size, Vec::new(), 0, Action::Consolidated)
+        }
+        Decided::Extended => (
+            Output::open(live.dir, live.name, feed, (size, &source))?,
+            size,
+            Vec::new(),
+            0,
+            Action::Extended,
+        ),
+        Decided::Union {
+            keep,
+            source_records,
+        } => (
+            Output::open(live.dir, live.name, feed, (size, &source))?,
+            size,
+            keep,
+            source_records,
+            Action::Consolidated,
+        ),
+    };
+    if let Err(refusal) = output.append(&read_target, &keep, base) {
+        output.discard(live.dir, base);
+        return Err(refusal);
     }
-    drop(file);
     let unmoved = |at: &Stat| at.node == link.node && at.ctime_ns == link.ctime_ns;
     let target_held = || {
-        sys::fstatat_nofollow(&target_dir, &target_c).is_ok_and(|now| {
-            now.node == stat.node && now.size == stat.size && now.mtime_ns == stat.mtime_ns
-        })
+        sys::fstat(&held).is_ok_and(|now| now.size == stat.size && now.mtime_ns == stat.mtime_ns)
+            && std::fs::canonicalize(live.path).ok().as_deref() == Some(target)
     };
     let still = sys::fstatat_nofollow(live.dir, &name).is_ok_and(|now| unmoved(&now))
         && std::fs::read_link(live.path).is_ok_and(|now| now == text);
     if !still || !target_held() {
-        let _ = sys::unlinkat(live.dir, &temp, false);
+        output.discard(live.dir, base);
         return Err(BulkloadRefusal::HomesConsolidateRaced);
     }
-    if let Err(error) = io::exchange(live.dir, &temp, &name) {
-        let _ = sys::unlinkat(live.dir, &temp, false);
+    if let Err(error) = io::exchange(live.dir, &output.name, &name) {
+        output.discard(live.dir, base);
         if io::rename_unsupported(&error) {
             return Err(BulkloadRefusal::DestinationExchangeUnsupported);
         }
         return Err(error).refuse_at(SITE);
     }
-    // What the trade took out must be the link that was read, and the
-    // target still as read; else it goes back.
-    let out = sys::fstatat_nofollow(live.dir, &temp);
-    if !out.as_ref().is_ok_and(unmoved) || !target_held() {
-        io::exchange(live.dir, &temp, &name).refuse_at(SITE)?;
-        let _ = sys::unlinkat(live.dir, &temp, false);
+    let out = sys::fstatat_nofollow(live.dir, &output.name);
+    if !out.as_ref().is_ok_and(unmoved)
+        || !sys::fstat(&held)
+            .is_ok_and(|now| now.size == stat.size && now.mtime_ns == stat.mtime_ns)
+    {
+        io::exchange(live.dir, &output.name, &name).refuse_at(SITE)?;
         live.dir.sync_all().refuse_at(SITE)?;
+        output.discard(live.dir, base);
         return Err(BulkloadRefusal::HomesConsolidateRaced);
     }
-    sys::unlinkat(live.dir, &temp, false).refuse_at(SITE)?;
-    live.dir.sync_all().refuse_at(SITE)?;
-    record(ledger, live.rel, &plan, (&bytes, &offered, &output))?;
+    output.retire(live.dir)?;
+    let extra: u64 = keep.iter().map(|(_, length)| length).sum();
+    let made =
+        |buffer: &mut [u8], at: u64| sys::pread_full(&output.file, buffer, at).refuse_at(SITE);
+    record(
+        ledger,
+        live.rel,
+        "regularize",
+        [
+            (&read_target, stat.size),
+            (&source, size),
+            (&made, base + extra),
+        ],
+        (records, keep.len() as u64),
+    )?;
     Ok(Outcome {
-        action: match plan.action {
-            Action::Adopted | Action::Covered => Action::Consolidated,
-            action => action,
-        },
-        written: output.len() as u64,
+        action,
+        written: base + extra,
         recorded: 1,
     })
 }
@@ -406,64 +876,32 @@ fn free(path: &Path) -> Result<bool> {
     Ok(matches!(crate::procs::inside(&[path])?, Some(pids) if pids.is_empty()))
 }
 
-fn read_source(source: &Source<'_>) -> Result<Vec<u8>> {
-    let mut bytes =
-        vec![0_u8; usize::try_from(source.size).map_err(|_| BulkloadRefusal::BudgetExceeded)?];
-    let read = sys::pread_full(source.file, &mut bytes, 0).refuse_at(SITE)?;
-    if read as u64 != source.size {
-        return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
-    }
-    Ok(bytes)
+/// The BLAKE3 of `[0, size)` of `read`, streamed.
+fn digest(read: &dyn Fn(&mut [u8], u64) -> Result<usize>, size: u64) -> Result<blake3::Hasher> {
+    let mut hasher = blake3::Hasher::new();
+    pieces(read, (0, size), &mut |_, piece| {
+        hasher.update(piece);
+        Ok(())
+    })?;
+    Ok(hasher)
 }
 
-/// A read of the live file.
-enum Read {
-    Absent,
-    Over,
-    /// A writer changed it while it was read.
-    Changed,
-    Live(Stat, Vec<u8>),
-}
-
-/// The live file's identity and bytes: this user's own regular file, never
-/// through a link.
-fn read_live(dir: &File, name: &CStr) -> Result<Read> {
-    let fd = match sys::open_read_at(dir, name) {
-        Ok(fd) => fd,
-        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(Read::Absent),
-        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
-            return Err(BulkloadRefusal::DestinationKindMismatch);
-        }
-        Err(error) => return Err(error).refuse_at(SITE),
-    };
-    let stat = sys::fstat(&fd).refuse_at(SITE)?;
-    if !stat.is_file() {
-        return Err(BulkloadRefusal::DestinationKindMismatch);
-    }
-    if stat.uid != sys::effective_uid() {
-        return Err(BulkloadRefusal::PathEscapesRoot);
-    }
-    if stat.size > SIZE_LIMIT {
-        return Ok(Read::Over);
-    }
-    let mut bytes = vec![0_u8; usize::try_from(stat.size).unwrap_or(0)];
-    let read = sys::pread_full(&fd, &mut bytes, 0).refuse_at(SITE)?;
-    let after = sys::fstat(&fd).refuse_at(SITE)?;
-    if read as u64 != stat.size || after.size != stat.size || after.mtime_ns != stat.mtime_ns {
-        return Ok(Read::Changed);
-    }
-    Ok(Read::Live(stat, bytes))
-}
-
-/// Ledger an append log written: both inputs' and the output's digests and
-/// the record counts. A union already recorded is not recorded twice.
+/// Ledger an append log written: both inputs' and the output's digests
+/// (streamed) and the record counts. A union already recorded is not
+/// recorded twice.
+#[allow(clippy::type_complexity)] // Three readers, each with its size.
 fn record(
     ledger: &Ledger,
     rel: &[u8],
-    plan: &Plan,
-    (live, source, output): (&[u8], &[u8], &[u8]),
+    action: &str,
+    sides: [(&dyn Fn(&mut [u8], u64) -> Result<usize>, u64); 3],
+    (source_records, live_extra): (u64, u64),
 ) -> Result<()> {
     let wide = |count: u64| i64::try_from(count).unwrap_or(i64::MAX);
+    let [(live, live_size), (source, size), (out, output_size)] = sides;
+    let live_hash = digest(live, live_size)?;
+    let source_hash = digest(source, size)?;
+    let output = digest(out, output_size)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| {
@@ -477,13 +915,13 @@ fn record(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         rusqlite::params![
             rel,
-            plan.action.word(),
-            blake3::hash(live).as_bytes().as_slice(),
-            blake3::hash(source).as_bytes().as_slice(),
-            blake3::hash(output).as_bytes().as_slice(),
-            wide(plan.source_records),
-            wide(plan.live_extra),
-            wide(output.len() as u64),
+            action,
+            live_hash.finalize().as_bytes().as_slice(),
+            source_hash.finalize().as_bytes().as_slice(),
+            output.finalize().as_bytes().as_slice(),
+            wide(source_records),
+            wide(live_extra),
+            wide(output_size),
             now,
         ],
     )

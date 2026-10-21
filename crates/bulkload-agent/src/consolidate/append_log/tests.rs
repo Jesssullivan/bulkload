@@ -8,7 +8,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
 
 use super::super::tests::set_hook;
-use super::super::{union_of, Action, Class, Ledger, Live, Maps, Outcome, Source};
+use super::super::{union_of, Action, Class, Ledger, Live, Outcome};
 use super::{by_uuid, plan};
 use crate::BulkloadRefusal;
 
@@ -68,22 +68,19 @@ impl Home {
         fs::write(&staged, source).unwrap();
         let file = File::open(&staged).unwrap();
         let dir = File::open(parent).unwrap();
-        let maps = Maps::new(Vec::new());
         let union = union_of(Class::of(rel.as_bytes(), false)).expect("the append-log union");
-        let outcome = union(
+        // Through the class interface (in memory) for a small source, and by
+        // streaming from the file: the one union either way.
+        let _ = union;
+        let outcome = super::union_stream(
             &Live {
                 dir: &dir,
                 name: path.file_name().unwrap().as_bytes(),
                 path: &path,
                 rel: rel.as_bytes(),
             },
-            &Source {
-                file: &file,
-                path: &staged,
-                size: source.len() as u64,
-                mtime_ns: 0,
-                maps: &maps,
-            },
+            super::Feed::File(&file),
+            source.len() as u64,
             &self.ledger,
         );
         fs::remove_file(&staged).unwrap();
@@ -475,4 +472,75 @@ fn where_open_files_cannot_be_seen_nothing_is_written() {
         BulkloadRefusal::HomesConsolidateRaced
     );
     assert_eq!(fs::read(&path).unwrap(), live);
+}
+
+/// Big logs are never held whole: the streamed union of two multi-megabyte
+/// transcripts (records crossing every read piece) is the in-memory plan's,
+/// and a staged source becomes the output itself (its inode traded in, no
+/// second copy of the source's bytes).
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "a write needs the open-file check, Linux only"
+)]
+fn a_big_union_streams_and_the_staged_source_is_the_output() {
+    use std::ffi::CString;
+    let record = |id: &str, at: usize| {
+        format!(
+            "{{\"uuid\":\"{id}-{at}\",\"parentUuid\":null,\"text\":\"{}\"}}\n",
+            "x".repeat(700 + at % 997)
+        )
+    };
+    let shared: String = (0..2_000).map(|at| record("a", at)).collect();
+    let neo: String = format!(
+        "{shared}{}",
+        (0..1_500).map(|at| record("n", at)).collect::<String>()
+    );
+    let sting: String = format!(
+        "{shared}{}",
+        (0..1_500).map(|at| record("s", at)).collect::<String>()
+    );
+    assert!(neo.len() > 2 * super::PIECE);
+    let want = super::plan(sting.as_bytes(), neo.as_bytes(), true)
+        .unwrap()
+        .bytes
+        .unwrap();
+
+    let home = Home::new();
+    let path = home.live(TRANSCRIPT, sting.as_bytes());
+    let dir = File::open(path.parent().unwrap()).unwrap();
+    // The receive's staged file, a private name in the live directory.
+    let staged_path = path.with_file_name(".s.jsonl.staged");
+    fs::write(&staged_path, neo.as_bytes()).unwrap();
+    let staged = File::options()
+        .read(true)
+        .write(true)
+        .open(&staged_path)
+        .unwrap();
+    let staged_inode = staged.metadata().unwrap().ino();
+    let name = CString::new(".s.jsonl.staged").unwrap();
+    let outcome = super::union_stream(
+        &Live {
+            dir: &dir,
+            name: path.file_name().unwrap().as_bytes(),
+            path: &path,
+            rel: TRANSCRIPT.as_bytes(),
+        },
+        super::Feed::Staged {
+            file: &staged,
+            name: &name,
+        },
+        neo.len() as u64,
+        &home.ledger,
+    )
+    .unwrap();
+    assert_eq!(outcome.action, Action::Consolidated);
+    assert_eq!(fs::read(&path).unwrap(), want, "the in-memory plan's union");
+    assert_eq!(
+        fs::metadata(&path).unwrap().ino(),
+        staged_inode,
+        "the staged file traded in"
+    );
+    assert!(!staged_path.exists(), "no second copy left");
+    assert_eq!(home.names(TRANSCRIPT), ["s.jsonl"]);
 }

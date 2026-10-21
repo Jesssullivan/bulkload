@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 
 use super::ledger::{Identity, Ledger};
 use super::place::{c_name, identity_at, lstat, open_dir, temp_name};
-use crate::consolidate::{append_log, Action, Live, Maps, Source};
+use crate::consolidate::{append_log, Action, Live};
 use crate::counters::{self, Counter};
 use crate::refuse::RefuseAt as _;
 use crate::{BulkloadRefusal, Result};
@@ -113,21 +113,15 @@ pub fn fold(
     }
     let file = crate::hash::open_nofollow(copy)?;
     let live_dir = open_dir(live_parent)?;
-    let maps = Maps::new(Vec::new());
-    let outcome = append_log::union(
+    let outcome = append_log::union_stream(
         &Live {
             dir: &live_dir,
             name: live_name.as_bytes(),
             path: live,
             rel,
         },
-        &Source {
-            file: &file,
-            path: copy,
-            size: meta.len(),
-            mtime_ns: i128::from(read.mtime),
-            maps: &maps,
-        },
+        append_log::Feed::File(&file),
+        meta.len(),
         ledger.union_ledger()?,
     );
     let action = match outcome {

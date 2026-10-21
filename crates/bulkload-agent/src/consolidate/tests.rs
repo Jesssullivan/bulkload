@@ -716,13 +716,10 @@ fn an_opaque_file_is_adopted_when_equal_and_held_when_not() {
     let ledger = Ledger::open(&home.root.join("state")).unwrap();
     home.live("blob.bin", "same", Duration::from_mins(1));
     let dir = File::open(&home.root).unwrap();
-    let staged_path = home.root.join(".staged");
     for (bytes, expected) in [
         ("same", Action::Adopted),
         ("other", Action::Held("opaque: the bytes differ")),
     ] {
-        fs::write(&staged_path, bytes).unwrap();
-        let staged = File::open(&staged_path).unwrap();
         let outcome = super::opaque(
             &super::Live {
                 dir: &dir,
@@ -731,9 +728,7 @@ fn an_opaque_file_is_adopted_when_equal_and_held_when_not() {
                 rel: b"blob.bin",
             },
             &super::Source {
-                file: &staged,
-                path: &staged_path,
-                size: bytes.len() as u64,
+                bytes: bytes.as_bytes(),
                 mtime_ns: 1,
                 maps: &maps(),
             },

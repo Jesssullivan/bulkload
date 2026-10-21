@@ -439,13 +439,3 @@ pub(super) fn get_xattr_raw(
         }
     }
 }
-
-/// Darwin has no anonymous in-memory file: the homes consolidation's
-/// in-memory receive is Linux only, and a Darwin destination holds the
-/// file typed instead.
-///
-/// # Errors
-/// Always `Unsupported`.
-pub fn memory_file() -> io::Result<std::os::fd::OwnedFd> {
-    Err(io::Error::from(io::ErrorKind::Unsupported))
-}
