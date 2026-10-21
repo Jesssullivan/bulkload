@@ -85,7 +85,12 @@ SUBCOMMANDS:
                 Native SSH pull; remote bulkload-agent must be installed; the
                 session is recorded in DEST_STATE as copy's is. --file as
                 copy's, run on the source as serve --file; --consolidate and
-                --map-prefix as copy's
+                --map-prefix as copy's. The transport is the first ssh on
+                PATH (as for sqlite-union and estate-move's pulls); it must
+                parse this host's /etc/ssh config. On a host whose system
+                config a PATH ssh cannot read (sting: a nix openssh against
+                Rocky's crypto-policies, refused TRANSPORT_LOST), put the
+                system ssh first: env PATH=/usr/bin:$PATH bulkload-agent ...
     serve [--file]
                 Serve one framed request on stdin/stdout (for SSH). With
                 --file the root the request names is one file or symlink,
