@@ -3521,3 +3521,97 @@ fn a_path_outside_the_maps_lands_under_the_destination_home() {
         "{both}"
     );
 }
+
+/// SPEC rule 3 ("Duplicates already on sting are consolidated into the
+/// live path and removed"; the coordinator, 2026-10-21): a copy an older
+/// pass left beside a live checkout (`.neo-*`) is consolidated into it
+/// through the B2 rules (its branch created, a diverged one tracked at
+/// `refs/remotes/SUFFIX/`, a changed file merged three-way), then removed.
+/// A copy whose file conflicts is kept, typed, and the live file is the
+/// destination's.
+#[test]
+fn a_copy_beside_the_live_path_is_consolidated_and_removed() {
+    let world = World::new("asides");
+    let (_source, live) = related_pair(&world, "p");
+    let dup = world.dst().join("p.neo-20261016");
+    git(
+        &world.dst(),
+        &["clone", "--quiet", "--template=", live.to_str().unwrap(), "p.neo-20261016"],
+    );
+    git(&dup, &["remote", "remove", "origin"]);
+    git(&dup, &["checkout", "--quiet", "-b", "only-in-copy"]);
+    git(&dup, &["commit", "--quiet", "--allow-empty", "-m", "copy work"]);
+    let copy_work = out(&dup, &["rev-parse", "HEAD"]);
+    git(&dup, &["checkout", "--quiet", "main"]);
+    git(&dup, &["commit", "--quiet", "--allow-empty", "-m", "copy main"]);
+    git(&live, &["commit", "--quiet", "--allow-empty", "-m", "live main"]);
+    let live_main = out(&live, &["rev-parse", "main"]);
+    let copy_main = out(&dup, &["rev-parse", "main"]);
+    fs::write(dup.join("f.txt"), "one\ntwo\nthree\nfour\nFIVE copy\n").unwrap();
+    // A second copy whose file conflicts with the live one: kept.
+    let held = world.dst().join("p.sting-1015");
+    git(
+        &world.dst(),
+        &["clone", "--quiet", "--template=", live.to_str().unwrap(), "p.sting-1015"],
+    );
+    git(&held, &["remote", "remove", "origin"]);
+    fs::write(held.join("f.txt"), "ONE held\ntwo\nthree\nfour\nfive\n").unwrap();
+    fs::write(live.join("f.txt"), "ONE live\ntwo\nthree\nfour\nfive\n").unwrap();
+    assert!(world.source().ok);
+    let moved = world.moved();
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    assert!(
+        moved.stdout.lines().any(|line| line.contains("aside=")
+            && line.contains("p.neo-20261016")
+            && line.ends_with("outcome=retired")),
+        "{both}"
+    );
+    assert!(!dup.exists(), "{both}");
+    assert_eq!(out(&live, &["rev-parse", "refs/heads/only-in-copy"]), copy_work);
+    assert_eq!(out(&live, &["rev-parse", "main"]), live_main, "{both}");
+    assert_eq!(
+        out(&live, &["rev-parse", "refs/remotes/neo-20261016/main"]),
+        copy_main,
+        "{both}"
+    );
+    assert_eq!(
+        fs::read(live.join("f.txt")).unwrap(),
+        b"ONE live\ntwo\nthree\nfour\nFIVE copy\n",
+        "{both}"
+    );
+    assert!(
+        moved.stdout.lines().any(|line| line.contains("p.sting-1015")
+            && line.contains("outcome=held")),
+        "{both}"
+    );
+    assert!(held.join("f.txt").is_file(), "the conflicting copy is kept");
+    assert_eq!(
+        fs::read(live.join("f.txt")).unwrap(),
+        b"ONE live\ntwo\nthree\nfour\nFIVE copy\n"
+    );
+}
+
+/// 2026-10-21: a plan pull never makes `carry/corpus` in the state, and an
+/// empty one an older pass left (here on the source half) is removed, not
+/// refused `STATE_FORMAT_RETIRED`.
+#[test]
+fn no_pass_leaves_an_empty_corpus_and_an_old_one_is_removed() {
+    let world = World::new("nocorpus");
+    world.estate();
+    fs::create_dir_all(world.source_state().join("carry/corpus")).unwrap();
+    let sourced = world.source();
+    assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
+    assert!(!world.source_state().join("carry/corpus").exists());
+    fs::create_dir_all(world.source_state().join("carry/corpus")).unwrap();
+    let planned = world.planned();
+    assert!(planned.ok, "{}\n{}", planned.stdout, planned.stderr);
+    assert!(!world.state().join("carry/corpus").exists());
+    for state in [world.state(), world.source_state()] {
+        assert!(
+            !tree(&state).iter().any(|rel| rel.ends_with("corpus")),
+            "{}: {:?}",
+            state.display(),
+            tree(&state)
+        );
+    }
+}
