@@ -365,10 +365,23 @@ fn a_streamed_pass_lands_every_absent_item_with_no_payload_anywhere() {
             "{rel}"
         );
     }
+    // The same status, but the hand-off notes the move wrote (R0.5).
+    let landed_status: String = out(&dst.join("land"), &["status", "--porcelain", "--ignored"])
+        .lines()
+        .filter(|line| *line != "?? AGENTS.md" && *line != "?? CLAUDE.md")
+        .map(|line| format!("{line}\n"))
+        .collect();
     assert_eq!(
-        out(&dst.join("land"), &["status", "--porcelain", "--ignored"]),
+        landed_status,
         out(&src.join("land"), &["status", "--porcelain", "--ignored"])
     );
+    assert!(
+        moved
+            .stdout
+            .contains("estate-move phase=hand-off outcome=ok"),
+        "{both}"
+    );
+    assert!(dst.join("land/AGENTS.md").is_file(), "{both}");
     // The linked worktree is linked, at its live path.
     assert_eq!(
         out(&dst.join("land-wt"), &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
