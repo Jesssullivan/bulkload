@@ -1048,6 +1048,69 @@ pub(in crate::git_carry) fn run_git(
     command: &mut Command,
     input: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
+    match run_git_once(command, input) {
+        // A stale or corrupt commit-graph (one naming commits a gc pruned
+        // from the store) fails a read such as `fsck`. The graph is only an
+        // index of the store: a read-only child is run once more with it
+        // off, and the source's repository is never written to repair it.
+        Err(BulkloadRefusal::GitChildFailed(_)) if commit_graph_retry(command) => {
+            run_git_once(command, input)
+        }
+        ran => ran,
+    }
+}
+
+/// The Git subcommands that only read, and so may run again with the
+/// commit-graph off ([`run_git`]).
+const READ_ONLY_SUBCOMMANDS: &[&str] = &[
+    "cat-file",
+    "diff",
+    "for-each-ref",
+    "fsck",
+    "log",
+    "ls-files",
+    "ls-tree",
+    "merge-base",
+    "rev-list",
+    "rev-parse",
+    "show-ref",
+    "status",
+];
+
+/// Turn the commit-graph off in `command` when it is a read-only Git child
+/// that did not already set configuration through the environment; whether
+/// it did.
+fn commit_graph_retry(command: &mut Command) -> bool {
+    if command.get_program() != "git"
+        || command
+            .get_envs()
+            .any(|(key, value)| key == "GIT_CONFIG_COUNT" && value.is_some())
+    {
+        return false;
+    }
+    let mut args = command.get_args();
+    let subcommand = loop {
+        match args.next().and_then(|arg| arg.to_str()) {
+            Some("-c" | "-C") => {
+                args.next();
+            }
+            Some(arg) if arg.starts_with('-') => {}
+            Some(arg) => break arg,
+            None => return false,
+        }
+    };
+    let read_only = READ_ONLY_SUBCOMMANDS.contains(&subcommand)
+        || (subcommand == "worktree" && args.next().and_then(|arg| arg.to_str()) == Some("list"));
+    if read_only {
+        command
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.commitGraph")
+            .env("GIT_CONFIG_VALUE_0", "false");
+    }
+    read_only
+}
+
+fn run_git_once(command: &mut Command, input: Option<&[u8]>) -> Result<Vec<u8>> {
     let mut child = command
         .stdin(if input.is_some() {
             Stdio::piped()

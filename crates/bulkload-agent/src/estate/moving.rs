@@ -425,10 +425,12 @@ pub enum Action {
     /// A refs-only (bare) item whose live repository exists: adopted, refs
     /// imported, refs-in.
     RefsOnly,
-    /// Capture refused: carried as files at the live path (absent or empty).
+    /// Retired (SPEC rule 3, no duplicates; 2026-10-21): a refused capture
+    /// was carried as files at the live path. Never decided now; a ledger
+    /// from before may still name it, and the pass reads it as a hold.
     CarryLive,
-    /// Capture refused and the live path is occupied: carried as files at
-    /// `<path>.<label>`.
+    /// Retired (SPEC rule 3): a refused capture was carried as files beside
+    /// the live path. Never decided now; read as a hold.
     CarryBeside,
     /// No action the table covers: the apply refuses it typed with nothing
     /// written, and closure holds it pending review.
@@ -439,19 +441,21 @@ impl Action {
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
-            Self::Land => "land",
-            Self::Adopt => "adopt",
-            Self::RefsOnly => "refs-only",
+            // B2's words (2026-10-21): what the pass does, not what the
+            // retired corpus apply did.
+            Self::Land => "create",
+            Self::Adopt => "consolidate",
+            Self::RefsOnly => "refs-consolidate",
             Self::CarryLive => "carry-live",
             Self::CarryBeside => "carry-beside",
-            Self::Refuse => "refuse",
+            Self::Refuse => "held",
         }
     }
 
-    /// Carried as files (`estate-carry-files`).
+    /// A typed hold: the pass writes nothing for it.
     #[must_use]
-    pub const fn carries(self) -> bool {
-        matches!(self, Self::CarryLive | Self::CarryBeside)
+    pub const fn holds(self) -> bool {
+        matches!(self, Self::Refuse | Self::CarryLive | Self::CarryBeside)
     }
 }
 
@@ -498,6 +502,10 @@ pub fn capture_of(held: bool, refusal: Option<&str>) -> Capture {
 
 /// The action for an item, and the table row's name as its reason.
 ///
+/// [`Action::Adopt`] is B2's consolidation (SPEC rule 4): the live path
+/// holds a repository, which the pass consolidates when it is related
+/// (refs unioned, files merged three-way) and holds typed when it is not.
+///
 /// Its inputs: a workspace item or a refs-only one, its [`Capture`], what
 /// its live path (the workspace, or a refs-only item's repository) holds,
 /// and whether `--side-root` seats symlinked paths. Pure.
@@ -521,12 +529,10 @@ pub const fn action(
             (Action::Adopt, "adopt-or-beside")
         }
         (_, Capture::Held, Presence::NotGit) => (Action::Refuse, "not-git"),
-        (true, Capture::Refused, Presence::Absent | Presence::Empty) => {
-            (Action::CarryLive, "capture-refused")
-        }
-        (true, Capture::Refused, Presence::Git | Presence::NotGit | Presence::Symlinked) => {
-            (Action::CarryBeside, "capture-refused-occupied")
-        }
+        // SPEC rule 3 (no duplicates) and rule 4 (a case not merged yet is
+        // a typed hold): a refused capture is held with its code, nothing
+        // written, at the live path or beside it.
+        (true, Capture::Refused, _) => (Action::Refuse, "capture-refused"),
         (false, Capture::Held, Presence::Absent | Presence::Empty) => {
             (Action::Land, "bare-landing")
         }
@@ -681,7 +687,7 @@ pub struct Row {
 }
 
 /// What [`decide`] reads besides the plan.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct Inputs<'a> {
     /// The pulled corpus (capture records).
     pub corpus: &'a Path,
@@ -692,6 +698,11 @@ pub struct Inputs<'a> {
     pub source: &'a str,
     /// `--side-root` was given.
     pub seats: bool,
+    /// The destination's paths for an item the source half left unmapped
+    /// (the default home map, 2026-10-21): the item at its destination
+    /// paths, or `None` when it maps nowhere (held `DESTINATION_UNMAPPED`).
+    /// Without it every item is taken as planned.
+    pub remap: Option<&'a dyn Fn(&Item) -> Option<Item>>,
 }
 
 /// Decide every item of `items` (the pulled plan) against the destination.
@@ -714,6 +725,11 @@ pub fn decide(
     let mut rows = Vec::with_capacity(items.len());
     for item in items {
         let identity = id(item)?;
+        // The item keeps the identity its plan gave it; it is placed at its
+        // destination paths.
+        let mapped = inputs.remap.map_or_else(|| Some(item.clone()), |remap| remap(item));
+        let unmapped = mapped.is_none();
+        let item = &mapped.unwrap_or_else(|| item.clone());
         // A corpus capture record, or the streamed capture's item snapshot
         // beside the corpus (SPEC rule 2 reset, B1).
         let held = inputs
@@ -729,38 +745,31 @@ pub fn decide(
         let place = item.workspace.as_ref().unwrap_or(&item.repository);
         let now = presence(place);
         let decided = action(item.workspace.is_some(), capture, now, inputs.seats);
-        let (action, reason) = nonrepo_preview(item, capture, decided);
-        let previous = ledger.items.get(&identity);
-        let carried = super::carried::carried_path(inputs.state, &identity, inputs.source)
-            .try_exists()
-            .refuse_at(SITE)?;
-        let keep = capture != Capture::Held
-            && previous.is_some_and(|previous| {
-                previous.action.carries() && (previous.attempted || carried)
-            });
-        let decision = if keep {
-            previous
-                .cloned()
-                .ok_or(BulkloadRefusal::GitAuthorityChanged)?
+        let (action, reason) = if unmapped {
+            (Action::Refuse, "unmapped")
         } else {
-            Decision {
-                action,
-                reason: reason.to_owned(),
-                presence: now,
-                capture,
-                decided_ns: match previous {
-                    Some(previous) if previous.action == action => previous.decided_ns,
-                    _ => now_ns,
-                },
-                attempted: false,
-            }
+            nonrepo_preview(item, capture, decided)
+        };
+        let previous = ledger.items.get(&identity);
+        // Every decision is taken again (SPEC rule 3: no carry is kept
+        // where an earlier run put it; a carry is never decided now).
+        let decision = Decision {
+            action,
+            reason: reason.to_owned(),
+            presence: now,
+            capture,
+            decided_ns: match previous {
+                Some(previous) if previous.action == action => previous.decided_ns,
+                _ => now_ns,
+            },
+            attempted: false,
         };
         ledger.items.insert(identity.clone(), decision.clone());
         rows.push(Row {
             id: identity,
             item: item.clone(),
             decision,
-            kept: keep,
+            kept: false,
         });
     }
     Ok(rows)
@@ -962,24 +971,14 @@ mod tests {
                         let (action, reason) = action(workspace, capture, seen, seats);
                         assert!(!reason.is_empty());
                         let held = capture == Capture::Held;
+                        // SPEC rule 3: nothing is ever carried as files,
+                        // live or beside; an uncaptured item is a typed hold.
+                        assert!(
+                            !matches!(action, Action::CarryLive | Action::CarryBeside),
+                            "{workspace} {capture:?} {seen:?} {action:?}"
+                        );
                         if !held {
-                            assert!(
-                                matches!(
-                                    action,
-                                    Action::CarryLive | Action::CarryBeside | Action::Refuse
-                                ),
-                                "{workspace} {seen:?} {action:?}"
-                            );
-                        }
-                        // Only a recorded, lasting refusal is carried as files.
-                        if action.carries() {
-                            assert_eq!(capture, Capture::Refused);
-                        }
-                        if action == Action::CarryLive {
-                            assert!(matches!(seen, Presence::Absent | Presence::Empty));
-                        }
-                        if !workspace {
-                            assert!(!action.carries(), "a refs-only item has no files");
+                            assert_eq!(action, Action::Refuse, "{workspace} {seen:?}");
                         }
                         if seen == Presence::Symlinked && !(seats && held) {
                             assert_eq!(action, Action::Refuse);
@@ -1291,14 +1290,14 @@ mod tests {
         }
     }
 
-    // P-MOVE (plan): every item gets exactly one recorded decision, the
-    // ledger holds one per item, and a carry once started stays while the
-    // item is uncaptured, whatever its path holds on a rerun; a carry never
-    // started is decided again.
+    // P-MOVE (plan): every item gets exactly one recorded decision and the
+    // ledger holds one per item. SPEC rule 3: a refused capture is a typed
+    // hold, and a carry an older ledger recorded (started or not) is never
+    // kept: it is decided again, as a hold.
     proptest! {
         #![proptest_config(prop_config(64))]
         #[test]
-        fn decisions_are_total_and_started_carries_are_sticky(
+        fn decisions_are_total_and_refused_captures_are_held(
             shapes in proptest::collection::vec(any::<bool>(), 1..12),
             stale in proptest::collection::vec(0usize..4, 1..12),
         ) {
@@ -1326,22 +1325,16 @@ mod tests {
                 }
             }
             let before = ledger.clone();
-            let inputs = Inputs { corpus: &corpus, refusals: &refusals, state: &base, source: "neo", seats: false };
+            let inputs = Inputs { corpus: &corpus, refusals: &refusals, state: &base, source: "neo", seats: false, remap: None };
             let rows = decide(&items, &inputs, &mut ledger, 9).unwrap();
             prop_assert_eq!(rows.len(), items.len());
             prop_assert_eq!(ledger.items.len(), items.iter().map(|item| id(item).unwrap()).collect::<BTreeSet<_>>().len());
             for row in &rows {
-                match before.items.get(&row.id) {
-                    Some(was) if was.attempted => {
-                        prop_assert!(row.kept);
-                        prop_assert_eq!(&row.decision, was);
-                    }
-                    _ => {
-                        // Absent paths: workspace items carry live, refs-only
-                        // items are refused.
-                        prop_assert!(!row.kept);
-                        prop_assert_eq!(row.decision.action, if row.item.workspace.is_some() { Action::CarryLive } else { Action::Refuse });
-                    }
+                prop_assert!(!row.kept);
+                prop_assert_eq!(row.decision.action, Action::Refuse);
+                prop_assert!(row.decision.action.holds());
+                if before.items.contains_key(&row.id) {
+                    prop_assert_ne!(row.decision.action, Action::CarryBeside);
                 }
             }
             let total: u64 = histogram(&rows).values().sum();

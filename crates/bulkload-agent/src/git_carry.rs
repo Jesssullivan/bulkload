@@ -66,6 +66,7 @@ pub mod shared;
     clippy::unwrap_used
 )]
 mod source_inert_tests;
+pub mod preview;
 pub mod stream;
 pub mod union;
 
