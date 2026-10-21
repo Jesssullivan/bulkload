@@ -496,7 +496,7 @@ fn a_source_key_copy_is_folded_into_the_mapped_key() {
             .iter()
             .map(|(_, _, action)| action.as_str())
             .collect::<Vec<_>>(),
-        ["move", "union"]
+        ["rmdir", "move", "union"]
     );
     // m: moved (the same inode), then extended in place by neo's line.
     let m = run.destination(&format!("{STING}/m.jsonl"));
@@ -524,6 +524,8 @@ fn a_source_key_copy_is_folded_into_the_mapped_key() {
     }
     assert!(!run.destination(&format!("{NEO}/m.jsonl")).exists());
     assert!(!run.destination(&format!("{NEO}/u.jsonl")).exists());
+    // The key directory the fold emptied is removed (plain rmdir).
+    assert!(!run.destination(NEO).exists());
     let ledger =
         rusqlite::Connection::open(run.corpus.base.join("consolidate/consolidate.sqlite")).unwrap();
     let rows: i64 = ledger
@@ -608,6 +610,7 @@ fn a_sessions_subfiles_at_the_source_key_fold_the_same_way() {
     let mut actions: Vec<(String, String)> = first
         .folded
         .iter()
+        .filter(|(_, _, action)| action != "rmdir")
         .map(|(from, _, action)| (String::from_utf8_lossy(from).into_owned(), action.clone()))
         .collect();
     actions.sort();
@@ -670,4 +673,16 @@ fn a_sessions_subfiles_at_the_source_key_fold_the_same_way() {
         std::fs::read(run.destination(&format!("{STING}/sid/tool-results/moved.txt"))).unwrap(),
         b"moved\n"
     );
+    // The emptied source-key directory goes (plain rmdir); one with the
+    // held file left in it stays, and so do its parents.
+    assert!(!run.destination(&format!("{NEO}/sid/subagents")).exists());
+    assert!(run.destination(&format!("{NEO}/sid/tool-results")).is_dir());
+    assert!(run.destination(NEO).is_dir());
+    let removed: Vec<String> = first
+        .folded
+        .iter()
+        .filter(|(_, _, action)| action == "rmdir")
+        .map(|(dir, _, _)| String::from_utf8_lossy(dir).into_owned())
+        .collect();
+    assert_eq!(removed, [format!("{NEO}/sid/subagents")]);
 }

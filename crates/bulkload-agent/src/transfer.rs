@@ -1370,6 +1370,41 @@ pub struct Consolidation {
     pub archived: Vec<PathBuf>,
 }
 
+/// After a pass, each source-key directory a fold took files out of
+/// (`projects/<S>/...`, the key directory itself included) is removed when
+/// the fold left it empty: a plain `rmdir`, never recursive, so a
+/// directory with anything left in it stays. Deepest first; each removed
+/// one is a `rmdir` fold row.
+fn sweep_folded_dirs(
+    root: &Path,
+    dirs: std::collections::BTreeSet<Vec<u8>>,
+    stats: &mut TransferStats,
+) {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut candidates: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+    for dir in dirs {
+        let mut at = dir;
+        // Up to the key directory `projects/<S>`, never `projects` itself.
+        while at.starts_with(b"projects/") && at.len() > b"projects/".len() {
+            candidates.insert(at.clone());
+            match at.iter().rposition(|byte| *byte == b'/') {
+                Some(cut) => at.truncate(cut),
+                None => break,
+            }
+        }
+    }
+    let mut deepest: Vec<Vec<u8>> = candidates.into_iter().collect();
+    deepest.sort_by_key(|dir| std::cmp::Reverse(dir.split(|byte| *byte == b'/').count()));
+    for dir in deepest {
+        let path = root.join(std::ffi::OsStr::from_bytes(&dir));
+        if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir())
+            && std::fs::remove_dir(&path).is_ok()
+        {
+            stats.folded.push((dir, Vec::new(), "rmdir".to_owned()));
+        }
+    }
+}
+
 /// Whether the regular files at `a` and `b` hold the same bytes, streamed.
 fn files_equal(a: &Path, b: &Path) -> std::io::Result<bool> {
     use std::io::Read as _;
@@ -5527,6 +5562,10 @@ struct Inbound<'a, W> {
     /// source path the walk offers is landed at its mapped path, or refused
     /// by the owner rule ([`PrefixMap::land`]).
     maps: PrefixMap,
+    /// The source-key directories a fold took a file out of, relative to
+    /// the root: each is removed after the pass when the fold left it
+    /// empty ([`sweep_folded_dirs`]).
+    fold_dirs: std::collections::BTreeSet<Vec<u8>>,
 }
 
 /// A walk frame: what a batch of new directories holds back.
@@ -5878,6 +5917,7 @@ fn receive_session<R: Read, W: Write>(
             answered_now: None,
             elsewhere: None,
             maps,
+            fold_dirs: std::collections::BTreeSet::new(),
         };
         drop(setup_timer);
         let source_bytes_read = {
@@ -5891,6 +5931,7 @@ fn receive_session<R: Read, W: Write>(
             pool,
             sidecars,
             snapshot_bases,
+            fold_dirs,
             ..
         } = receiver;
         drop(pool);
@@ -5899,12 +5940,19 @@ fn receive_session<R: Read, W: Write>(
             stats,
             session,
             salvage_staged,
-            sidecars,
+            (sidecars, fold_dirs),
             snapshot_bases,
         ))
     });
-    let (source_bytes_read, mut stats, session, salvage_staged, sidecars, snapshot_bases) =
-        streamed?;
+    let (
+        source_bytes_read,
+        mut stats,
+        session,
+        salvage_staged,
+        (sidecars, fold_dirs),
+        snapshot_bases,
+    ) = streamed?;
+    sweep_folded_dirs(target.path(), fold_dirs, &mut stats);
     let _tail_timer = PhaseTimer(&RECV_TAIL_NS, Instant::now());
     stats.source_bytes_read = source_bytes_read;
     drop(session);
@@ -7025,6 +7073,11 @@ impl<W: Write> Inbound<'_, W> {
         self.stats
             .folded
             .push((from.to_vec(), to.to_vec(), action.to_owned()));
+        if let Some(cut) = from.iter().rposition(|byte| *byte == b'/') {
+            if let Some(dir) = from.get(..cut) {
+                self.fold_dirs.insert(dir.to_vec());
+            }
+        }
         Ok(())
     }
 

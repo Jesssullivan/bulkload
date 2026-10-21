@@ -3074,6 +3074,11 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
         );
     }
     for (source, destination, action) in &stats.folded {
+        if destination.is_empty() {
+            // A source-key directory the fold left empty, removed.
+            eprintln!("key-fold {} action={action}", source.escape_ascii());
+            continue;
+        }
         eprintln!(
             "key-fold {} into={} action={action}",
             source.escape_ascii(),
