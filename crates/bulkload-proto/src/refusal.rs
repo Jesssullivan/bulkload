@@ -391,6 +391,12 @@ pub enum BulkloadRefusal {
     /// WP0(d), OI-1003-Q18, #187). The Git carry's occupied destinations
     /// keep `GIT_DESTINATION_OCCUPIED`.
     DestinationOccupied,
+    /// `--map-prefix` (#280 finding 9 review): a source path would reach a
+    /// map's destination by another route than that map (the source holds
+    /// the destination's name itself, or a shorter map's image lies in a
+    /// longer map's destination). Refused with everything under it, so two
+    /// source paths never merge at one name.
+    DestinationMapConflict,
     /// The destination's parent directory is absent (#232). `copy` and
     /// `pull` create an absent DEST itself (mode 0700) when its parent
     /// exists, and never a parent: the operator named DEST, not the path
@@ -543,6 +549,12 @@ pub enum BulkloadRefusal {
     /// (`consolidate::config::ATTEMPTS`). Nothing is changed and nothing is
     /// recorded. It is retryable: the next pass reads and merges it again.
     HomesConsolidateRaced,
+    /// An append-log union that would write (an extension, a union, a fold)
+    /// cannot tell whether a process holds the live file open: the open-file
+    /// check reads `/proc` and has no implementation on this platform (only
+    /// Linux; sting is Linux). Writing anyway could lose a writer's lines to
+    /// a file traded out, so nothing is written and the file is held, typed.
+    HomesConsolidateHolderUnknown,
 
     // ---- handoff proof ------------------------------------------------------
     /// A credential-class probe did not prove what it set out to prove.
@@ -574,7 +586,7 @@ impl BulkloadRefusal {
     /// These strings are the wire/log identity of a refusal and must not change
     /// once a milestone ships.
     #[must_use]
-    #[allow(clippy::too_many_lines)] // One arm per code.
+    #[allow(clippy::too_many_lines)] // One arm per refusal: grows with the taxonomy.
     pub const fn code(&self) -> &'static str {
         match *self {
             Self::SnapshotRootsOverlap => "SNAPSHOT_ROOTS_OVERLAP",
@@ -647,6 +659,7 @@ impl BulkloadRefusal {
             Self::DestinationSpaceInsufficient => "DESTINATION_SPACE_INSUFFICIENT",
             Self::SpaceExhausted(_) => "SPACE_EXHAUSTED",
             Self::DestinationOccupied => "DESTINATION_OCCUPIED",
+            Self::DestinationMapConflict => "DESTINATION_MAP_CONFLICT",
             Self::DestinationParentMissing => "DESTINATION_PARENT_MISSING",
             Self::DestinationKindMismatch => "DESTINATION_KIND_MISMATCH",
             Self::DestinationExchangeUnsupported => "DESTINATION_EXCHANGE_UNSUPPORTED",
@@ -675,6 +688,7 @@ impl BulkloadRefusal {
             Self::ReseatR0Failed => "RESEAT_R0_FAILED",
             Self::HomesConsolidateUnsupported => "HOMES_CONSOLIDATE_UNSUPPORTED",
             Self::HomesConsolidateRaced => "HOMES_CONSOLIDATE_RACED",
+            Self::HomesConsolidateHolderUnknown => "HOMES_CONSOLIDATE_HOLDER_UNKNOWN",
             Self::ProbeFailed => "PROBE_FAILED",
             Self::Io(_) => "IO",
         }
@@ -756,6 +770,7 @@ impl BulkloadRefusal {
         "DESTINATION_SPACE_INSUFFICIENT",
         "SPACE_EXHAUSTED",
         "DESTINATION_OCCUPIED",
+        "DESTINATION_MAP_CONFLICT",
         "DESTINATION_PARENT_MISSING",
         "DESTINATION_KIND_MISMATCH",
         "DESTINATION_EXCHANGE_UNSUPPORTED",
@@ -784,6 +799,7 @@ impl BulkloadRefusal {
         "RESEAT_R0_FAILED",
         "HOMES_CONSOLIDATE_UNSUPPORTED",
         "HOMES_CONSOLIDATE_RACED",
+        "HOMES_CONSOLIDATE_HOLDER_UNKNOWN",
         "PROBE_FAILED",
         "IO",
     ];
@@ -1034,6 +1050,7 @@ mod tests {
             BulkloadRefusal::DestinationSpaceInsufficient,
             BulkloadRefusal::SpaceExhausted(None),
             BulkloadRefusal::DestinationOccupied,
+            BulkloadRefusal::DestinationMapConflict,
             BulkloadRefusal::DestinationParentMissing,
             BulkloadRefusal::DestinationKindMismatch,
             BulkloadRefusal::DestinationExchangeUnsupported,
@@ -1062,6 +1079,7 @@ mod tests {
             BulkloadRefusal::ReseatR0Failed,
             BulkloadRefusal::HomesConsolidateUnsupported,
             BulkloadRefusal::HomesConsolidateRaced,
+            BulkloadRefusal::HomesConsolidateHolderUnknown,
             BulkloadRefusal::ProbeFailed,
             BulkloadRefusal::Io(None),
         ];

@@ -350,10 +350,83 @@ same report, totals and gate:
   nothing written. `--beside` on `copy` and `pull` is retired (SPEC rule
   3, "no beside copies"): an **applied-beside** row of a record written
   while it existed still decodes and stays accounted.
+  - **Append logs** (`*.jsonl`) take the #294 lane's union,
+    `consolidate::append_log::union`. The result is one file at the path:
+    the source's bytes whole, then the live file's records the source
+    lacks, in the live file's order. A Claude transcript record is matched
+    by its `uuid`, any other line by its exact bytes, counted, so both
+    branches of a session continued on both hosts are kept.
+  - A live log that already holds every source record, in any order, is
+    `covered` and is never rewritten (SPEC rule 7).
+  - A live log that is a prefix of the source's is extended in place: the
+    missing tail is appended to the same inode through `O_APPEND`, so a
+    session writing through an open handle never loses a turn. Only a
+    true union (the live log holds records the source lacks) is traded in
+    by the crash-safe swap, and only while no process holds the file. Both
+    are checked against the live file as it was read and ledgered in
+    `consolidate.sqlite` (`append_log_union`: both inputs' and the
+    output's BLAKE3, and the record counts).
+  - A live transcript that is a link into a `--replace-archived-dest`
+    root is unioned with its archived file and regularized: the union is
+    written as a regular file at the live name in place of the link, and
+    the archive copy stays (A-055, `append_log::union_link`).
+  - With `--map-prefix`, the same session that the destination holds at a
+    map's source key (`projects/<S>/<name>`) is folded into the mapped key
+    (`projects/<D>/<name>`). If absent there it is moved (renamed, never
+    copied); otherwise it is unioned. The source-key name is removed once
+    the merged bytes are durable, ledgered (`key_fold`) and reported on
+    `key-fold` lines. The same holds for every file of the session under
+    the source key (its `<id>/` subdirectory: subagent logs, tool results).
+    An append log is moved or unioned; any other file is moved when
+    absent, its source-key copy removed when the mapped key holds the same
+    bytes, and held (`HOMES_CONSOLIDATE_UNSUPPORTED`, both kept) when it
+    holds other bytes. `--plan-only` lists `fold-move`, `fold-union`,
+    `fold-remove` and `fold-hold`; `--key-map-proof` gives each file a
+    `fold` field (`move`, `union`, `remove`, `hold`, `none`).
+  - A log that a process holds open, or that ends inside a line, is
+    `HOMES_CONSOLIDATE_RACED`, retryable, with nothing written.
+    Whether a process holds the file is read from `/proc`, so off Linux
+    (sting is Linux) a union that would write is held as
+    `HOMES_CONSOLIDATE_HOLDER_UNKNOWN`, with nothing written.
+- one **mapped** row per `--map-prefix SRC_REL=DST_REL` a `copy` or `pull`
+  landed entries through (#280 finding 9, "no duplicates"; accounted like
+  `applied`, the row printing `mapped`, the destination path). The map is a
+  receive-side rename, the wire unchanged: an entry at `SRC_REL` or under
+  `SRC_REL/` (whole components, the longest source wins) is decided, keyed
+  (`row_key` over the mapped row), recorded and published at `DST_REL` plus
+  the rest of its path, once. A path that would reach a map's destination
+  any other way is refused `DESTINATION_MAP_CONFLICT` with everything under
+  it (the owner rule: a destination path lands only through the map whose
+  destination is the deepest holding it), so no two seats of a session
+  meet at one name and nothing merges. A set with an invalid side, one
+  source or destination twice, or a destination whose parent is not where
+  its source's parent lands, refuses `FIELD_DOMAIN_VIOLATION` before
+  either store exists. `estate-move --sessions` pulls the Claude tree with
+  the project-key map of the re-seat's own lanes:
+  `projects/<key(S)>=projects/<key(D)>` for each lane `S -> D`, `D` at its
+  real path on the destination and keyed exactly as Claude Code keys it
+  (`reseat::key`). A key two lane sources share (keys are lossy), two keys
+  whose destination key is one, and a lane that does not resolve stay
+  unmapped, named on typed `estate-move key-map-held` lines. A mapped
+  session lands where Claude Code lists it and the re-seat finds it in
+  place; the source-key directories earlier passes left are never removed,
+  and `estate-move --key-map-proof` lists, report only, how the destination
+  key holds each of their files. A derived map whose lane's sessions the
+  source keyed otherwise is named on a typed `estate-move key-map-unused`
+  line.
+- **Race copies.** A copy of a transcript that a re-seat race leaves
+  behind is unioned into the live file (the archive target) and removed
+  once the merged bytes are durable (`reseat::fold`, SPEC rules 3 and 4).
+  This covers an A-106 swap-back copy that a writer appended to, and a
+  Q198 regularization copy. Only a refusing union holds: the copy is
+  renamed to `.<name>.<token>.kept-<inode>.bulkload-reseat` (the same file,
+  never a new copy) with nothing written, and every later pass retries it
+  first. While it refuses, the path is `held-written` (placement) or
+  `kept-held` (regularization), and `reseat_copy_folded` counts the folds.
 
 A transfer row's identity (`item`, 64 hex) is a digest of the transfer's
 source (`SOURCE`, or `HOST:SOURCE` for `pull`), its destination, the path
-and the code (or `covered`, `applied-beside`); its refusal `instance` digests the row's
+and the code (or `covered`, `applied-beside`, `consolidated`, `mapped`); its refusal `instance` digests the row's
 record, so a rerun that refuses identically keeps its review and any other
 record is a new instance. `closure-dispose --transfer DEST_STATE` reviews a
 transfer row as it reviews a planned item, in the same plan-bound ledger.
