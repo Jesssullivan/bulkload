@@ -613,7 +613,7 @@ pub(crate) fn verify_received(file: &fs::File, path: &Path, size: u64) -> Result
 /// The sidecars are only `lstat`ed, never opened: closing any descriptor of a
 /// file drops every POSIX lock the process holds on it, `SQLite`'s included.
 /// They sit beside the resolved path, as `SQLite` resolves symbolic links.
-struct Footprint {
+pub(crate) struct Footprint {
     wal: PathBuf,
     shm: PathBuf,
     /// No `-wal` sat beside the source before the read.
@@ -621,7 +621,7 @@ struct Footprint {
 }
 
 impl Footprint {
-    fn observe(source: &Path) -> Self {
+    pub(crate) fn observe(source: &Path) -> Self {
         let database = fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
         let wal = sidecar(&database, "-wal");
         let shm = sidecar(&database, "-shm");
@@ -635,7 +635,7 @@ impl Footprint {
 
     /// Count what the read left beside its source. Call it once the source
     /// connection is closed.
-    fn settle(self) {
+    pub(crate) fn settle(self) {
         // With a `-shm` beside the source, `SQLite` opened it read-write,
         // mapped it and locked it, whatever its bytes are now. Without one
         // there was no wal-index to touch (a rollback-journal database).
@@ -833,7 +833,7 @@ fn compose(
 /// code when `SQLite` reported one, never the message text.
 // A `map_err` adapter: it is handed the error by value.
 #[allow(clippy::needless_pass_by_value)]
-fn backup_refusal(error: rusqlite::Error) -> BulkloadRefusal {
+pub(crate) fn backup_refusal(error: rusqlite::Error) -> BulkloadRefusal {
     match error {
         rusqlite::Error::SqliteFailure(failure, _) => {
             BulkloadRefusal::SqliteBackupFailed(Some(failure.extended_code))

@@ -2334,6 +2334,134 @@ specified how a caller retries carry_v2's ingest locks
 `carry-v2-final` holds the code and the contract's text. A future receiver
 for these frames needs a contract of its own.
 
+## SQLite row union: `sqlite-union` (operator ruling 2026-10-20)
+
+SPEC, "How each kind of data is consolidated", the Codex SQLite row: "rows
+merged into sting's live database by primary key, streamed from neo's held
+read snapshot; no database copy is written; a key with two versions takes
+the later one, and the other is kept in the ledger". Rule 4 also applies
+("the result contains both"). Operator ruling 2026-10-20: "they must be
+consoldiated" and "no dupes, no duplciated besides, no stage dupes".
+
+**Transport.** `sqlite-union` runs over `pull`'s ssh child (the P76
+registry's `pull_command`). `serve_flags` adds the fixed literal
+`--sqlite-rows`, and the remote `serve` then speaks the row stream
+(`bulkload_proto::rows`, `ROWS_VERSION` 1, its own schema id); the transfer
+wire stays v6. The database path crosses in the request on stdin. `--local`
+runs both halves in one process. No database copy exists on either host at
+any point.
+
+**Read side** (`sqlite_union::serve_rows`, with `sqlite_union::hold`):
+
+- The store is opened read-only with a zero busy timeout. One WAL read
+  snapshot is held for the pass (operator ruling 2026-10-19 "Hold one read
+  snapshot"). It is released at the wall (the base, or
+  `--sqlite-carry-wall`, plus three reads of the store at 32 MiB/s, at most
+  30 min) or under the source's free-space floor, either way
+  `BUDGET_EXCEEDED`.
+- A rollback-journal store is `SQLITE_UNION_SOURCE_NOT_WAL`.
+- A store `SQLite` finds corrupt or not a database is
+  `SQLITE_UNION_SOURCE_UNREADABLE`: held, listed, nothing written. The
+  operator rules on it.
+- A store whose `stat` (the database and a non-empty `-wal`) is the one
+  recorded at the last completed pass is not opened.
+- `--clock STATE_DB` names the home's store with `threads`. It is attached
+  read-only before the snapshot is taken.
+
+**Schema.** An absent destination store is **created**. Only its schema is
+written, under a private name beside the path, from the source's tables,
+indexes, triggers, views and `user_version`. It is linked in only if the
+path is still free, then set to WAL, and its rows (`_sqlx_migrations`
+included) go in by the union. Otherwise the destination's schema must equal
+the source's entry for entry (`SQLITE_SCHEMA_MISMATCH`, nothing written). A
+virtual table, or a generated or hidden column, is
+`SQLITE_UNION_SCHEMA_UNSUPPORTED`. The live store must be this user's
+regular file. Its `(dev, ino)` and `schema_version` are checked again before
+every write batch.
+
+**Write side** (`sqlite_union::consolidate`). Tables are merged parents
+first, with `threads` before every thread-scoped table. Each batch is a
+`BEGIN IMMEDIATE` of at most 256 rows or 20 ms, under a 5 s busy timeout
+with backoff up to 5 min, `synchronous=FULL`, foreign keys enforced.
+
+- **Threads decide.** Merging `threads` records each thread's winner for
+  the source host in the ledger (`row_union_threads`): the side whose
+  `updated_at_ms` (or `updated_at`) is later, or `same`.
+- **Thread-scoped rows** (a natural-key table with `thread_id`, in any
+  store of the home) follow their thread:
+  - A key both sides hold takes the winner's version. The loser's version
+    is ledgered (`thread-newer` or `thread-older`).
+  - A key the destination lacks is inserted, whichever thread is later
+    (rule 4: the result contains both). If such an extra row would reuse
+    one of its thread's ordinals (`*ordinal`, not `updated_at_ordinal`) for
+    another row, the thread is **held**: it is ledgered `thread-held`,
+    listed (`held_threads`), recorded `held`, and nothing more is written
+    for it until the operator rules.
+- **Other natural-key rows:** absent rows are inserted, and equal rows are
+  adopted with nothing written. A differing row is replaced only by a
+  strictly later version column (`updated_at_ms`, `updated_at`,
+  `updated_at_ordinal`). A replacement is an `UPDATE`, so no cascade fires.
+- **Surrogate keys** (`AUTOINCREMENT`, such as `logs.id`): new keys here. A
+  `UNIQUE` match is adopted when equal and kept as the destination's
+  otherwise. An insert batch is ledgered as pending before its commit and
+  confirmed after it, so a row is never inserted twice.
+- **Constraints:** a row a constraint refuses is ledgered, not written.
+- **Paths:** `cwd`, `path` and `*_path` values are re-spelled through
+  `--map` (A-055).
+
+**Ledger.** The `row_union_*` tables live in the homes' consolidation
+ledger, `STATE/consolidate.sqlite`, on `consolidate::Ledger::connection()`
+(#297). They hold every row not in
+the destination's final state: its key as JSON, its reason, its BLAKE3 and
+its JSON. A displaced row is ledgered durably before the commit that
+replaces it.
+
+**Rerun** (SPEC rule 8, "reads only what changed"). Per table the source
+reads `rowid > r OR <changed> >= t`, in rowid order:
+
+- `<changed>` is the table's own time column. For a thread-scoped table
+  with no time column of its own (`thread_items`), it is the row's thread's
+  `updated_at` in the clock store. A changed thread therefore has all its
+  rows read again, and no other thread's are.
+- `t` is the high value at the start of the scan that last reached the
+  table's end. A row changed after a scan started has a time at least that
+  high, so the rowid mark is saved every 32 batches without losing it.
+- Surrogate tables are read by rowid mark only, even under `--full`.
+- `--full` reads every natural-key row again.
+
+After a pass, `integrity_check` must say `ok`, and `foreign_key_check` rows
+are counted.
+
+**Order and gaps.**
+
+- A thread-scoped row of a thread with no recorded winner keeps per-row
+  later-wins.
+
+**Dispatch** (`copy`/`pull --consolidate`, #297). The receive skips a
+`SQLite` store and its `-wal`, `-shm` and `-journal` on the file path,
+with nothing read (`TransferStats::sqlite_routed`). After the session,
+`sqlite_union::union_routed` merges each store by the row union, one serve
+session per store: `pull` uses its ssh child with `--sqlite-rows`, and
+`copy` runs in process. A home's `state_*.sqlite` goes first in each
+directory and is the clock of that directory's other stores. Each outcome
+joins the session's transfer record before it is written
+(`sqlite_union::fold`):
+
+- `consolidate`, `covered` (the store was unchanged) or `created`;
+- a hold, with the union's typed code;
+- the refusal, for example `HOMES_CONSOLIDATE_RACED` when the live store
+  stayed locked past the batch wall or was replaced (retryable).
+
+A sidecar the source reports beside a routed store is routed with it
+rather than refused, and the store's sidecars follow its outcome.
+`--plan-only` asks each store's source for its header only: a plain
+100-byte read, no `SQLite` lock. It lists the store `row-union`, or `hold`
+with `SQLITE_UNION_SOURCE_NOT_WAL` (a rollback-journal store, whose read
+would need a shared lock its writer waits on, SPEC rule 6) or
+`SQLITE_UNION_SOURCE_UNREADABLE`. Each store also gets one
+`planned-sqlite STORE WORD` line.
+- `>=` re-reads the rows at the old time mark itself; they are adopted.
+
 ## Durability
 
 A record is never committed before the bytes it describes are durable on the
