@@ -510,6 +510,8 @@ ok.
   yet). This lane supplies its append-log row (`append_log::plan_at`).
 - A copy whose union keeps refusing (a process never closes the file)
   stays kept and held until it can be unioned.
+- Darwin's open-holder check (libproc) is not built; off Linux the union
+  holds typed.
 - A link outside the archive roots, and a session held under a key that
   is no map source, stay held (`OTHER_KIND`, `held_elsewhere`).
 - `just darwin-check` on pzm is owed before merge.
