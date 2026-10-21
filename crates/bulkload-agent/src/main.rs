@@ -85,7 +85,12 @@ SUBCOMMANDS:
                 Native SSH pull; remote bulkload-agent must be installed; the
                 session is recorded in DEST_STATE as copy's is. --file as
                 copy's, run on the source as serve --file; --consolidate and
-                --map-prefix as copy's
+                --map-prefix as copy's. The transport is the first ssh on
+                PATH (as for sqlite-union and estate-move's pulls); it must
+                parse this host's /etc/ssh config. On a host whose system
+                config a PATH ssh cannot read (sting: a nix openssh against
+                Rocky's crypto-policies, refused TRANSPORT_LOST), put the
+                system ssh first: env PATH=/usr/bin:$PATH bulkload-agent ...
     serve [--file]
                 Serve one framed request on stdin/stdout (for SSH). With
                 --file the root the request names is one file or symlink,
@@ -283,6 +288,7 @@ SUBCOMMANDS:
                 [--activate-origin PREFIX]... [--side-root ROOT]... [--jobs N] [--dispositions LEDGER]
                 [--sessions SOURCE_HOME [--codex-source-root DIR] [--dest-home DIR]
                  [--map SRC=DST]... [--reseat-arg ARG]... [--replace-archived-dest ROOT]...
+                 [--live-link-root ROOT]... [--regularize-link-root ROOT]...
                  [--key-map-proof]]
                 [--remote-executable PATH [--ssh-config FILE]]
                 HOST|- SOURCE_MOVE_STATE MOVE_STATE
@@ -376,7 +382,18 @@ SUBCOMMANDS:
                 file and regularized at the live name, the archive copy
                 kept; a session the destination holds at a mapped source
                 key is folded into the mapped key (moved when absent there,
-                else unioned; key-fold lines). With --plan-only --sessions every home file is listed
+                else unioned; key-fold lines; a source-key link folds
+                through its target, only the link name removed). Per-repo
+                lanes are derived: each directory under the destination of
+                SOURCE_HOME/git keys by its real path. A home directory that
+                links into a --live-link-root ROOT is the live directory
+                itself: the source's directory is merged there (its own
+                pull, estate-move live-link lines), the link stays. A link
+                in a home into a --regularize-link-root ROOT (a repair
+                stage) becomes a real file or directory holding its target's
+                bytes before the pull, ROOT never written (estate-move
+                regularize and regularized-links lines, remaining= counting
+                links left into ROOT). With --plan-only --sessions every home file is listed
                 (planned PATH class= action= source_size= live_size=) and
                 nothing is landed, merged or recorded. State
                 MOVE_STATE/reseat. 7

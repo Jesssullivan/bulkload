@@ -124,7 +124,24 @@ pub fn derive(options: &Options) -> Result<KeyMaps> {
         .iter()
         .map(|(source, _)| source.clone())
         .collect();
-    sources.push(options.source_home.join("git"));
+    let source_git = options.source_home.join("git");
+    sources.push(source_git.clone());
+    // The per-repo lanes, derived (no flag per repo): a session's cwd is a
+    // repository under the source's git root far more often than the root
+    // itself, and Claude Code keys it by the repository's own path. Each
+    // directory (or link to one) directly under the destination of that
+    // root is a lane `SOURCE_HOME/git/NAME`, its destination resolved to
+    // its real path here and keyed by it (an archive link keys by the
+    // archive path). An explicit --map for the same source wins as before.
+    if let Ok(Some(lane)) = lanes.lane(&source_git) {
+        if let Ok(entries) = std::fs::read_dir(&lane.dest_cwd) {
+            for entry in entries.flatten() {
+                if std::fs::metadata(entry.path()).is_ok_and(|meta| meta.is_dir()) {
+                    sources.push(source_git.join(entry.file_name()));
+                }
+            }
+        }
+    }
     sources.sort();
     sources.dedup();
     // Source key → (lane source, its destination key or none).
@@ -438,6 +455,7 @@ fn status(file: &Path, size: u64, at: &Path, suffix: Option<&str>) -> Result<&'s
 ///
 /// # Errors
 /// I/O refusals of the listing; a transcript whose `cwd` cannot be read.
+#[allow(clippy::too_many_lines)] // Walk, judge each file, its fold, its line.
 pub fn proof(
     options: &Options,
     maps: &KeyMaps,
@@ -490,8 +508,17 @@ pub fn proof(
         };
         for rel in files {
             let path = root.join(&rel);
-            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            let Ok(node) = std::fs::symlink_metadata(&path) else {
                 continue;
+            };
+            // A link to a regular file (into the archive) is judged by its
+            // target's bytes, as the fold merges through it; only its name
+            // is ever removed.
+            let link = node.file_type().is_symlink();
+            let meta = if link {
+                std::fs::metadata(&path).unwrap_or(node)
+            } else {
+                node
             };
             let first = rel
                 .components()
@@ -511,7 +538,14 @@ pub fn proof(
                 _ if !meta.is_file() => "source-not-regular",
                 None => "unresolved",
                 Some(to) if *to == dir => "in-place",
-                Some(to) => status(&path, meta.len(), &projects.join(to).join(&rel), suffix)?,
+                Some(to) => {
+                    let bytes = if link {
+                        std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone())
+                    } else {
+                        path.clone()
+                    };
+                    status(&bytes, meta.len(), &projects.join(to).join(&rel), suffix)?
+                }
             };
             *summary.files.entry(word).or_default() += 1;
             // What the next mapped pull does with it (`--consolidate`): every
@@ -532,7 +566,7 @@ pub fn proof(
                 _ => "none",
             };
             emit(&format!(
-                "{{\"schema\":\"{SCHEMA}\",\"kind\":\"key-map-proof\",\"tool\":\"claude\",\"source_key\":{},\"dest_key\":{},\"basis\":\"{basis}\",\"path\":{},\"size\":{},\"status\":\"{word}\",\"fold\":\"{fold}\"}}",
+                "{{\"schema\":\"{SCHEMA}\",\"kind\":\"key-map-proof\",\"tool\":\"claude\",\"source_key\":{},\"dest_key\":{},\"basis\":\"{basis}\",\"path\":{},\"size\":{},\"status\":\"{word}\",\"fold\":\"{fold}\",\"link\":{link}}}",
                 json_string(&dir),
                 to.as_deref().map_or_else(|| "null".to_owned(), json_string),
                 json_string(&rel.to_string_lossy()),
@@ -561,6 +595,45 @@ mod tests {
             .map(|(source, dest)| (base.join(source), base.join(dest)))
             .collect();
         options
+    }
+
+    /// The per-repo lanes are derived, no flag per repository: each
+    /// directory under the destination's git root (a link into an archive
+    /// root included) maps its source key to the key of its real path.
+    #[test]
+    fn per_repo_lanes_are_derived_and_keyed_by_their_real_path() {
+        let base = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(base.path()).unwrap();
+        std::fs::create_dir_all(base.join("srv/git/lab")).unwrap();
+        std::fs::create_dir_all(base.join("archive/git/old-site")).unwrap();
+        std::fs::create_dir_all(base.join("home/jess")).unwrap();
+        std::os::unix::fs::symlink(base.join("srv/git"), base.join("home/jess/git")).unwrap();
+        // A repository whose destination is a link into an archive root.
+        std::os::unix::fs::symlink(
+            base.join("archive/git/old-site"),
+            base.join("srv/git/old-site"),
+        )
+        .unwrap();
+        std::fs::write(base.join("srv/git/notes.txt"), b"not a repo\n").unwrap();
+        let derived = derive(&options(&base, &[("Users/jess/git", "home/jess/git")])).unwrap();
+        let key_of = |path: &Path| key::project_key(path.to_str().unwrap());
+        let maps: Vec<(String, String)> = derived
+            .maps
+            .iter()
+            .map(|map| (map.from.clone(), map.to.clone()))
+            .collect();
+        for (source, real) in [
+            ("Users/jess/git/lab", base.join("srv/git/lab")),
+            ("Users/jess/git/old-site", base.join("archive/git/old-site")),
+        ] {
+            let pair = (key_of(&base.join(source)), key_of(&real));
+            assert!(maps.contains(&pair), "{pair:?} in {maps:?}");
+        }
+        assert!(
+            !maps.iter().any(|(from, _)| from.ends_with("notes-txt")),
+            "a file is no lane: {maps:?}"
+        );
+        assert!(derived.held.is_empty(), "{:?}", derived.held);
     }
 
     /// A lossy key two lane sources share, and two keys landing at one
