@@ -18,11 +18,8 @@
 //! - any payload a pass leaves in its state is named and refused
 //!   `STATE_PAYLOAD_LEFT`.
 //!
-//! The P-MOVE-1..3 landing proofs this file held (M2 item 7), and the four
-//! `--sessions` passes over a Git lane below (plan of record 2026-10-19,
-//! C9 to C11), wait for the streamed capture (PR B), which brings them back
-//! over live-store transfers: until then they are `#[ignore]`d with that
-//! reason.
+//! The `--sessions` passes over a Git lane below land the lane through the
+//! streamed capture and consolidate the homes (#297).
 
 #![allow(
     clippy::unwrap_used,
@@ -793,7 +790,6 @@ fn a_sessions_only_pass_lands_the_live_home_with_no_payload_in_state() {
 /// - The closure counts the session transfers and the re-seat (C11).
 /// - An unchanged rerun rewrites nothing.
 #[test]
-#[ignore = "waits for the streamed capture (PR B): SPEC rule 2 refuses the git capture and corpus pull this pass needs"]
 fn sessions_are_consolidated_into_the_live_home_and_the_gate_reads_them() {
     let base = std::env::temp_dir().join(format!("bulkload-move-home-{}", std::process::id()));
     let _ = fs::remove_dir_all(&base);
@@ -1101,7 +1097,6 @@ fn sessions_are_consolidated_into_the_live_home_and_the_gate_reads_them() {
 /// (N1), the rollout lands in place, and a destination session with no
 /// `cwd` under a destination key is in place and holds nothing.
 #[test]
-#[ignore = "waits for the streamed capture (PR B): SPEC rule 2 refuses the git capture and corpus pull this pass needs"]
 fn sessions_into_a_destination_with_no_codex_index_hold_the_store() {
     let base = std::env::temp_dir().join(format!("bulkload-move-fresh-{}", std::process::id()));
     let _ = fs::remove_dir_all(&base);
@@ -1287,7 +1282,6 @@ fn sessions_into_a_destination_with_no_codex_index_hold_the_store() {
 /// - A source session with no lane is `RESEAT_LANE_UNMAPPED`, typed, and
 ///   holds the gate.
 #[test]
-#[ignore = "waits for the streamed capture (PR B): SPEC rule 2 refuses the git capture and corpus pull this pass needs"]
 fn archive_links_follow_a106_and_destination_links_stay() {
     const SID_FORK: &str = "5e5e5e5e-3333-4222-8333-444444444444";
     const SID_NEO_KEY: &str = "5e5e5e5e-4444-4222-8333-444444444444";
@@ -1611,7 +1605,6 @@ fn archive_links_follow_a106_and_destination_links_stay() {
 /// re-seat ledger recorded it as neo's): never `in-place`, the gate never
 /// passes on it, and its refused ledger row is never overwritten.
 #[test]
-#[ignore = "waits for the streamed capture (PR B): SPEC rule 2 refuses the git capture and corpus pull this pass needs"]
 fn listed_then_pruned_sessions_with_no_lane_stay_typed() {
     const SID_PRUNED: &str = "5e5e5e5e-8888-4222-8333-444444444444";
     const T_LANE: &str = "019a0000-0000-7000-8000-00000000000b";
@@ -1836,7 +1829,6 @@ fn tree_files(root: &Path) -> Vec<(String, Vec<u8>)> {
 /// lists every file of the homes with its class, its action and the sizes
 /// on both sides before anything lands, and writes nothing to them.
 #[test]
-#[ignore = "waits for the streamed capture (PR B): SPEC rule 2 refuses the git capture and corpus pull this pass needs"]
 fn the_homes_plan_lists_every_file_and_writes_nothing() {
     let base = std::env::temp_dir().join(format!("bulkload-move-plan-{}", std::process::id()));
     let _ = fs::remove_dir_all(&base);
