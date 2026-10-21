@@ -170,8 +170,7 @@ fn code(repo: &Path, args: &[&str]) -> Option<i32> {
         return Some(code);
     }
     let mut again = git(repo);
-    again.envs(super::git_env::GRAPH_OFF.iter().copied());
-    again
+    super::without_graph(&mut again)
         .args(args)
         .output()
         .ok()?

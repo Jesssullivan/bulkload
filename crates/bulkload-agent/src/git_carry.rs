@@ -187,6 +187,15 @@ fn git(repo: &Path) -> Command {
     command
 }
 
+/// Turn the commit-graph off in `command` (a [`git`] read run once more
+/// after it failed): [`git_env::GRAPH_OFF`].
+fn without_graph(command: &mut Command) -> &mut Command {
+    for (key, value) in git_env::GRAPH_OFF {
+        command.env(key, value);
+    }
+    command
+}
+
 /// The oldest Git whose destination writes this carry trusts: 2.46 has
 /// `core.fsync=reference` (2.36) and `update-ref --stdin`'s `symref-*`
 /// commands, which move a worktree's HEAD and its branch in one

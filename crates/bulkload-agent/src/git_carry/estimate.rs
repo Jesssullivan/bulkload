@@ -1106,9 +1106,7 @@ fn commit_graph_retry(command: &mut Command) -> bool {
     };
     let read_only = READ_ONLY_SUBCOMMANDS.contains(&subcommand);
     if read_only {
-        for (key, value) in super::git_env::GRAPH_OFF {
-            command.env(key, value);
-        }
+        super::without_graph(command);
     }
     read_only
 }
