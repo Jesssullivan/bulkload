@@ -107,7 +107,7 @@ impl Measure {
 /// (`carry-files/ITEM/source` and `/dest`), per `pull` (`pull/NAME`) and
 /// per `serve` (`serve/NAME`, `serve/carry/ITEM`). (Not led by `pull`: the
 /// S2 registry scan reads a list led by a Git subcommand as Git arguments.)
-const STORE_HOMES: &[&str] = &["reseat", "carry-files", "pull", "serve"];
+const STORE_HOMES: &[&str] = &["reseat", "carry-files", "pull", "serve", "consolidate"];
 
 /// The pulls' home, where the session pulls also keep their provenance
 /// listings.
@@ -126,6 +126,11 @@ const STORE_LEDGERS: &[&str] = &[
     "reseat.sqlite-shm",
     "reseat.sqlite-journal",
     "reseat.lock",
+    // #297's consolidation ledger: every value a union did not keep.
+    "consolidate.sqlite",
+    "consolidate.sqlite-wal",
+    "consolidate.sqlite-shm",
+    "consolidate.sqlite-journal",
 ];
 
 /// The move's own ledgers at the state directory's top.
@@ -442,6 +447,7 @@ mod tests {
             "carry-files/item/dest/transfer.sqlite",
             "reseat/reseat.sqlite",
             "reseat/reseat.lock",
+            "consolidate/consolidate.sqlite",
         ] {
             assert!(ledger(&rel(path)), "{path} is a ledger");
         }
