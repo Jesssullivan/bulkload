@@ -3248,17 +3248,17 @@ fn the_plan_prints_every_b2_decision_and_writes_nothing() {
     let planned = world.planned();
     let both = format!("{}\n{}", planned.stdout, planned.stderr);
     assert!(planned.ok, "{both}");
-    let line = words(plan_line(&planned.stdout, &live));
-    assert_eq!(line["action"], "consolidate", "{both}");
-    assert_eq!(line["refs_created"], "1", "{both}");
-    assert_eq!(line["refs_tracked"], "1", "{both}");
-    assert_eq!(line["merges"], "1", "{both}");
-    assert_eq!(line["conflicts"], "1", "{both}");
-    assert_eq!(line["land"], "1", "{both}");
-    assert_eq!(line["untracked"], "1", "{both}");
-    assert_eq!(line["changed"], "2", "{both}");
-    assert_eq!(line["asides"], "1", "{both}");
-    assert_eq!(line["worktree"], "main", "{both}");
+    let row = words(plan_line(&planned.stdout, &live));
+    assert_eq!(row["action"], "consolidate", "{both}");
+    assert_eq!(row["refs_created"], "1", "{both}");
+    assert_eq!(row["refs_tracked"], "1", "{both}");
+    assert_eq!(row["merges"], "1", "{both}");
+    assert_eq!(row["conflicts"], "1", "{both}");
+    assert_eq!(row["land"], "1", "{both}");
+    assert_eq!(row["untracked"], "1", "{both}");
+    assert_eq!(row["changed"], "2", "{both}");
+    assert_eq!(row["asides"], "1", "{both}");
+    assert_eq!(row["worktree"], "main", "{both}");
     assert!(
         planned
             .stdout
@@ -3328,14 +3328,14 @@ fn a_refused_capture_is_held_and_nothing_is_written_beside_or_live() {
     );
     let planned = world.planned();
     let both = format!("{}\n{}", planned.stdout, planned.stderr);
-    for live in [&occupied, &world.dst().join("solo")] {
-        let line = words(plan_line(&planned.stdout, live));
-        assert_eq!(line["action"], "held", "{both}");
-        assert_eq!(line["code"], "GIT_SOURCE_PARTIAL_CLONE", "{both}");
+    for place in [&occupied, &world.dst().join("solo")] {
+        let row = words(plan_line(&planned.stdout, place));
+        assert_eq!(row["action"], "held", "{both}");
+        assert_eq!(row["code"], "GIT_SOURCE_PARTIAL_CLONE", "{both}");
     }
     let moved = world.moved();
     let both = format!("{}\n{}", moved.stdout, moved.stderr);
-    for live in [&occupied, &world.dst().join("solo")] {
+    for place in [&occupied, &world.dst().join("solo")] {
         assert!(
             moved
                 .stdout
@@ -3343,7 +3343,7 @@ fn a_refused_capture_is_held_and_nothing_is_written_beside_or_live() {
                 .any(|line| line.contains("outcome=held code=CAPTURE_ABSENT")
                     && line.contains("capture_code=GIT_SOURCE_PARTIAL_CLONE")),
             "{} {both}",
-            live.display()
+            place.display()
         );
     }
     assert!(!world.dst().join("solo").exists(), "{both}");
@@ -3362,7 +3362,7 @@ fn a_refused_capture_is_held_and_nothing_is_written_beside_or_live() {
 
 /// The coordinator, 2026-10-21: a path outside every `--map` (a worktree
 /// under the source's home, outside `~/git`) is placed by the default home
-/// map, SOURCE_HOME=DEST_HOME, its absent parents made 0700 under the
+/// map, `SOURCE_HOME=DEST_HOME`, its absent parents made 0700 under the
 /// destination home; never at the source's raw path.
 #[test]
 fn a_path_outside_the_maps_lands_under_the_destination_home() {
