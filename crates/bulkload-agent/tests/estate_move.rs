@@ -726,6 +726,7 @@ fn nested_repositories_and_submodules_land_as_their_own_items() {
     git(&parent, &["commit", "--quiet", "-m", "add sub"]);
     // An independent repository nested in the worktree (untracked by it).
     repo(&parent.join("vendor/tool"), "tool.txt");
+    fs::create_dir_all(parent.join(".git/info")).unwrap();
     fs::write(parent.join(".git/info/exclude"), "vendor/\n").unwrap();
     let sourced = world.source();
     assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);

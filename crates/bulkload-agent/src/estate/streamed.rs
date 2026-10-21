@@ -445,10 +445,10 @@ pub fn land(
 // The live object store an item owns (a main or bare repository's), from
 // its excluded `objects` path.
 fn store_of(snapshot: &ItemSnapshot, live: &Path, map: &[(Vec<u8>, Vec<u8>)]) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
     if let Some(admin) = admin_of(snapshot, map) {
         return Some(admin.join("objects"));
     }
-    use std::os::unix::ffi::OsStrExt as _;
     snapshot
         .excluded
         .iter()
