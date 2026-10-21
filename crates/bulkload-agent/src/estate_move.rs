@@ -716,20 +716,31 @@ impl Move {
     }
 }
 
-// The `upload-pack` program a streamed fetch runs at the source: this
-// agent's `upload-pack` verb, here for HOST `-` (SPEC rule 2 reset, B1). A
-// remote source needs the fetch relayed over the move's own transport,
-// which is not built yet: refused, typed, before anything is fetched.
+// The `upload-pack` program a streamed fetch runs (SPEC rule 2 reset, B1):
+// this agent's `upload-pack` verb for HOST `-`, else its relay to the
+// remote one.
 fn upload_pack_program(run: &Move) -> Result<String> {
-    if !run.local() {
-        return Err(BulkloadRefusal::TransportLost);
-    }
+    let quoted = |word: &std::ffi::OsStr| -> Result<String> {
+        let word = word.to_str().ok_or(BulkloadRefusal::PathNotPortable)?;
+        if word.contains('\'') {
+            return Err(BulkloadRefusal::PathNotPortable);
+        }
+        Ok(format!("'{word}'"))
+    };
     let exe = std::env::current_exe().refuse_at("estate_move::upload_pack")?;
-    let exe = exe.to_str().ok_or(BulkloadRefusal::PathNotPortable)?;
-    if exe.contains('\'') {
-        return Err(BulkloadRefusal::PathNotPortable);
+    let exe = quoted(exe.as_os_str())?;
+    if run.local() {
+        return Ok(format!("{exe} upload-pack"));
     }
-    Ok(format!("'{exe}' upload-pack"))
+    // A remote source: `git fetch` runs this agent's relay, which reaches
+    // the remote `upload-pack` over the one ssh session builder.
+    let dash = std::ffi::OsString::from("-");
+    Ok(format!(
+        "{exe} relay-upload-pack {} {} {}",
+        quoted(&run.host)?,
+        quoted(run.remote.as_ref().unwrap_or(&dash))?,
+        quoted(run.config.as_ref().unwrap_or(&dash))?,
+    ))
 }
 
 // Record a phase's end in the ledger (written durably) and print it.

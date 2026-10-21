@@ -958,6 +958,7 @@ fn main() -> ExitCode {
         Some("estate-reseat") => reseat_command(&args.collect::<Vec<_>>()),
         Some("serve") => serve_command(&args.collect::<Vec<_>>()),
         Some("upload-pack") => upload_pack_command(&args.collect::<Vec<_>>()),
+        Some("relay-upload-pack") => relay_upload_pack_command(&args.collect::<Vec<_>>()),
         Some("help" | "--help" | "-h") => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -2813,6 +2814,31 @@ fn pull_command(
     kind: bulkload_agent::transfer::RootKind,
     args: &[std::ffi::OsString],
 ) -> Result<bulkload_agent::transfer::TransferStats> {
+    remote_command(Remote::Serve(kind), args)?.ok_or(BulkloadRefusal::ProtocolStateViolation)
+}
+
+/// What the remote `bulkload-agent` an ssh session starts runs.
+#[derive(Clone, Copy)]
+enum Remote<'a> {
+    /// `serve`, the source half of a pull.
+    Serve(bulkload_agent::transfer::RootKind),
+    /// `upload-pack REPO`, the source end of a streamed fetch (SPEC rule 2
+    /// reset, B1), its stdio this process's (a `git fetch`'s pipes).
+    UploadPack(&'a str),
+}
+
+// The one ssh session builder: a pull's `serve`, or a streamed fetch's
+// relayed `upload-pack`. ARGS are pull's: HOST, then (a pull's) SOURCE,
+// DEST, SOURCE_STATE and DEST_STATE, then REMOTE_EXECUTABLE and SSH_CONFIG.
+#[allow(clippy::too_many_lines)] // One builder, its two remote words.
+fn remote_command(
+    mode: Remote<'_>,
+    args: &[std::ffi::OsString],
+) -> Result<Option<bulkload_agent::transfer::TransferStats>> {
+    let kind = match mode {
+        Remote::Serve(kind) => kind,
+        Remote::UploadPack(_) => bulkload_agent::transfer::RootKind::Tree,
+    };
     let path = |index: usize| {
         args.get(index)
             .map(Path::new)
@@ -2821,6 +2847,7 @@ fn pull_command(
     let host = args.first().ok_or(BulkloadRefusal::RequiredFieldMissing)?;
     let remote = match args.get(5) {
         None => "bulkload-agent",
+        Some(value) if value == "bulkload-agent" => "bulkload-agent",
         Some(value) => {
             let value = value.to_str().ok_or(BulkloadRefusal::PathNotPortable)?;
             if !Path::new(value).is_absolute()
@@ -2849,17 +2876,43 @@ fn pull_command(
     if bulkload_agent::durable::ledger_sync() == bulkload_agent::durable::LedgerSync::Full {
         ssh.arg("--source-ledger-sync=full");
     }
-    ssh.arg("serve");
+    let relay = match mode {
+        Remote::Serve(_) => false,
+        // The repository, quoted for the remote shell ssh hands it to.
+        Remote::UploadPack(repo) => {
+            if repo.contains('\'') || !repo.starts_with('/') {
+                return Err(BulkloadRefusal::PathNotPortable);
+            }
+            ssh.arg("upload-pack").arg(format!("'{repo}'"));
+            true
+        }
+    };
+    if !relay {
+        ssh.arg("serve");
+    }
     // #232: the source half serves one regular file, as this side lands it.
     if kind == bulkload_agent::transfer::RootKind::File {
         ssh.arg("--file");
     }
+    let (wire_in, wire_out) = if relay {
+        (Stdio::inherit(), Stdio::inherit())
+    } else {
+        (Stdio::piped(), Stdio::piped())
+    };
     let mut child = ssh
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+        .stdin(wire_in)
+        .stdout(wire_out)
         .stderr(Stdio::inherit())
         .spawn()
         .refuse_at("main::pull_command")?;
+    if relay {
+        let status = child.wait().refuse_at("main::pull_command")?;
+        return if status.success() {
+            Ok(None)
+        } else {
+            Err(BulkloadRefusal::TransportLost)
+        };
+    }
     let result = {
         let mut output = child.stdin.take().ok_or(BulkloadRefusal::Io(None))?;
         let mut input = child.stdout.take().ok_or(BulkloadRefusal::Io(None))?;
@@ -2881,7 +2934,32 @@ fn pull_command(
     if !exit_status.success() {
         return Err(BulkloadRefusal::TransportLost);
     }
-    Ok(stats)
+    Ok(Some(stats))
+}
+
+// `relay-upload-pack HOST REMOTE_EXECUTABLE SSH_CONFIG REPO` (`-` for
+// either of the middle two: the default), the program a streamed fetch's
+// `git fetch` runs as its `upload-pack` when the source is remote (git
+// appends REPO): the remote `bulkload-agent upload-pack REPO`, over the one
+// ssh builder, its stdio this process's.
+fn relay_upload_pack_command(args: &[std::ffi::OsString]) -> Result<()> {
+    let [host, remote, config, repo] = args else {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
+    };
+    let repo = repo.to_str().ok_or(BulkloadRefusal::PathNotPortable)?;
+    let mut pull: Vec<std::ffi::OsString> = vec![host.clone()];
+    pull.extend(std::iter::repeat_n(std::ffi::OsString::new(), 4));
+    if remote != "-" || config != "-" {
+        pull.push(if remote == "-" {
+            "bulkload-agent".into()
+        } else {
+            remote.clone()
+        });
+    }
+    if config != "-" {
+        pull.push(config.clone());
+    }
+    remote_command(Remote::UploadPack(repo), &pull).map(drop)
 }
 
 fn steps(value: Option<&std::ffi::OsString>) -> Result<u32> {
