@@ -984,6 +984,59 @@ fn sessions_into_a_destination_with_no_codex_index_hold_the_store() {
         &src_git,
     ]));
     assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
+    // The plan resolves the symlinked homes as the real pass does (never
+    // creating or writing them) and lists the Claude tree under the key map
+    // the real pass uses: the source's session at the lane's destination
+    // key.
+    let before = tree_files(&state_dir);
+    let planned = agent(&os(&[
+        &"estate-move",
+        &"--plan-only",
+        &"--label",
+        &LABEL,
+        &"--source",
+        &"neo",
+        &"--sessions",
+        &src_home,
+        &"--dest-home",
+        &dst_home,
+        &"--map",
+        &map,
+        &"-",
+        &source_state,
+        &state,
+    ]));
+    assert!(planned.ok, "{}\n{}", planned.stdout, planned.stderr);
+    assert!(
+        planned
+            .stdout
+            .contains("estate-move sessions-home name=claude"),
+        "{}",
+        planned.stdout
+    );
+    // The Claude home's plan is refused nothing (the Codex store's typed
+    // hold is its own line).
+    assert!(
+        !planned.stdout.contains("homes-plan name=.claude refused="),
+        "{}",
+        planned.stdout
+    );
+    assert!(
+        planned.stdout.lines().any(|line| line.starts_with(&format!(
+            "planned projects/{}/{SID}.jsonl class=append-log action=create",
+            key(&dst_lane)
+        ))),
+        "{}",
+        planned.stdout
+    );
+    assert!(
+        !planned
+            .stdout
+            .contains(&format!("planned projects/{}/", key(&src_lane))),
+        "nothing planned under the source key: {}",
+        planned.stdout
+    );
+    assert_eq!(tree_files(&state_dir), before, "the plan wrote nothing");
     let moved = agent(&os(&[
         &"estate-move",
         &"--label",
@@ -1242,16 +1295,29 @@ fn archive_links_follow_a106_and_destination_links_stay() {
         &dst_home,
         &"--map",
         &map,
+        &"--replace-archived-dest",
+        &archive,
         &"-",
         &source_state,
         &state,
     ]));
     assert!(planned.ok, "{}\n{}", planned.stdout, planned.stderr);
+    // Planned under the key map: the fork at the lane's key is an archive
+    // link, unioned and regularized; the neo-key copy of another session is
+    // folded (moved) into the lane's key.
     assert!(
         planned.stdout.lines().any(|line| line.starts_with(&format!(
-            "planned projects/{}/{SID_FORK}.jsonl class=append-log action=hold ",
+            "planned projects/{}/{SID_FORK}.jsonl class=append-log action=consolidate ",
+            key(&dst_lane)
+        ))),
+        "{}",
+        planned.stdout
+    );
+    assert!(
+        planned.stdout.lines().any(|line| line.starts_with(&format!(
+            "planned projects/{}/{SID_NEO_KEY}.jsonl class=append-log action=fold-move ",
             key(&src_lane)
-        )) && line.contains("under another key")),
+        ))),
         "{}",
         planned.stdout
     );
@@ -2073,6 +2139,7 @@ fn the_homes_plan_lists_every_file_and_writes_nothing() {
     fs::create_dir_all(&dst_git).unwrap();
     repo(&src_git.join("lab"), "l.txt");
     let src_lane = src_git.join("lab");
+    let dst_lane = dst_git.join("lab");
     let src_claude = src_home.join(".claude");
     let src_projects = src_claude.join("projects").join(key(&src_lane));
     fs::create_dir_all(&src_projects).unwrap();
@@ -2140,7 +2207,8 @@ fn the_homes_plan_lists_every_file_and_writes_nothing() {
         ("same.txt", "adopt"),
         ("blob.bin", "hold"),
         (
-            &format!("projects/{}/{SID}.jsonl", key(&src_lane)) as &str,
+            // Under the key map the real pass derives (#280 finding 9).
+            &format!("projects/{}/{SID}.jsonl", key(&dst_lane)) as &str,
             "create",
         ),
         (".claude.json", "consolidate"),
