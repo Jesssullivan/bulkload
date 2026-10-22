@@ -1658,6 +1658,22 @@ fn skip() -> Vec<Vec<u8>> {
     SKIP.lock().unwrap_or_else(PoisonError::into_inner).clone()
 }
 
+/// The [`set_skip`] prefixes the source offered an entry at or under, in
+/// this process's sessions since the last [`take_skip_seen`].
+static SKIP_SEEN: Mutex<std::collections::BTreeSet<Vec<u8>>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
+/// The skipped prefixes the source walk offered anything at or under since
+/// the last call; they are cleared.
+///
+/// A prefix absent here after a completed session is one the source does
+/// not have: its own session (a live link's pull) has nothing to merge
+/// (2026-10-22).
+#[must_use]
+pub fn take_skip_seen() -> std::collections::BTreeSet<Vec<u8>> {
+    std::mem::take(&mut *SKIP_SEEN.lock().unwrap_or_else(PoisonError::into_inner))
+}
+
 /// Whether `path` is `prefix` or lies under it, by whole components.
 fn under_prefix(path: &[u8], prefix: &[u8]) -> bool {
     path == prefix
@@ -6434,11 +6450,16 @@ impl<W: Write> Inbound<'_, W> {
     /// path ([`PrefixMap::land`]), recording the map it was landed
     /// through, or [`Walked::Unowned`] at its source path.
     fn landed(&mut self, entry: u64, mut row: RowSchema, wal: Option<SidecarId>) -> Walked {
-        if self
+        let landed = self.maps.path(row.rel_path.clone());
+        if let Some(prefix) = self
             .skip
             .iter()
-            .any(|prefix| under_prefix(&self.maps.path(row.rel_path.clone()), prefix))
+            .find(|prefix| under_prefix(&landed, prefix))
         {
+            SKIP_SEEN
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(prefix.clone());
             return Walked::Skipped { entry };
         }
         if self.maps.is_empty() {
