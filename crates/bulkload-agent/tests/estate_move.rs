@@ -2997,6 +2997,10 @@ fn homes_links_are_resolved_and_folded_through() {
     let dst_codex = dst_home.join(".codex");
     fs::create_dir_all(dst_codex.join("sessions")).unwrap();
     std::os::unix::fs::symlink(&rollout, dst_codex.join("sessions/rollout.jsonl")).unwrap();
+    // A stage-linked rollout neo no longer has: nothing to merge.
+    let gone = second_root.join("live/gone.jsonl");
+    fs::write(&gone, b"{\"g\":1}\n").unwrap();
+    std::os::unix::fs::symlink(&gone, dst_codex.join("sessions/gone.jsonl")).unwrap();
 
     // A file-history link into the repair stage.
     let repair_stage = base.join("stage");
@@ -3192,6 +3196,18 @@ fn homes_links_are_resolved_and_folded_through() {
             .is_symlink()
     );
     assert_eq!(fs::read(&rollout).unwrap(), b"{\"r\":1}\n{\"r\":2}\n");
+    assert!(
+        moved
+            .stdout
+            .contains("rel=sessions/gone.jsonl source=absent (nothing to merge)"),
+        "{}",
+        moved.stdout
+    );
+    assert_eq!(fs::read(&gone).unwrap(), b"{\"g\":1}\n");
+    assert!(fs::symlink_metadata(dst_codex.join("sessions/gone.jsonl"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
     // The neo-key link folded through: its name gone, its target kept, the
     // lane's file as it was.
     assert!(fs::symlink_metadata(neo_key_dir.join(format!("{SID}.jsonl"))).is_err());
