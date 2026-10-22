@@ -361,6 +361,7 @@ fn regularize_one(link: &Path, target: &Path) -> Result<bool> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -379,7 +380,7 @@ mod tests {
         std::os::unix::fs::symlink(live.join("notes"), base.join("execroot/_main/notes")).unwrap();
         std::os::unix::fs::symlink(live.join("notes"), home.join("notes")).unwrap();
         let _ = take_output_bases_skipped();
-        let found = live_links(&home, &[live.clone()]);
+        let found = live_links(&home, std::slice::from_ref(&live));
         assert_eq!(
             found
                 .iter()
