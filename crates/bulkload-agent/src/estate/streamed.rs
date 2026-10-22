@@ -702,12 +702,57 @@ fn top_up(
             Err(refusal) => return Err(refusal),
         }
     }
-    if wanted(live)?.is_empty() {
-        Ok((ids, bytes))
-    } else {
-        Err(BulkloadRefusal::CaptureDrifted)
+    if !wanted(live)?.is_empty() {
+        return Err(BulkloadRefusal::CaptureDrifted);
     }
+    // The destination's own lacking ids: fetched when the source holds
+    // them, never refused for. One the source lacks fails Git's whole
+    // fetch, so a failed batch is tried id by id.
+    let still: Vec<String> = stream::lacking(live)?
+        .into_iter()
+        .filter(|id| own.contains(id))
+        .collect();
+    if !still.is_empty() {
+        let objects = stream::objects_dir(live)?;
+        let try_fetch = |wants: Vec<String>| -> Result<u64> {
+            let want = stream::Snapshot {
+                object_format: snapshot.snapshot.object_format.clone(),
+                wants,
+                ..stream::Snapshot::default()
+            };
+            let fetched = stream::fetch_into(
+                &objects,
+                &snapshot.snapshot.object_format,
+                url,
+                upload_pack,
+                &want,
+                marks,
+            );
+            let _ = fs::remove_file(marks);
+            match fetched {
+                Ok(fetched) => Ok(fetched.bytes),
+                Err(BulkloadRefusal::GitChildFailed(_)) => Ok(0),
+                Err(refusal) => Err(refusal),
+            }
+        };
+        ids = ids.saturating_add(u64::try_from(still.len()).unwrap_or(u64::MAX));
+        bytes = bytes.saturating_add(try_fetch(still.clone())?);
+        if still.len() > 1 {
+            for id in stream::lacking(live)?
+                .into_iter()
+                .filter(|id| own.contains(id))
+                .take(OWN_ONE_BY_ONE)
+            {
+                bytes = bytes.saturating_add(try_fetch(vec![id])?);
+            }
+        }
+    }
+    Ok((ids, bytes))
 }
+
+/// At most this many of the destination's own lacking ids are tried one by
+/// one after their batch failed ([`top_up`]).
+const OWN_ONE_BY_ONE: usize = 64;
 
 /// `private/ITEM.converged`: the item's live path holds the destination's
 /// own repository, consolidated (never replaced) on every pass.
