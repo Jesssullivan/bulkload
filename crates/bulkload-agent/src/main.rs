@@ -2590,7 +2590,8 @@ fn handoff_options(
                 options.workspaces.push(PathBuf::from(value(at + 1)?));
                 at += 1;
             }
-            "--sibling" => {
+            "--sibling" | "--place" => {
+                let place = arg == "--place";
                 let pair = value(at + 1)?;
                 let (landed, live) = pair
                     .as_encoded_bytes()
@@ -2609,7 +2610,11 @@ fn handoff_options(
                         <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(bytes),
                     )
                 };
-                options.siblings.push((path(landed), path(live)));
+                if place {
+                    options.places.push((path(landed), path(live)));
+                } else {
+                    options.siblings.push((path(landed), path(live)));
+                }
                 at += 1;
             }
             "--as-of" if options.as_of.is_none() => {

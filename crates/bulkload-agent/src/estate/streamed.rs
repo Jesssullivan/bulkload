@@ -184,6 +184,11 @@ pub fn capture_source(
     for nest in crate::git_carry::nested_repositories(source)? {
         excluded.push(nest.rel_path.clone());
     }
+    // Registered worktrees nested in the checkout are their own items, never
+    // this one's seats (2026-10-21: tinyland.dev's `.worktrees/`).
+    for nest in crate::git_carry::nested_worktrees(source).unwrap_or_default() {
+        excluded.push(nest.rel_path.clone());
+    }
     for (rel, _) in &host_files {
         excluded.push(rel.clone());
     }
@@ -410,30 +415,14 @@ pub fn land(
     }
     // 4. What the landed administration names and the store lacks.
     if owns_store || item.workspace.is_some() {
-        let lacking = stream::lacking(&live)?;
-        if !lacking.is_empty() {
-            let top_up = stream::Snapshot {
-                object_format: snapshot.snapshot.object_format.clone(),
-                wants: lacking,
-                ..stream::Snapshot::default()
-            };
-            let objects = stream::objects_dir(&live)?;
-            let fetched = stream::fetch_into(
-                &objects,
-                &snapshot.snapshot.object_format,
-                &source_url,
-                reach.upload_pack,
-                &top_up,
-                &state.join(format!("{identity}.top-up.objects")),
-            )?;
-            landed.topped_up = u64::try_from(top_up.wants.len()).unwrap_or(u64::MAX);
-            landed.object_bytes = landed.object_bytes.saturating_add(fetched.bytes);
-            let _ = fs::remove_file(state.join(format!("{identity}.top-up.objects")));
-        }
-        // 5. The proof.
-        if !stream::lacking(&live)?.is_empty() {
-            return Err(BulkloadRefusal::CaptureDrifted);
-        }
+        let (ids, bytes) = top_up(
+            snapshot,
+            &live,
+            reach.upload_pack,
+            &state.join(format!("{identity}.top-up.objects")),
+        )?;
+        landed.topped_up = ids;
+        landed.object_bytes = landed.object_bytes.saturating_add(bytes);
         let objects = stream::objects_dir(&live)?;
         if let Some(left) = stream::quarantine_left(&objects)?.first() {
             return Err(BulkloadRefusal::StatePayloadLeft(rel_bytes(left)));
@@ -609,14 +598,85 @@ pub fn converge(
             Err(refusal) => return Err(refusal),
         }
     }
-    if !stream::lacking(&live)?.is_empty() {
-        return Err(BulkloadRefusal::CaptureDrifted);
-    }
+    // A source that moved after its snapshot (SPEC rule 6: a live neo
+    // worktree lands as it is at pass time): what the live administration
+    // now names is fetched by id from the live source.
+    fs::create_dir_all(reach.scratch).refuse_at(SITE)?;
+    let (_, bytes) = top_up(
+        snapshot,
+        &live,
+        reach.upload_pack,
+        &reach
+            .scratch
+            .join(format!("{}.top-up.objects", id(item)?)),
+    )?;
+    done.object_bytes = done.object_bytes.saturating_add(bytes);
     let objects = stream::objects_dir(&live)?;
     if let Some(left) = stream::quarantine_left(&objects)?.first() {
         return Err(BulkloadRefusal::StatePayloadLeft(rel_bytes(left)));
     }
     Ok(done)
+}
+
+/// How many rounds [`top_up`] fetches before it holds the item.
+pub const TOP_UPS: usize = 3;
+
+/// Fetch, by id from the live source, every object the live repository's
+/// administration names and its store lacks.
+///
+/// At most [`TOP_UPS`] rounds: a source that moved after its snapshot (an
+/// agent committing under the pass) lands as it is now. Returns the ids
+/// asked and the bytes the store grew by. `marks` is each round's resume
+/// file, removed after it.
+///
+/// # Errors
+/// `CAPTURE_DRIFTED` when the store still lacks an object after the last
+/// round (the source does not hold it either); IO.
+fn top_up(
+    snapshot: &ItemSnapshot,
+    live: &Path,
+    upload_pack: &str,
+    marks: &Path,
+) -> Result<(u64, u64)> {
+    let url = snapshot
+        .item
+        .source
+        .to_str()
+        .ok_or(BulkloadRefusal::PathNotPortable)?;
+    let (mut ids, mut bytes) = (0u64, 0u64);
+    for _ in 0..TOP_UPS {
+        let lacking = stream::lacking(live)?;
+        if lacking.is_empty() {
+            break;
+        }
+        ids = ids.saturating_add(u64::try_from(lacking.len()).unwrap_or(u64::MAX));
+        let want = stream::Snapshot {
+            object_format: snapshot.snapshot.object_format.clone(),
+            wants: lacking,
+            ..stream::Snapshot::default()
+        };
+        let objects = stream::objects_dir(live)?;
+        let fetched = stream::fetch_into(
+            &objects,
+            &snapshot.snapshot.object_format,
+            url,
+            upload_pack,
+            &want,
+            marks,
+        );
+        let _ = fs::remove_file(marks);
+        match fetched {
+            Ok(fetched) => bytes = bytes.saturating_add(fetched.bytes),
+            // The source no longer holds it, or the session failed: the
+            // proof below decides.
+            Err(_) => break,
+        }
+    }
+    if stream::lacking(live)?.is_empty() {
+        Ok((ids, bytes))
+    } else {
+        Err(BulkloadRefusal::CaptureDrifted)
+    }
 }
 
 /// `private/ITEM.converged`: the item's live path holds the destination's
