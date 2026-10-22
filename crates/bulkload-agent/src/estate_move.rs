@@ -292,7 +292,7 @@ fn source_pass(
             .sum()
     };
     out(&format!(
-        "estate-move-source phase=inventory outcome=ok items={} new={} planned={planned} symlinks={} not_git_files={} prunable={} unreadable={} source_vanished={} not_in_census={}",
+        "estate-move-source phase=inventory outcome=ok items={} new={} planned={planned} symlinks={} not_git_files={} prunable={} unreadable={} source_vanished={} not_in_census={} rebuildable_nests={}",
         found.items.len(),
         new.len(),
         noted("symlink"),
@@ -301,6 +301,7 @@ fn source_pass(
         noted("unreadable"),
         noted("source-vanished"),
         noted("not-in-census"),
+        noted(moving::REBUILDABLE_NEST),
     ))?;
     // Each refused item's code, and each nest its capture holds only as
     // custody (its content is not carried: M2r2 item 5), for the
@@ -1091,7 +1092,13 @@ fn move_pass(run: &Move) -> Result<()> {
     // or `CLAUDE.md` is cleared first, restored byte for byte and recorded,
     // so it never holds the consolidation of the file it sits in.
     {
-        let mut args: Vec<OsString> = vec!["--clear".into(), "--legacy-only".into()];
+        // `--keep-going`: one workspace's refusal is its row, never the
+        // phase's (2026-10-22: a read-only `SwiftPM` checkout, `IO` errno 13).
+        let mut args: Vec<OsString> = vec![
+            "--clear".into(),
+            "--legacy-only".into(),
+            "--keep-going".into(),
+        ];
         if let Some((from, to)) = homes.as_ref() {
             let mut pair = from.clone().into_os_string();
             pair.push("=");
@@ -1111,13 +1118,8 @@ fn move_pass(run: &Move) -> Result<()> {
     let sources: Vec<PathBuf> = rows.iter().map(|row| row.item.source.clone()).collect();
     let map = estate::streamed::path_map(&placed);
     let upload_pack = upload_pack_program(run);
-    let transfer = |from: &Path, to: &Path| -> Result<()> {
-        let name = format!(
-            "item-{}",
-            blake3::hash(std::os::unix::ffi::OsStrExt::as_bytes(to.as_os_str())).to_hex()
-        );
-        run.transfer_into(from, to, &name)
-    };
+    let transfer =
+        |from: &Path, to: &Path| -> Result<()> { run.transfer_into(from, to, &seat_transfer(to)) };
     let scratch = run.state.join("scratch");
     let consolidation = || -> Result<bulkload_agent::transfer::Consolidation> {
         let text = |path: &Path| path.to_string_lossy().into_owned();
@@ -1578,7 +1580,7 @@ fn move_pass(run: &Move) -> Result<()> {
 
     // 5. The hand-off block in each landed workspace (OI-1003-Q183).
     if run.handoff && !landed.is_empty() {
-        let mut args: Vec<OsString> = Vec::new();
+        let mut args: Vec<OsString> = vec!["--keep-going".into()];
         for item in &landed {
             args.extend(["--item".into(), item.into()]);
         }
@@ -1663,6 +1665,15 @@ fn move_pass(run: &Move) -> Result<()> {
             &run.source,
         )?);
     }
+    // 2026-10-22: each item's held seats on its own row, read from its seat
+    // transfer's record, so a held lane's files are named by the closure.
+    for row in &rows {
+        let live = row.item.workspace.as_ref().unwrap_or(&row.item.repository);
+        let state = run.state.join("pull").join(seat_transfer(live));
+        if state.is_dir() {
+            report.attach_held_seats(&row.id, &state);
+        }
+    }
     // The re-seat's outcomes that leave a session not resumable (or a
     // re-seat that did not run) hold the gate too.
     let reseat_held: std::collections::BTreeMap<String, u64> = match &sessions {
@@ -1684,7 +1695,13 @@ fn move_pass(run: &Move) -> Result<()> {
         .map(|(code, count)| format!("{code}:{count}"))
         .collect::<Vec<_>>()
         .join(",");
-    let not_moved: u64 = notes.values().sum();
+    // A nest under a rebuildable root is omitted by SPEC rule 5, not left
+    // behind: counted on the source's inventory line, never held here.
+    let not_moved: u64 = notes
+        .iter()
+        .filter(|(what, _)| what.as_str() != moving::REBUILDABLE_NEST)
+        .map(|(_, count)| count)
+        .sum();
     let measured = bulkload_agent::state_payload::measure_all(&run.states())?;
     // Objects no name reaches on the source: counted, never carried.
     let mut unreachable = 0u64;
@@ -1798,6 +1815,15 @@ fn print_plan(rows: &[moving::Row], notes: &std::collections::BTreeMap<String, u
 /// `CAPTURE_DRIFTED` (each followed by its land's or converge's own
 /// top-up rounds).
 const JIT_ROUNDS: usize = 2;
+
+/// The name of the seat transfer that lands an item at `live`: its state is
+/// `MOVE_STATE/pull/<name>`, where the closure reads its held seats.
+fn seat_transfer(live: &Path) -> String {
+    format!(
+        "item-{}",
+        blake3::hash(std::os::unix::ffi::OsStrExt::as_bytes(live.as_os_str())).to_hex()
+    )
+}
 
 /// The refusal a just-in-time recapture's source answered with, by its
 /// wire code: the capture's own codes typed, any other its code kept on

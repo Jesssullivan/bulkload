@@ -3097,7 +3097,10 @@ pub const REBUILDABLE_DIRECTORIES: &[&str] = &[
 /// 2026-10-22: the estate pass held 2293 files under `build/` and 686
 /// under `.svelte-kit/` as differing seats. The legacy capture
 /// keeps [`REBUILDABLE_DIRECTORIES`] alone, so its capture keys never move.
-pub const SPEC_REBUILDABLE_DIRECTORIES: &[&str] = &["build", "dist", ".svelte-kit"];
+/// `.build` is `SwiftPM`'s build root (2026-10-22, pass 4): its
+/// `checkouts/` hold read-only dependency clones that `swift build`
+/// resolves again, never a workspace.
+pub const SPEC_REBUILDABLE_DIRECTORIES: &[&str] = &["build", "dist", ".svelte-kit", ".build"];
 
 /// The prefix of Bazel's convenience links at a workspace root
 /// (`bazel-bin`, `bazel-out`, `bazel-<workspace>`): rebuildable, never
@@ -3553,6 +3556,38 @@ fn rebuildable_root(root: &Path, relative: &Path, name: &std::ffi::OsStr) -> Res
         return Ok(false);
     }
     untracked(root, relative)
+}
+
+/// Whether the nest at `rel` (relative to `repo`'s worktree) lies under a
+/// rebuildable root the streamed capture of `repo` omits (SPEC rule 5): a
+/// directory on its way named in [`REBUILDABLE_DIRECTORIES`] or
+/// [`SPEC_REBUILDABLE_DIRECTORIES`] that Git tracks nothing under, as
+/// [`streamed_omissions`] decides it. Such a nest (a `SwiftPM` dependency
+/// checkout under `.build/checkouts/`, a Git dependency under
+/// `node_modules/`) is rebuilt with its root, never its own estate item.
+///
+/// # Errors
+/// Git's refusal to list the index.
+pub fn under_rebuildable_root(repo: &Path, rel: &[u8]) -> Result<bool> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let rel = Path::new(std::ffi::OsStr::from_bytes(rel));
+    let mut prefix = PathBuf::new();
+    let components: Vec<_> = rel.components().collect();
+    // The nest itself is never its own rebuildable root: a directory
+    // holding `.git` is a nest before it is a name (`streamed_omissions`).
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        prefix.push(component);
+        let name = component.as_os_str().as_bytes();
+        if REBUILDABLE_DIRECTORIES
+            .iter()
+            .chain(SPEC_REBUILDABLE_DIRECTORIES)
+            .any(|candidate| name == candidate.as_bytes())
+            && untracked(repo, &prefix)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 // Whether Git tracks nothing at or below `relative` in `root`.

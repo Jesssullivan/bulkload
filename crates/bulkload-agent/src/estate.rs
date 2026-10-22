@@ -3977,7 +3977,10 @@ pub use diff::{diff, DiffOptions, Summary as DiffSummary, SCHEMA as DIFF_SCHEMA}
 
 // `estate-handoff` (TIN-6569, OI-1003-Q183).
 mod handoff;
-pub use handoff::{handoff, HandoffMode, HandoffOptions, HandoffSummary, SCHEMA as HANDOFF_SCHEMA};
+pub use handoff::{
+    handoff, move_state_inputs, streamed_move_state, HandoffMode, HandoffOptions, HandoffSummary,
+    SCHEMA as HANDOFF_SCHEMA,
+};
 mod retarget;
 pub use retarget::{mapped as retarget_mapped, retarget, Moved as Retargeted};
 

@@ -642,6 +642,18 @@ fn a_file_both_sides_changed_merges_three_way_or_is_held() {
         fs::read(live.join("f.txt")).unwrap(),
         b"one\ntwo\nTHREE sting\nfour\nfive\n"
     );
+    // The closure names the held seat on the item's own row, with why
+    // (2026-10-22): a held lane's files are read from the closure alone.
+    let report = fs::read_to_string(world.state().join("closure.json")).unwrap();
+    let held = report
+        .split("{\"item\":")
+        .find(|row| row.contains("\"held_seats\":["))
+        .unwrap_or_else(|| panic!("no held_seats in {report}"));
+    assert!(
+        held.contains("\"path\":\"f.txt\",\"refusal\":\"HOMES_CONSOLIDATE_UNSUPPORTED\""),
+        "{held}"
+    );
+    assert!(!held.contains("\"reason\":null"), "{held}");
 }
 
 /// Part 2, a different branch on each side (the `GloriousFlywheel` case):
@@ -4218,4 +4230,107 @@ fn a_reflog_entry_naming_a_pruned_object_is_never_unioned() {
     );
     let logs = fs::read_to_string(live.join(".git/logs/refs/heads/main")).unwrap_or_default();
     assert!(!logs.contains(&gone), "{logs}");
+}
+
+/// 2026-10-22 (estate pass 4, TIN-6569): a streamed pass keeps no corpus,
+/// so its hand-off block names the move state, never a corpus path, and
+/// every command it gives runs as printed: the read-only differences
+/// (`--dry-run`), `--check` and `--clear`, each with `--move-state`.
+#[test]
+fn a_streamed_hand_off_names_its_move_state_and_its_commands_run() {
+    let world = World::new("handoffstreamed");
+    world.estate();
+    assert!(world.source().ok);
+    let moved = world.moved();
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    assert!(
+        moved
+            .stdout
+            .contains("estate-move phase=hand-off outcome=ok"),
+        "{both}"
+    );
+    let note = world.dst().join("land/CLAUDE.local.md");
+    let block = fs::read_to_string(&note).unwrap();
+    assert!(!block.contains("carry/corpus"), "{block}");
+    assert!(!block.contains("| Corpus |"), "{block}");
+    assert!(
+        block.contains(&format!("| Move state | `{}`", world.state().display())),
+        "{block}"
+    );
+    assert!(block.contains("--move-state"), "{block}");
+    // Each command is the backticked text after its cue, run from `/`.
+    let command = |cue: &str| -> String {
+        let at = block
+            .find(cue)
+            .unwrap_or_else(|| panic!("no {cue} in {block}"));
+        let rest = &block[at..];
+        let start = rest.find('`').unwrap() + 1;
+        let end = start + rest[start..].find('`').unwrap();
+        rest[start..end].to_owned()
+    };
+    let run = |line: &str| {
+        let ran = Command::new("sh")
+            .arg("-c")
+            .arg(line)
+            .current_dir("/")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            ran.status.success(),
+            "{line}: {}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
+        String::from_utf8_lossy(&ran.stdout).into_owned()
+    };
+    let workspace = format!("\"workspace\":\"{}\"", world.dst().join("land").display());
+    let differs = run(&command("See what differs, read-only"));
+    assert!(
+        differs
+            .lines()
+            .any(|line| line.contains(&workspace) && line.contains("\"mode\":\"dry-run\"")),
+        "{differs}"
+    );
+    let check = run(&command("**When it is done**"));
+    assert!(
+        check
+            .lines()
+            .any(|line| line.contains(&workspace) && line.contains("\"state\":\"present\"")),
+        "{check}"
+    );
+    run(&command("Then remove this block with"));
+    assert!(!note.exists(), "the created note is cleared away");
+}
+
+/// SPEC rule 5 (2026-10-22, estate pass 4): a repository nested under a
+/// rebuildable root (a `SwiftPM` dependency clone in `.build/checkouts/`)
+/// is rebuilt with that root: never an item, counted on the inventory
+/// line, never carried, and it holds nothing.
+#[test]
+fn a_nest_under_a_rebuildable_root_is_never_an_item() {
+    let world = World::new("rebuildablenest");
+    let parent = world.src().join("app");
+    repo(&parent, "Package.swift");
+    repo(
+        &parent.join(".build/checkouts/swift-argument-parser"),
+        "Sources.swift",
+    );
+    let sourced = world.source();
+    assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
+    assert!(sourced.stdout.contains(" items=1 "), "{}", sourced.stdout);
+    assert!(
+        sourced.stdout.contains(" rebuildable_nests=1"),
+        "{}",
+        sourced.stdout
+    );
+    let moved = world.moved();
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    let live = world.dst().join("app");
+    assert!(
+        item_line(&moved.stdout, &live).contains("outcome=workspace-restored"),
+        "{both}"
+    );
+    assert!(!live.join(".build").exists(), "{both}");
+    assert!(!both.contains("swift-argument-parser"), "{both}");
+    assert_eq!(closure(&moved.stdout)["not_moved"], "0", "{both}");
 }

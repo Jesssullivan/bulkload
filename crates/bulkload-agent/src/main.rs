@@ -449,7 +449,8 @@ SUBCOMMANDS:
                 (dest-only). One bulkload.estate-diff.v1 JSON line per row
     estate-handoff [--check | --clear [--clear-carried] | --dry-run] [--item ID]...
                 [--workspace PATH]... [--sibling LANDED_PREFIX=LIVE_PREFIX]...
-                [--readme] [--renew] [--as-of NS] PLAN CORPUS PRIVATE_STATE SOURCE
+                [--readme] [--renew] [--as-of NS] [--keep-going]
+                (PLAN CORPUS PRIVATE_STATE | --move-state MOVE_STATE) SOURCE
                 TIN-6569, OI-1003-Q183: write a dated hand-off block at byte 0 of
                 AGENTS.md and CLAUDE.md in each landed workspace (absolute paths,
                 capture and landing facts, estate-diff's ref classes, the commands
@@ -484,7 +485,16 @@ SUBCOMMANDS:
                 keeps the options the record was rendered with unless they are
                 given again; an unchanged rerun reads and writes nothing. One
                 JSON line per workspace (schema bulkload.estate-handoff.v1, the
-                verb's own name)
+                verb's own name). --move-state MOVE_STATE reads estate-move's
+                MOVE_STATE/carry/plan.postcard, MOVE_STATE/carry/corpus and
+                MOVE_STATE/private: a streamed pass, which keeps no corpus,
+                renders its block naming the move state and these commands
+                (its "see what differs" is --dry-run). --keep-going makes a
+                workspace's refusal its own row (code, and errno for IO) and
+                exits 0 unless the run itself refuses. A planned workspace
+                under another planned checkout's rebuildable root (SPEC rule
+                5; a SwiftPM .build/checkouts clone) is a "rebuildable" row:
+                no block is rendered into it
     estate-carry-files [--dry-run] [--beside SUFFIX] [--item ID]... [--bind ID=DEST_STATE]...
                 [--bind-only] [--recarry]
                 [--host HOST --source-state-root DIR [--remote-executable PATH] [--ssh-config FILE]]
@@ -2167,24 +2177,28 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
             output.flush().refuse_at("main::estate_command")
         }
         "estate-handoff" => {
-            let (options, rest) = handoff_options(args)?;
-            if rest.len() != 4 {
-                return Err(BulkloadRefusal::RequiredFieldMissing);
-            }
-            let path = |i: usize| -> Result<&Path> {
-                rest.get(i)
-                    .map(Path::new)
-                    .ok_or(BulkloadRefusal::RequiredFieldMissing)
+            let (options, move_state, rest) = handoff_options(args)?;
+            // `--move-state MOVE_STATE SOURCE` (2026-10-22): a streamed
+            // pass's PLAN, CORPUS and PRIVATE_STATE, as its block names them.
+            let (plan, corpus, state, source) = match &move_state {
+                Some(move_state) if rest.len() == 1 => {
+                    let (plan, corpus, state) = estate::move_state_inputs(move_state);
+                    (plan, corpus, state, rest.first())
+                }
+                None if rest.len() == 4 => {
+                    let path = |i: usize| rest.get(i).map(PathBuf::from).unwrap_or_default();
+                    (path(0), path(1), path(2), rest.get(3))
+                }
+                _ => return Err(BulkloadRefusal::RequiredFieldMissing),
             };
-            let source = rest
-                .get(3)
+            let source = source
                 .and_then(|arg| arg.to_str())
                 .ok_or(BulkloadRefusal::FieldDomainViolation)?;
             let mut output = std::io::stdout().lock();
             let outcome = estate::handoff(
-                path(0)?,
-                path(1)?,
-                path(2)?,
+                &plan,
+                &corpus,
+                &state,
                 source,
                 &options,
                 &mut |line| writeln!(output, "{line}").refuse_at("main::estate_command"),
@@ -2550,9 +2564,11 @@ fn handoff_options(
     args: &[std::ffi::OsString],
 ) -> Result<(
     bulkload_agent::estate::HandoffOptions,
+    Option<PathBuf>,
     &[std::ffi::OsString],
 )> {
     let mut options = bulkload_agent::estate::HandoffOptions::default();
+    let mut move_state: Option<PathBuf> = None;
     let mut at = 0;
     let value = |at: usize| args.get(at).ok_or(BulkloadRefusal::RequiredFieldMissing);
     while let Some(arg) = args.get(at).and_then(|arg| arg.to_str()) {
@@ -2578,6 +2594,11 @@ fn handoff_options(
             "--readme" => flag(&mut options.readme)?,
             "--clear-carried" => flag(&mut options.clear_carried)?,
             "--legacy-only" => flag(&mut options.legacy_only)?,
+            "--keep-going" => flag(&mut options.keep_going)?,
+            "--move-state" if move_state.is_none() => {
+                move_state = Some(PathBuf::from(value(at + 1)?));
+                at += 1;
+            }
             "--item" => {
                 options.items.push(
                     value(at + 1)?
@@ -2633,7 +2654,7 @@ fn handoff_options(
         }
         at += 1;
     }
-    Ok((options, args.get(at..).unwrap_or_default()))
+    Ok((options, move_state, args.get(at..).unwrap_or_default()))
 }
 
 /// The options `estate-apply` and `estate-diff` take before their

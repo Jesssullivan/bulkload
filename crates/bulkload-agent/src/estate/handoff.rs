@@ -72,6 +72,43 @@ pub struct HandoffOptions {
     /// block an earlier pass wrote into a tracked file; any other is
     /// skipped (2026-10-21).
     pub legacy_only: bool,
+    /// `--keep-going` (2026-10-22, `estate-move`'s hand-off phases): a
+    /// workspace's refusal is its own row (code and errno), never the
+    /// run's; the run refuses only for itself (a malformed option or plan,
+    /// the lock).
+    pub keep_going: bool,
+}
+
+/// `estate-move`'s hand-off inputs under `MOVE_STATE`: its plan
+/// (`carry/plan.postcard`), its corpus path (`carry/corpus`) and its
+/// private state (`private`). `estate-handoff --move-state MOVE_STATE`
+/// reads them so (2026-10-22).
+#[must_use]
+pub fn move_state_inputs(move_state: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let carry = move_state.join("carry");
+    (
+        carry.join("plan.postcard"),
+        carry.join("corpus"),
+        move_state.join("private"),
+    )
+}
+
+/// The `MOVE_STATE` of a streamed pass (SPEC rule 2 reset, B1): PLAN,
+/// CORPUS and STATE are its [`move_state_inputs`] and no corpus exists
+/// (the pass keeps one snapshot per item in `carry/`, never a corpus).
+/// `None` for a corpus pass: its block names the corpus, as before.
+#[must_use]
+pub fn streamed_move_state(plan: &Path, corpus: &Path, state: &Path) -> Option<PathBuf> {
+    let carry = fs::canonicalize(plan.parent()?).ok()?;
+    let move_state = carry.parent()?;
+    let (want_plan, want_corpus, want_state) = move_state_inputs(move_state);
+    (plan.file_name() == want_plan.file_name()
+        && carry.file_name() == want_corpus.parent()?.file_name()
+        && corpus.file_name() == want_corpus.file_name()
+        && fs::canonicalize(corpus.parent()?).ok()? == carry
+        && fs::canonicalize(state).ok()? == want_state
+        && fs::symlink_metadata(corpus).is_err())
+    .then(|| move_state.to_path_buf())
 }
 
 /// The counts of one run.
@@ -84,6 +121,10 @@ pub struct HandoffSummary {
     pub planned: u64,
     pub checked: u64,
     pub refused: u64,
+    /// Planned workspaces under another planned checkout's rebuildable
+    /// root (SPEC rule 5; a `SwiftPM` `.build/checkouts/` clone): not a
+    /// workspace, so no block (2026-10-22).
+    pub rebuildable: u64,
 }
 
 /// `path` canonical when it exists, else absolute: a block names every
@@ -202,6 +243,9 @@ fn line_of(item: &str, workspace: &Path, mode: &str, result: &Result<Row>) -> St
                 ",\"outcome\":\"refused\",\"refusal\":{}",
                 json_string(refusal.code())
             );
+            if let BulkloadRefusal::Io(Some(errno)) = refusal {
+                let _ = write!(text, ",\"errno\":{errno}");
+            }
         }
         Ok(row) => {
             let _ = write!(
@@ -308,6 +352,19 @@ pub fn handoff(
         as_of: options.as_of,
         h_step: false,
     };
+    let place = |planned_at: &Path| -> PathBuf {
+        options
+            .places
+            .iter()
+            .find_map(|(from, to)| planned_at.strip_prefix(from).ok().map(|rest| to.join(rest)))
+            .unwrap_or_else(|| planned_at.to_path_buf())
+    };
+    let checkouts: Vec<PathBuf> = contents
+        .items
+        .iter()
+        .filter_map(|item| item.workspace.as_deref())
+        .map(place)
+        .collect();
     let mut session = Session::default();
     let mut summary = HandoffSummary::default();
     let mut first: Option<BulkloadRefusal> = None;
@@ -317,11 +374,8 @@ pub fn handoff(
         let Some(planned_at) = item.workspace.as_deref() else {
             continue;
         };
-        let placed = options
-            .places
-            .iter()
-            .find_map(|(from, to)| planned_at.strip_prefix(from).ok().map(|rest| to.join(rest)));
-        let workspace = placed.as_deref().unwrap_or(planned_at);
+        let placed = place(planned_at);
+        let workspace = placed.as_path();
         if options.legacy_only
             && !crate::git_carry::converge::handoff::has_legacy_block(workspace, source)
         {
@@ -336,6 +390,15 @@ pub fn handoff(
             continue;
         }
         if !wanted.is_empty() && !wanted.contains(&canonical(workspace)) {
+            continue;
+        }
+        if mode == Mode::Render && under_planned_rebuildable(workspace, &checkouts) {
+            summary.rebuildable += 1;
+            line(&format!(
+                "{{\"schema\":\"{SCHEMA}\",\"kind\":\"workspace\",\"item\":{},\"workspace\":{},\"mode\":\"{mode_name}\",\"outcome\":\"rebuildable\",\"refusal\":null}}",
+                json_string(&identity),
+                json_string(&shown(workspace.as_os_str().as_bytes())),
+            ))?;
             continue;
         }
         let result = handoff::run(
@@ -371,7 +434,7 @@ pub fn handoff(
         line(&line_of(&identity, workspace, mode_name, &result))?;
     }
     line(&format!(
-        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"summary\",\"mode\":\"{mode_name}\",\"workspaces\":{},\"written\":{},\"unchanged\":{},\"cleared\":{},\"planned\":{},\"checked\":{},\"refused\":{},\"open\":{open_total}}}",
+        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"summary\",\"mode\":\"{mode_name}\",\"workspaces\":{},\"written\":{},\"unchanged\":{},\"cleared\":{},\"planned\":{},\"checked\":{},\"refused\":{},\"rebuildable\":{},\"open\":{open_total}}}",
         summary.workspaces,
         summary.written,
         summary.unchanged,
@@ -379,8 +442,32 @@ pub fn handoff(
         summary.planned,
         summary.checked,
         summary.refused,
+        summary.rebuildable,
     ))?;
+    // `--keep-going`: each workspace's refusal is its row, printed above.
+    if options.keep_going {
+        return Ok(summary);
+    }
     first.map_or(Ok(summary), Err)
+}
+
+/// Whether `workspace` lies under a rebuildable root of the nearest other
+/// planned checkout that holds it (SPEC rule 5, 2026-10-22: a `SwiftPM`
+/// dependency clone under `.build/checkouts/`, planned by a pass from
+/// before the rule): it is rebuilt with that root, not a workspace, and a
+/// block is never written into it.
+fn under_planned_rebuildable(workspace: &Path, checkouts: &[PathBuf]) -> bool {
+    let Some(enclosing) = checkouts
+        .iter()
+        .filter(|checkout| workspace != checkout.as_path() && workspace.starts_with(checkout))
+        .max_by_key(|checkout| checkout.as_os_str().len())
+    else {
+        return false;
+    };
+    workspace.strip_prefix(enclosing).is_ok_and(|rel| {
+        crate::git_carry::under_rebuildable_root(enclosing, rel.as_os_str().as_bytes())
+            .unwrap_or(false)
+    })
 }
 
 /// The H step (design 6.4): after `estate-apply` changed a repository, each
