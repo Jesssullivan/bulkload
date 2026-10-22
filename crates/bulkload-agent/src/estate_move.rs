@@ -2402,7 +2402,18 @@ fn session_pulls(pulls: &Path) -> Vec<PathBuf> {
         .flatten()
         .flatten()
         .filter(|entry| {
-            entry.path().is_dir() && !entry.file_name().to_string_lossy().starts_with("plan-")
+            // This pass's transfer pulls only (2026-10-22): the session
+            // trees, their live links and the Git asides; never a plan's
+            // (`plan-*`), nor the pull of the source's ledgers (`plan`), nor
+            // one a retired pass left under another name (`corpus`, the same
+            // ledger transfer: joined twice it refused the closure).
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            entry.path().is_dir()
+                && (["claude", CLAUDE_JSON_PULL, "codex"].contains(&name.as_ref())
+                    || name.starts_with("claude-link-")
+                    || name.starts_with("codex-link-")
+                    || name.starts_with("aside-"))
         })
         .map(|entry| entry.path())
         .collect();
@@ -2516,7 +2527,16 @@ fn pull_links(
             bulkload_agent::transfer::RootKind::File
         };
         match run.transfer_kind(kind, &source, &link.target, &pull) {
-            Ok(()) | Err(BulkloadRefusal::SourceRootMissing) => {}
+            Ok(()) => {}
+            // No source directory: nothing to merge, and no record left to
+            // count (its one row would be the absent source's session).
+            Err(BulkloadRefusal::SourceRootMissing) => {
+                let _ = std::fs::remove_dir_all(run.state.join("pull").join(&pull));
+                out(&format!(
+                    "estate-move live-link home={name} rel={} source=absent (nothing to merge)",
+                    link.rel.display()
+                ))?;
+            }
             // A file link whose source path is absent (the one-file pull
             // records it SOURCE_VANISHED): nothing to merge, as a missing
             // directory source is; the target stays the live copy, and the
@@ -2678,23 +2698,31 @@ fn sessions_pull(
     let codex_linked = pull_links(run, &codex_from, "codex", &codex_links, &[]);
     bulkload_agent::transfer::set_listing(Vec::new());
     bulkload_agent::transfer::set_consolidate(None);
-    let cleared = Ok(());
     // A session that did not complete outranks one that completed with
-    // refused paths: the phase's word says whether the re-seat may run.
+    // refused paths (`ITEMS_REFUSED`: typed rows, a socket's included): the
+    // phase's word says whether the re-seat may run. Every step that
+    // refused is listed by name, with its errno. The unused-map notes are
+    // a report only (the re-seat never reads them): listed, never holding
+    // the re-seat (2026-10-22 ruling).
     let mut outcome = Ok(());
-    for result in [
-        suffix,
-        claude,
-        unmapped,
-        noted,
-        claude_listed,
-        claude_linked,
-        claude_json,
-        codex,
-        codex_listed,
-        codex_linked,
-        cleared,
+    for (step, result) in [
+        ("consolidate", suffix),
+        ("claude", claude),
+        ("unmap", unmapped),
+        ("key-map-unused", noted),
+        ("claude-listing", claude_listed),
+        ("claude-links", claude_linked),
+        ("claude-json", claude_json),
+        ("codex", codex),
+        ("codex-listing", codex_listed),
+        ("codex-links", codex_linked),
     ] {
+        if let Err(refusal) = &result {
+            let _ = step_refused(step, refusal);
+        }
+        if step == "key-map-unused" {
+            continue;
+        }
         if let Err(refusal) = result {
             if session_completed(&outcome) {
                 outcome = Err(refusal);
@@ -2706,6 +2734,19 @@ fn sessions_pull(
         _ => None,
     };
     (outcome, homes, key_maps.ok())
+}
+
+// One sessions-pull step that refused: its name, code and errno (a bare
+// `IO` is never unnamed).
+fn step_refused(step: &str, refusal: &BulkloadRefusal) -> Result<()> {
+    let errno = match refusal {
+        BulkloadRefusal::Io(Some(errno)) => format!(" errno={errno}"),
+        _ => String::new(),
+    };
+    out(&format!(
+        "estate-move sessions-pull step={step} outcome=refused:{}{errno}",
+        refusal.code()
+    ))
 }
 
 // Whether the one-file session recorded in `state` found no file at its

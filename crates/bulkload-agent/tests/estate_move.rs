@@ -3006,6 +3006,16 @@ fn homes_links_are_resolved_and_folded_through() {
     fs::write(&gone, b"{\"g\":1}\n").unwrap();
     std::os::unix::fs::symlink(&gone, dst_codex.join("sessions/gone.jsonl")).unwrap();
 
+    // A stage-linked session directory neo no longer has: nothing to
+    // merge, and no record of the absent source left to count.
+    let sid3 = "5e5e5e5e-3333-4333-8333-444444444444";
+    fs::create_dir_all(second_root.join("forks").join(sid3)).unwrap();
+    fs::write(
+        second_root.join("forks").join(sid3).join("kept.jsonl"),
+        b"{}\n",
+    )
+    .unwrap();
+
     // A file-history link into the repair stage.
     let repair_stage = base.join("stage");
     let staged = repair_stage.join("forks/x/support/file-history").join(SID);
@@ -3034,6 +3044,11 @@ fn homes_links_are_resolved_and_folded_through() {
     let lane_projects = dst_claude.join("projects").join(key(&dst_lane));
     fs::create_dir_all(&lane_projects).unwrap();
     std::os::unix::fs::symlink(&session_dir, lane_projects.join(sid2)).unwrap();
+    std::os::unix::fs::symlink(
+        second_root.join("forks").join(sid3),
+        lane_projects.join(sid3),
+    )
+    .unwrap();
     fs::write(lane_projects.join(format!("{SID}.jsonl")), &bytes).unwrap();
     let archive = base.join("archive");
     fs::create_dir_all(&archive).unwrap();
@@ -3208,6 +3223,78 @@ fn homes_links_are_resolved_and_folded_through() {
         moved.stdout
     );
     assert_eq!(fs::read(&gone).unwrap(), b"{\"g\":1}\n");
+    assert!(
+        moved.stdout.contains(&format!(
+            "rel=projects/{}/{sid3} source=absent (nothing to merge)",
+            key(&dst_lane)
+        )),
+        "{}",
+        moved.stdout
+    );
+    assert_eq!(
+        fs::read(second_root.join("forks").join(sid3).join("kept.jsonl")).unwrap(),
+        b"{}\n"
+    );
+    // 2026-10-22: the typed refusals never hold the re-seat; no step
+    // refused; the closure joins the session pulls only (never the
+    // estate's own `plan` and `corpus` pulls, one transfer twice).
+    assert!(
+        !moved.stdout.contains("phase=reseat outcome=skipped"),
+        "{}",
+        moved.stdout
+    );
+    assert!(
+        !moved.stdout.contains("estate-move sessions-pull step="),
+        "{}",
+        moved.stdout
+    );
+    assert!(
+        !moved.stderr.contains("refused: FIELD_DOMAIN_VIOLATION"),
+        "{}",
+        moved.stderr
+    );
+    let pulls: Vec<String> = fs::read_dir(state.join("pull"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        pulls
+            .iter()
+            .filter(|name| name.starts_with("claude-link-"))
+            .count()
+            >= 1,
+        "{pulls:?}"
+    );
+    // A retired pass's pull of the same ledgers under another name
+    // (`corpus`): never joined, so the top-up's closure joins every
+    // transfer once.
+    let retired = state.join("pull/corpus");
+    fs::create_dir_all(retired.join("transfer.closure.d")).unwrap();
+    for entry in fs::read_dir(state.join("pull/plan/transfer.closure.d"))
+        .unwrap()
+        .flatten()
+    {
+        fs::copy(
+            entry.path(),
+            retired.join("transfer.closure.d").join(entry.file_name()),
+        )
+        .unwrap();
+    }
+    let topped = run(false);
+    assert!(
+        !topped.stderr.contains("refused: FIELD_DOMAIN_VIOLATION"),
+        "{}\n{}",
+        topped.stdout,
+        topped.stderr
+    );
+    assert!(
+        topped
+            .stdout
+            .contains("estate-move phase=sessions-pull outcome=ok"),
+        "{}",
+        topped.stdout
+    );
     assert!(fs::symlink_metadata(dst_codex.join("sessions/gone.jsonl"))
         .unwrap()
         .file_type()
