@@ -1152,6 +1152,7 @@ fn h19_the_blocks_commands_run_as_printed() {
         ])
         .arg(SOURCE)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("BULKLOAD_HANDOFF_TRACKED_TARGETS", "1")
         .output()
         .unwrap();
     assert!(
