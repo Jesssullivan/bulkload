@@ -270,7 +270,7 @@ pub fn unused(options: &Options, maps: &KeyMaps, listed: &[Vec<u8>]) -> Result<V
         return Ok(Vec::new());
     };
     let lanes = Lanes::new(options);
-    let mut first: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut listed_in: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for path in listed {
         let Some(rest) = std::str::from_utf8(path)
             .ok()
@@ -290,12 +290,29 @@ pub fn unused(options: &Options, maps: &KeyMaps, listed: &[Vec<u8>]) -> Result<V
         {
             continue;
         }
-        first.entry(dir).or_insert(name);
+        listed_in.entry(dir).or_default().push(name);
     }
     let mut out = Vec::new();
-    for (dir, name) in first {
-        let path = options.dest_claude.join("projects").join(dir).join(name);
-        let cwd = claude::first_cwd(&path)?.unwrap_or_default();
+    for (dir, names) in listed_in {
+        // The first of the key's listed transcripts still at its landed
+        // path: one the pull refused, or a fold moved on, is not there
+        // (`ENOENT`), or is a link (`ELOOP`); its own pull or fold row
+        // accounts for it, and a key with none left has nothing to note.
+        let mut found = None;
+        for name in names {
+            let path = options.dest_claude.join("projects").join(dir).join(name);
+            match claude::first_cwd(&path) {
+                Ok(cwd) => {
+                    found = Some(cwd.unwrap_or_default());
+                    break;
+                }
+                Err(BulkloadRefusal::Io(Some(libc::ENOENT | libc::ELOOP | libc::ENOTDIR))) => {}
+                Err(refusal) => return Err(refusal),
+            }
+        }
+        let Some(cwd) = found else {
+            continue;
+        };
         let key = match lanes.lane(Path::new(&cwd)) {
             Ok(Some(lane)) if !cwd.is_empty() => Some(lane.key),
             _ => None,
@@ -732,11 +749,30 @@ mod tests {
             )
             .unwrap();
         }
-        let listed: Vec<Vec<u8>> = [&cased, &dotted]
-            .iter()
-            .map(|dir| format!("projects/{dir}/s.jsonl").into_bytes())
-            .collect();
+        // A key whose only listed transcript is not at its landed path (the
+        // pull refused it, or a fold moved it on): nothing to read, no note.
+        let gone = key("Users/jess/git/LAB");
+        std::fs::create_dir_all(projects.join(&gone)).unwrap();
+        // 2026-10-22: a listed transcript absent at its landing (`ENOENT`)
+        // or a link there (`ELOOP`) is passed over for the key's next one,
+        // never a bare `IO` refusing the step.
+        std::os::unix::fs::symlink(
+            projects.join(&cased).join("s.jsonl"),
+            projects.join(&cased).join("a-link.jsonl"),
+        )
+        .unwrap();
+        let mut listed: Vec<Vec<u8>> = vec![
+            format!("projects/{cased}/a-absent.jsonl").into_bytes(),
+            format!("projects/{cased}/a-link.jsonl").into_bytes(),
+            format!("projects/{gone}/s.jsonl").into_bytes(),
+        ];
+        listed.extend(
+            [&cased, &dotted]
+                .iter()
+                .map(|dir| format!("projects/{dir}/s.jsonl").into_bytes()),
+        );
         let unused = unused(&options, &derived, &listed).unwrap();
+        assert!(unused.iter().all(|note| note.seen != gone), "{unused:?}");
         let seen: Vec<&str> = unused.iter().map(|note| note.seen.as_str()).collect();
         assert!(seen.contains(&cased.as_str()), "{unused:?}");
         assert!(seen.contains(&dotted.as_str()), "{unused:?}");
