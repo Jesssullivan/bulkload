@@ -622,7 +622,7 @@ pub fn unframe<T: for<'de> Deserialize<'de>>(reader: &mut impl std::io::Read) ->
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
+#[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 
