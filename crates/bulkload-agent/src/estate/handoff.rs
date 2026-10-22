@@ -42,7 +42,10 @@ pub enum HandoffMode {
 
 /// What one `estate-handoff` run does (design 3.1).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[allow(clippy::struct_excessive_bools, reason = "one field per independent flag of the verb")]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "one field per independent flag of the verb"
+)]
 pub struct HandoffOptions {
     pub mode: HandoffMode,
     /// `--renew`: put back a block a person removed by hand.

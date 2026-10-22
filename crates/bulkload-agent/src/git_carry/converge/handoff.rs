@@ -591,12 +591,14 @@ pub fn has_legacy_block(worktree: &Path, source: &str) -> bool {
 /// Whether the hand-off record in `dir` names a file other than the local
 /// one (a block an earlier pass wrote into a tracked file).
 fn legacy_recorded(dir: &Path) -> Result<bool> {
-    Ok(landed::read::<HandoffLanded>(&dir.join(HANDOFF_LANDED))?.is_some_and(|record| {
-        record
-            .files
-            .iter()
-            .any(|file| file.path != LOCAL.as_bytes())
-    }))
+    Ok(
+        landed::read::<HandoffLanded>(&dir.join(HANDOFF_LANDED))?.is_some_and(|record| {
+            record
+                .files
+                .iter()
+                .any(|file| file.path != LOCAL.as_bytes())
+        }),
+    )
 }
 
 /// Add [`LOCAL`] to the repository's shared `info/exclude` (in its common

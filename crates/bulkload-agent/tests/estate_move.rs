@@ -3836,16 +3836,23 @@ fn the_hand_off_never_modifies_a_tracked_file() {
             b"# claude\nneo's notes\n",
             "pass {pass}: {both}"
         );
-        let status = out(&live, &["status", "--porcelain", "--", "AGENTS.md", "CLAUDE.md"]);
+        let status = out(
+            &live,
+            &["status", "--porcelain", "--", "AGENTS.md", "CLAUDE.md"],
+        );
         assert!(status.is_empty(), "pass {pass}: {status}\n{both}");
         assert!(live.join("CLAUDE.local.md").is_file(), "{both}");
         assert!(
-            out(&live, &["status", "--porcelain"]).lines().all(|line| !line.contains("CLAUDE.local.md")),
+            out(&live, &["status", "--porcelain"])
+                .lines()
+                .all(|line| !line.contains("CLAUDE.local.md")),
             "excluded"
         );
         assert!(
-            !moved.stderr.lines().any(|line| line.contains("AGENTS.md")
-                || line.contains(" CLAUDE.md")),
+            !moved
+                .stderr
+                .lines()
+                .any(|line| line.contains("AGENTS.md") || line.contains(" CLAUDE.md")),
             "pass {pass}: {both}"
         );
     }
@@ -3853,8 +3860,10 @@ fn the_hand_off_never_modifies_a_tracked_file() {
     assert!(planned.ok, "{}\n{}", planned.stdout, planned.stderr);
     let rows = fs::read_to_string(world.state().join("diff.jsonl")).unwrap();
     assert!(
-        !rows.lines().any(|row| row.contains("\"path\":\"AGENTS.md\"")
-            || row.contains("\"path\":\"CLAUDE.md\"")),
+        !rows
+            .lines()
+            .any(|row| row.contains("\"path\":\"AGENTS.md\"")
+                || row.contains("\"path\":\"CLAUDE.md\"")),
         "{rows}"
     );
 }
