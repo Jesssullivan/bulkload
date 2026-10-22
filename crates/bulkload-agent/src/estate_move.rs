@@ -2504,7 +2504,7 @@ fn homes_plan(run: &Move, home: &Path, plan: &Path) -> Result<()> {
             // written), and the live links it merges at their real
             // directories.
             regularize_home(run, short, &to, true)?;
-            bulkload_agent::reseat::links::live_links(&to, &run.live_link_roots)
+            home_live_links(short, &to, &run.live_link_roots)
         } else {
             Vec::new()
         };
@@ -2564,6 +2564,25 @@ fn session_pulls(pulls: &Path) -> Vec<PathBuf> {
         .collect();
     found.sort();
     found
+}
+
+// The live links of the home `name` (reseat::links::live_links), with one
+// line counting them and the Bazel output bases the walk never entered
+// (2026-10-22: rebuildable, decided at the directory). Stdout lost is the
+// pass's own refusal elsewhere; the links are returned regardless.
+fn home_live_links(
+    name: &str,
+    real: &Path,
+    roots: &[PathBuf],
+) -> Vec<bulkload_agent::reseat::links::LiveLink> {
+    let _ = bulkload_agent::reseat::links::take_output_bases_skipped();
+    let links = bulkload_agent::reseat::links::live_links(real, roots);
+    let _ = out(&format!(
+        "estate-move live-links home={name} links={} rebuildable_output_bases={}",
+        links.len(),
+        bulkload_agent::reseat::links::take_output_bases_skipped()
+    ));
+    links
 }
 
 // A-055 (2026-10-21): the home's links into a declared regularize root
@@ -2775,7 +2794,7 @@ fn sessions_pull(
     let claude_root = Move::live_root(&dest.join(".claude"), "claude");
     let claude_links = claude_root
         .as_ref()
-        .map(|real| bulkload_agent::reseat::links::live_links(real, &run.live_link_roots))
+        .map(|real| home_live_links("claude", real, &run.live_link_roots))
         .unwrap_or_default();
     // #280 finding 9: the Claude tree with the key map of this pass's lanes,
     // derived for the real, owner-checked home the pull runs under; the
@@ -2867,7 +2886,7 @@ fn sessions_pull(
     let codex_root = Move::live_root(&dest.join(".codex"), "codex");
     let codex_links = codex_root
         .as_ref()
-        .map(|real| bulkload_agent::reseat::links::live_links(real, &run.live_link_roots))
+        .map(|real| home_live_links("codex", real, &run.live_link_roots))
         .unwrap_or_default();
     let mut codex_seen = None;
     let codex = codex_root.as_ref().map_err(Clone::clone).and_then(|real| {
