@@ -1885,6 +1885,18 @@ fn archive_links_follow_a106_and_destination_links_stay() {
     fs::write(&gz, b"\x1f\x8b old").unwrap();
     let odd = dst_codex.join("sessions/2026/10/19/notes.txt");
     fs::write(&odd, b"an odd name\n").unwrap();
+    // homes-20261021: neo rollouts no index names, whose live paths on sting
+    // are links into the archive. One holds neo's bytes exactly (covered,
+    // nothing written; the re-seat never reads it, where O_NOFOLLOW was
+    // ELOOP, a bare IO that ended the re-seat); one holds other bytes (held).
+    let same_rel = "sessions/2026/10/19/rollout-2026-10-19T11-00-00-019a0000-0000-7000-8000-00000000000b.jsonl.zst";
+    let diff_rel = "sessions/2026/10/19/rollout-2026-10-19T12-00-00-019a0000-0000-7000-8000-00000000000c.jsonl.zst";
+    fs::write(src_codex.join(same_rel), b"zst frames, the same on both\n").unwrap();
+    fs::write(src_codex.join(diff_rel), b"zst frames, neo's\n").unwrap();
+    fs::write(archive.join("same.zst"), b"zst frames, the same on both\n").unwrap();
+    fs::write(archive.join("diff.zst"), b"zst frames, sting's\n").unwrap();
+    std::os::unix::fs::symlink(archive.join("same.zst"), dst_codex.join(same_rel)).unwrap();
+    std::os::unix::fs::symlink(archive.join("diff.zst"), dst_codex.join(diff_rel)).unwrap();
 
     let source_state = base.join("move-src");
     let state = base.join("move-dst");
@@ -2065,6 +2077,36 @@ fn archive_links_follow_a106_and_destination_links_stay() {
     );
     assert_eq!(fs::read(&gz).unwrap(), b"\x1f\x8b old");
     assert_eq!(fs::read(&odd).unwrap(), b"an odd name\n");
+    // The archive links to rollouts no index names: both stay links, the
+    // archive untouched; the equal one is covered, the other held.
+    for (rel, archived) in [
+        (same_rel, &b"zst frames, the same on both\n"[..]),
+        (diff_rel, &b"zst frames, sting's\n"[..]),
+    ] {
+        assert!(
+            fs::symlink_metadata(dst_codex.join(rel))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "{rel}: {}",
+            moved.stderr
+        );
+        assert_eq!(fs::read(dst_codex.join(rel)).unwrap(), archived);
+    }
+    assert!(
+        !moved.stderr.contains(&format!(
+            "held {same_rel}: HOMES_CONSOLIDATE_UNSUPPORTED"
+        )),
+        "{}",
+        moved.stderr
+    );
+    assert!(
+        moved.stderr.contains(&format!(
+            "held {diff_rel}: HOMES_CONSOLIDATE_UNSUPPORTED reason=\"the live path is a link or another kind\""
+        )),
+        "{}",
+        moved.stderr
+    );
     // SPEC rule 3: nothing lands beside a link either.
     assert!(
         label_copies(&dst_home).is_empty(),

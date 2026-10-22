@@ -1465,6 +1465,42 @@ fn archive_target(root: &Path, rel_path: &[u8], archived: &[PathBuf]) -> Option<
     .then_some(target)
 }
 
+/// The size of the regular file a live path that is a symlink resolves
+/// to, or `None` (no link, dangling, or a link to another kind).
+fn linked_size(root: &Path, rel_path: &[u8]) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let live = root.join(std::ffi::OsStr::from_bytes(rel_path));
+    if !std::fs::symlink_metadata(&live)
+        .ok()?
+        .file_type()
+        .is_symlink()
+    {
+        return None;
+    }
+    let found = std::fs::metadata(&live).ok()?;
+    found.is_file().then_some(found.len())
+}
+
+/// Whether a live path that is a symlink resolves to a regular file
+/// holding exactly the seat's bytes (its size, every manifest chunk by
+/// digest): the seat is covered there, read through the link, and nothing
+/// is written, the link and its target untouched (A-106/TIN-5268: an
+/// archive is never modified; homes-20261021 held 11,384 such links).
+fn linked_equal(root: &Path, rel_path: &[u8], manifest: &Manifest) -> Result<bool> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let Some(size) = linked_size(root, rel_path) else {
+        return Ok(false);
+    };
+    if manifest.size() != Some(size) {
+        return Ok(false);
+    }
+    let live = root.join(std::ffi::OsStr::from_bytes(rel_path));
+    let Ok(file) = std::fs::File::open(&live) else {
+        return Ok(false);
+    };
+    crate::materialize::covers(&file, manifest)
+}
+
 /// A class #297 can union (append logs, JSON and TOML config): what an
 /// add/add in a Git worktree falls back to.
 const fn unionable(class: crate::consolidate::Class) -> bool {
@@ -6992,6 +7028,15 @@ impl<W: Write> Inbound<'_, W> {
                     }
                     return Ok(Decision::WantManifest);
                 }
+                // A link to a regular file of the seat's size: covered when
+                // its bytes are the seat's, judged by manifest, nothing
+                // written through it. One proved before is reused.
+                if linked_size(self.target.path(), &row.rel_path) == Some(row.size) {
+                    if self.store.consolidated(key)? {
+                        return Ok(self.reuse_seat(row, class, "covered", Some(row.size), plan));
+                    }
+                    return Ok(Decision::WantManifest);
+                }
                 return self.hold_seat(row, class, None, OTHER_KIND, plan);
             }
             // A plan creates no directory: one the seat would be landed in
@@ -8423,6 +8468,15 @@ impl<W: Write> Inbound<'_, W> {
                 drop_staged(staged);
                 return Err(BulkloadRefusal::ProtocolStateViolation);
             }
+            Err(_) if linked_equal(self.target.path(), &row.rel_path, manifest)? => {
+                drop_staged(staged);
+                if settings.plan_only {
+                    self.plan_seat(row, class.word(), "covered", Some(row.size), None);
+                    self.answered_now = Some(false);
+                    return Ok(());
+                }
+                return self.covered(row, &key, racy);
+            }
             Err(_)
                 if archive_target(self.target.path(), &row.rel_path, &settings.archived)
                     .is_some() =>
@@ -9518,6 +9572,13 @@ fn plan_consolidating(
         Ok(None) if plan => return dry("create", None, None),
         Ok(None) => return Consolidating::Land,
         Err(BulkloadRefusal::DestinationOccupied | BulkloadRefusal::DestinationKindMismatch) => {
+            // A link to exactly the seat's bytes: covered, nothing written.
+            match linked_equal(context.target.path(), &row.rel_path, manifest) {
+                Ok(true) if plan => return dry("covered", Some(row.size), None),
+                Ok(true) => return done(Plan::Covered),
+                Ok(false) => {}
+                Err(refusal) => return done(Plan::Refuse(refusal)),
+            }
             if archive_target(context.target.path(), &row.rel_path, &settings.archived).is_some() {
                 if plan {
                     return dry("consolidate", None, Some(ARCHIVE_LINK));

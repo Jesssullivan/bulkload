@@ -951,9 +951,12 @@ fn reached(ledger: &mut moving::Ledger, path: &Path, phase: &str, outcome: Strin
     ledger.save(path)
 }
 
+// A bare IO names its errno (`refused:IO errno=40`): homes-20261021's
+// re-seat ended `refused:IO` with nothing to find the cause by.
 fn word(result: &Result<()>) -> String {
     match result {
         Ok(()) => "ok".to_owned(),
+        Err(BulkloadRefusal::Io(Some(errno))) => format!("refused:IO errno={errno}"),
         Err(refusal) => format!("refused:{}", refusal.code()),
     }
 }
