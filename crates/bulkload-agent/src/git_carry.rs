@@ -3111,10 +3111,11 @@ pub const REBUILDABLE_LINK_PREFIX: &str = "bazel-";
 /// `execroot`).
 pub const BAZEL_OUTPUT_BASE_MARKER: &str = "DO_NOT_BUILD_HERE";
 
-/// Whether `directory` is a Bazel output base: its
-/// [`BAZEL_OUTPUT_BASE_MARKER`] file, an `execroot/`, and an `external/` or
-/// `action_cache/` beside them. Rebuildable (SPEC rule 5): the next
-/// `bazel build` makes it again.
+/// Whether `directory` is a Bazel output base, rebuildable (SPEC rule 5).
+///
+/// Its [`BAZEL_OUTPUT_BASE_MARKER`] file, an `execroot/`, and an
+/// `external/` or `action_cache/` beside them; the next `bazel build` makes
+/// it again.
 ///
 /// Decided at the directory by a few `lstat`s, never by descending, and no
 /// link is followed. 2026-10-22: the homes pass walked sting's Codex home
