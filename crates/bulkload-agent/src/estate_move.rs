@@ -2364,15 +2364,15 @@ fn homes_plan(run: &Move, home: &Path, plan: &Path) -> Result<()> {
             Vec::new()
         };
         let pull = format!("plan-{short}");
-        let pulled = if tree {
+        let (pulled, seen) = if tree {
             pull_home(run, &from, &to, &pull, &links)
         } else {
-            run.transfer_kind(kind, &from, &to, &pull)
+            (run.transfer_kind(kind, &from, &to, &pull), None)
         };
         if claude {
             bulkload_agent::transfer::set_map_prefixes(Vec::new())?;
         }
-        let linked = pull_links(run, &from, &pull, &links, &prefixes);
+        let linked = pull_links(run, &from, &pull, &links, &prefixes, seen.as_ref());
         let pulled = pulled.and(linked);
         // Report-only: a path refusal (an absent `~/.claude.json` among
         // them) is printed with the plan; only a session that failed fails
@@ -2452,7 +2452,7 @@ fn pull_home(
     real: &Path,
     name: &str,
     links: &[bulkload_agent::reseat::links::LiveLink],
-) -> Result<()> {
+) -> (Result<()>, Option<Seen>) {
     use std::os::unix::ffi::OsStrExt as _;
     bulkload_agent::transfer::set_skip(
         links
@@ -2460,10 +2460,18 @@ fn pull_home(
             .map(|link| link.rel.as_os_str().as_bytes().to_vec())
             .collect(),
     );
+    let _ = bulkload_agent::transfer::take_skip_seen();
     let pulled = run.transfer_into(from, real, name);
     bulkload_agent::transfer::set_skip(Vec::new());
-    pulled
+    let seen = bulkload_agent::transfer::take_skip_seen();
+    // Only a walk that completed saw every link the source has.
+    let seen = session_completed(&pulled).then_some(seen);
+    (pulled, seen)
 }
+
+/// The live links' paths (relative to the home) the home's own walk
+/// offered anything at or under ([`pull_home`]).
+type Seen = std::collections::BTreeSet<Vec<u8>>;
 
 // The source path of a destination path relative to the home: the key map
 // (#280 finding 9) run backwards, `projects/<D>/...` from the
@@ -2501,11 +2509,32 @@ fn pull_links(
     name: &str,
     links: &[bulkload_agent::reseat::links::LiveLink],
     maps: &[(Vec<u8>, Vec<u8>)],
+    seen: Option<&Seen>,
 ) -> Result<()> {
     use std::os::unix::ffi::OsStrExt as _;
     bulkload_agent::transfer::set_listing(Vec::new());
     let mut result = Ok(());
     for link in links {
+        // 2026-10-22: a link the home's completed walk never reached is one
+        // the source does not have: nothing to merge, and no session run
+        // (a remote source refuses a missing root before any frame, which
+        // the pull can only read as TRANSPORT_LOST). A record an earlier
+        // pass left for it is removed.
+        if seen.is_some_and(|seen| !seen.contains(link.rel.as_os_str().as_bytes())) {
+            let pull = format!(
+                "{name}-link-{}",
+                blake3::hash(link.rel.as_os_str().as_bytes())
+                    .to_hex()
+                    .get(..16)
+                    .unwrap_or_default()
+            );
+            let _ = std::fs::remove_dir_all(run.state.join("pull").join(&pull));
+            out(&format!(
+                "estate-move live-link home={name} rel={} source=absent (nothing to merge)",
+                link.rel.display()
+            ))?;
+            continue;
+        }
         let source = from.join(source_rel(&link.rel, maps));
         let pull = format!(
             "{name}-link-{}",
@@ -2612,6 +2641,7 @@ fn sessions_pull(
         .as_ref()
         .map_err(Clone::clone)
         .and_then(|real| derive_key_maps(run, home, plan, real));
+    let mut claude_seen = None;
     let claude = key_maps
         .as_ref()
         .map_err(Clone::clone)
@@ -2622,7 +2652,10 @@ fn sessions_pull(
         .and_then(|()| {
             claude_root.as_ref().map_err(Clone::clone).and_then(|real| {
                 regularize_home(run, "claude", real, false)?;
-                pull_home(run, &home.join(".claude"), real, "claude", &claude_links)
+                let (pulled, seen) =
+                    pull_home(run, &home.join(".claude"), real, "claude", &claude_links);
+                claude_seen = seen;
+                pulled
             })
         });
     let unmapped = bulkload_agent::transfer::set_map_prefixes(Vec::new());
@@ -2637,6 +2670,7 @@ fn sessions_pull(
         "claude",
         &claude_links,
         &claude_prefixes,
+        claude_seen.as_ref(),
     );
     // #294 review 4: a derived map the landed sessions of its lane did not
     // use (the source keyed them otherwise) leaves them to be re-seated as
@@ -2690,12 +2724,22 @@ fn sessions_pull(
         .as_ref()
         .map(|real| bulkload_agent::reseat::links::live_links(real, &run.live_link_roots))
         .unwrap_or_default();
+    let mut codex_seen = None;
     let codex = codex_root.as_ref().map_err(Clone::clone).and_then(|real| {
         regularize_home(run, "codex", real, false)?;
-        pull_home(run, &codex_from, real, "codex", &codex_links)
+        let (pulled, seen) = pull_home(run, &codex_from, real, "codex", &codex_links);
+        codex_seen = seen;
+        pulled
     });
     let codex_listed = write_listing(&pulls.join("codex.listing"), super::take_listed());
-    let codex_linked = pull_links(run, &codex_from, "codex", &codex_links, &[]);
+    let codex_linked = pull_links(
+        run,
+        &codex_from,
+        "codex",
+        &codex_links,
+        &[],
+        codex_seen.as_ref(),
+    );
     bulkload_agent::transfer::set_listing(Vec::new());
     bulkload_agent::transfer::set_consolidate(None);
     // A session that did not complete outranks one that completed with

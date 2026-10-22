@@ -2938,7 +2938,24 @@ fn no_option_writes_a_label_copy_in_a_home() {
 ///   --map).
 #[test]
 fn homes_links_are_resolved_and_folded_through() {
-    let base = std::env::temp_dir().join(format!("bulkload-move-links-{}", std::process::id()));
+    homes_links(false);
+}
+
+/// 2026-10-22: the same pass over a transport. A remote source refuses a
+/// missing link source before any frame (the pull can only read
+/// `TRANSPORT_LOST`), so a link the home's own walk never reached runs no
+/// session: nothing to merge, the sessions pull completes and the re-seat
+/// runs.
+#[test]
+fn homes_links_over_a_transport_skip_a_link_the_source_lacks() {
+    homes_links(true);
+}
+
+fn homes_links(remote: bool) {
+    let base = std::env::temp_dir().join(format!(
+        "bulkload-move-links-{}-{remote}",
+        std::process::id()
+    ));
     let _ = fs::remove_dir_all(&base);
     fs::create_dir_all(&base).unwrap();
     let world = World {
@@ -3069,6 +3086,8 @@ fn homes_links_are_resolved_and_folded_through() {
     assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
     let map = format!("{}={}", src_git.display(), dst_git.display());
     let home_map = format!("{}={}", src_home.display(), dst_home.display());
+    let fake_bin = base.join("fake-bin");
+    fake_ssh(&fake_bin);
     let run = |plan: bool| {
         let mut args: Vec<&dyn AsRef<std::ffi::OsStr>> = vec![&"estate-move"];
         if plan {
@@ -3094,14 +3113,22 @@ fn homes_links_are_resolved_and_folded_through() {
             &"--regularize-link-root",
             &repair_stage,
         ]);
-        args.extend::<[&dyn AsRef<std::ffi::OsStr>; 5]>([
-            &"--reseat-arg",
-            &"--no-default-by-id",
-            &"-",
-            &source_state,
-            &state,
-        ]);
-        agent(&os(&args))
+        args.extend::<[&dyn AsRef<std::ffi::OsStr>; 2]>([&"--reseat-arg", &"--no-default-by-id"]);
+        if remote {
+            args.extend::<[&dyn AsRef<std::ffi::OsStr>; 3]>([
+                &"--remote-executable",
+                &env!("CARGO_BIN_EXE_bulkload-agent"),
+                &"fakehost",
+            ]);
+        } else {
+            args.push(&"-");
+        }
+        args.extend::<[&dyn AsRef<std::ffi::OsStr>; 2]>([&source_state, &state]);
+        if remote {
+            agent_over_ssh(&os(&args), &fake_bin)
+        } else {
+            agent(&os(&args))
+        }
     };
 
     // The plan: the lane is derived, the regularization and the live link
@@ -3310,6 +3337,37 @@ fn homes_links_are_resolved_and_folded_through() {
         fs::read_to_string(lane_projects.join(format!("{SID}.jsonl"))).unwrap(),
         bytes
     );
+}
+
+/// An `ssh` stand-in first on `PATH`: drops ssh's own options and the
+/// host, then runs the remote command here through a shell.
+fn fake_ssh(dir: &Path) {
+    fs::create_dir_all(dir).unwrap();
+    let ssh = dir.join("ssh");
+    fs::write(
+        &ssh,
+        "#!/bin/sh\nwhile [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\nshift 2\nexec sh -c \"$*\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn agent_over_ssh(args: &[OsString], fake_bin: &Path) -> Ran {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![fake_bin.to_path_buf()];
+    paths.extend(std::env::split_paths(&path));
+    let out = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .arg("--min-free-percent=0")
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .output()
+        .unwrap();
+    Ran {
+        ok: out.status.success(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
 }
 
 fn agent_home(args: &[OsString], home: &Path) -> Ran {
