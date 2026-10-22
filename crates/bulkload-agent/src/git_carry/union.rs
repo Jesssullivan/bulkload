@@ -262,6 +262,14 @@ pub fn reflogs(
     actions: &[(String, RefAction)],
 ) -> Result<u64> {
     let common = super::common_repository(repo)?;
+    let mut ids: Vec<String> = source_logs
+        .iter()
+        .flat_map(|(_, lines)| lines.split(|byte| *byte == b'\n'))
+        .flat_map(entry_ids)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    let present = super::preview::held(repo, &ids)?;
     let mut added = 0u64;
     for (name, lines) in source_logs {
         if name == "refs/stash" || name == "HEAD" || name.contains("..") {
@@ -282,6 +290,11 @@ pub fn reflogs(
         let missing: Vec<&[u8]> = lines
             .split(|byte| *byte == b'\n')
             .filter(|line| !line.is_empty() && !held_lines.contains(line))
+            // An entry naming an object the source no longer holds (its gc
+            // pruned it; the fetch could not bring it) is history neither
+            // side has: never written, so the live repository never names a
+            // missing object (2026-10-22, tinyland.dev's CAPTURE_DRIFTED).
+            .filter(|line| entry_ids(line).iter().all(|id| present.contains(id)))
             .collect();
         if missing.is_empty() {
             continue;
@@ -302,6 +315,17 @@ pub fn reflogs(
         added += u64::try_from(missing.len()).unwrap_or(u64::MAX);
     }
     Ok(added)
+}
+
+// The object ids a reflog line names (its old and new values), the
+// null id left out.
+fn entry_ids(line: &[u8]) -> Vec<String> {
+    line.split(|byte| *byte == b' ')
+        .take(2)
+        .filter_map(|word| std::str::from_utf8(word).ok())
+        .filter(|word| oid(word) && word.bytes().any(|byte| byte != b'0'))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Whether the live repository `repo` holds any of `roots` (the source's

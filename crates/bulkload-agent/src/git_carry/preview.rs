@@ -121,6 +121,10 @@ pub struct FilesAnswer {
 pub enum Ask {
     Refs(Vec<RefsAsk>),
     Files(Vec<FilesAsk>),
+    /// Capture these items now (estate-move's just-in-time capture of an
+    /// item that drifted, 2026-10-22): the source half's own capture,
+    /// read-only, answered over the wire, never recorded on the source.
+    Capture(Vec<crate::estate::Item>),
 }
 
 /// A negotiation answer, one per question in order.
@@ -128,6 +132,8 @@ pub enum Ask {
 pub enum Answer {
     Refs(Vec<RefsAnswer>),
     Files(Vec<FilesAnswer>),
+    /// Each item's snapshot, or its refusal's code.
+    Capture(Vec<std::result::Result<crate::estate::streamed::ItemSnapshot, String>>),
 }
 
 /// Answer `ask` on the source. Reads only.
@@ -136,6 +142,20 @@ pub fn answer(ask: &Ask) -> Answer {
     match ask {
         Ask::Refs(asks) => Answer::Refs(asks.iter().map(refs_answer).collect()),
         Ask::Files(asks) => Answer::Files(asks.iter().map(files_answer).collect()),
+        Ask::Capture(items) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| i128::try_from(since.as_nanos()).unwrap_or(i128::MAX));
+            Answer::Capture(
+                items
+                    .iter()
+                    .map(|item| {
+                        crate::estate::streamed::capture_source(item, now, false)
+                            .map_err(|refusal| refusal.code().to_owned())
+                    })
+                    .collect(),
+            )
+        }
     }
 }
 
@@ -676,5 +696,39 @@ mod tests {
         let (code, detail) = files[0].unreadable.clone().unwrap();
         assert_eq!(code, "SOURCE_ROOT_UNREADABLE");
         assert!(detail.contains("13"), "{detail}");
+    }
+
+    // 2026-10-22: the just-in-time capture is the source half's own,
+    // answered over the wire.
+    #[test]
+    fn a_capture_is_answered_with_the_items_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = fs::canonicalize(dir.path()).unwrap().join("r");
+        fs::create_dir(&repo).unwrap();
+        let run = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(["-c", "user.name=t", "-c", "user.email=t@l", "-c", "commit.gpgsign=false", "-C"])
+                .arg(&repo)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        };
+        run(&["init", "-q", "--template=", "-b", "main"]);
+        fs::write(repo.join("a"), "a\n").unwrap();
+        run(&["add", "a"]);
+        run(&["commit", "-q", "-m", "c0"]);
+        let item = crate::estate::Item {
+            source: repo.clone(),
+            repository: repo.clone(),
+            workspace: Some(repo.clone()),
+        };
+        let Answer::Capture(captured) = answer(&Ask::Capture(vec![item])) else {
+            panic!("not a capture answer");
+        };
+        let snapshot = captured[0].clone().unwrap();
+        assert_eq!(snapshot.head_branch.as_deref(), Some("refs/heads/main"));
+        assert!(!snapshot.snapshot.wants.is_empty());
     }
 }

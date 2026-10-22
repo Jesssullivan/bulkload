@@ -601,6 +601,43 @@ pub fn fetch_into(
     snapshot: &Snapshot,
     marks: &Path,
 ) -> Result<Fetched> {
+    // The quarantines already in the store are another writer's: only the
+    // ones that appear while this fetch runs are this pass's own
+    // (2026-10-22: an in-flight fetch of a live user is never ours).
+    let present = quarantine_left(objects)?;
+    let fetched = fetch_batches(objects, object_format, url, upload_pack, snapshot, marks);
+    let after = quarantine_left(objects)?;
+    let mut own = OWN.lock().map_err(|_| BulkloadRefusal::WorkerLost)?;
+    own.extend(after.into_iter().filter(|path| !present.contains(path)));
+    drop(own);
+    fetched
+}
+
+/// The quarantine paths this process's own fetches made ([`fetch_into`]).
+static OWN: std::sync::Mutex<BTreeSet<PathBuf>> = std::sync::Mutex::new(BTreeSet::new());
+
+/// The quarantines this process's fetches made in `objects` that are still
+/// there: what a pass must never leave (SPEC rule 2). Another writer's
+/// in-flight quarantine is never counted.
+///
+/// # Errors
+/// IO for an unreadable store directory.
+pub fn own_quarantine_left(objects: &Path) -> Result<Vec<PathBuf>> {
+    let own = OWN.lock().map_err(|_| BulkloadRefusal::WorkerLost)?;
+    Ok(quarantine_left(objects)?
+        .into_iter()
+        .filter(|path| own.contains(path))
+        .collect())
+}
+
+fn fetch_batches(
+    objects: &Path,
+    object_format: &str,
+    url: &str,
+    upload_pack: &str,
+    snapshot: &Snapshot,
+    marks: &Path,
+) -> Result<Fetched> {
     let digest = snapshot.digest();
     let mut recorded = read_marks(marks, digest)?;
     let before = store_bytes(objects);

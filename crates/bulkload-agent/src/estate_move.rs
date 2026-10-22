@@ -1258,13 +1258,60 @@ fn move_pass(run: &Move) -> Result<()> {
     let landing_ns = bulkload_agent::git_carry::pass_start_ns();
     // Then each item's seats, host-path files and proof, mains first; a
     // related repository of the destination's own is consolidated.
-    for ((row, snapshot, related), (fetched, fetch_ms)) in landing.iter().zip(fetched) {
+    // SPEC rule 6 (work never halts; the coordinator, 2026-10-22): an item
+    // whose live source moved under the pass is captured again, just in
+    // time, through the source session, its objects fetched, and landed or
+    // consolidated as it is at that moment; typed `CAPTURE_DRIFTED` only
+    // after the rounds run out.
+    let recapture = |stale: &estate::streamed::ItemSnapshot| -> Result<(
+        estate::streamed::ItemSnapshot,
+        bulkload_agent::git_carry::stream::Fetched,
+    )> {
+        let planned = estate::Item {
+            source: stale.item.source.clone(),
+            repository: stale.item.source.clone(),
+            workspace: stale.item.workspace.as_ref().map(|_| stale.item.source.clone()),
+        };
+        let answer = super::negotiate(
+            &run.host,
+            run.remote.as_deref(),
+            run.config.as_deref(),
+            &bulkload_agent::git_carry::preview::Ask::Capture(vec![planned]),
+        )?;
+        let mut fresh = match answer {
+            bulkload_agent::git_carry::preview::Answer::Capture(mut captured) => captured
+                .pop()
+                .ok_or(BulkloadRefusal::ProtocolStateViolation)?
+                .map_err(|_| BulkloadRefusal::CaptureDrifted)?,
+            _ => return Err(BulkloadRefusal::ProtocolStateViolation),
+        };
+        fresh.item = stale.item.clone();
+        fresh.excluded.extend(stale.excluded.iter().cloned());
+        fresh.excluded.sort();
+        fresh.excluded.dedup();
+        let program = upload_pack.as_ref().map_err(Clone::clone)?;
+        let fetched = estate::streamed::fetch_objects(&fresh, &private, program, &map)?;
+        Ok((fresh, fetched))
+    };
+    for ((row, planned_snapshot, related), (fetched, fetch_ms)) in landing.iter().zip(fetched) {
         let place = row.item.workspace.as_ref().unwrap_or(&row.item.repository);
         let started = std::time::Instant::now();
+        let mut current = planned_snapshot.clone();
         if *related {
-            let converged = fetched.and_then(|fetched| {
-                estate::streamed::converge(snapshot, &reach, fetched, &run.source, &map)
+            let mut converged = fetched.and_then(|fetched| {
+                estate::streamed::converge(&current, &reach, fetched, &run.source, &map)
             });
+            for _ in 0..JIT_ROUNDS {
+                if converged.as_ref().err() != Some(&BulkloadRefusal::CaptureDrifted) {
+                    break;
+                }
+                out(&format!("estate-move item={} recapture=just-in-time", row.id))?;
+                converged = recapture(&current).and_then(|(fresh, fetched)| {
+                    current = fresh;
+                    estate::streamed::converge(&current, &reach, fetched, &run.source, &map)
+                });
+            }
+            let snapshot = &current;
             match converged {
                 Ok(done) => {
                     for (name, action) in &done.refs {
@@ -1369,8 +1416,19 @@ fn move_pass(run: &Move) -> Result<()> {
             }
             continue;
         }
-        let landing = fetched
-            .and_then(|fetched| estate::streamed::land(snapshot, &private, &map, &reach, fetched));
+        let mut landing = fetched
+            .and_then(|fetched| estate::streamed::land(&current, &private, &map, &reach, fetched));
+        for _ in 0..JIT_ROUNDS {
+            if landing.as_ref().err() != Some(&BulkloadRefusal::CaptureDrifted) {
+                break;
+            }
+            out(&format!("estate-move item={} recapture=just-in-time", row.id))?;
+            landing = recapture(&current).and_then(|(fresh, fetched)| {
+                current = fresh;
+                estate::streamed::land(&current, &private, &map, &reach, fetched)
+            });
+        }
+        let snapshot = &current;
         match landing {
             Ok(done) => {
                 estate::streamed::journal(&private, snapshot, &run.source)?;
@@ -1710,6 +1768,11 @@ fn print_plan(rows: &[moving::Row], notes: &std::collections::BTreeMap<String, u
 
 // `--plan-only`: estate-diff's preview of what the apply will do
 // (read-only at the destination), one row per line in MOVE_STATE/diff.jsonl.
+/// How many just-in-time captures a drifted item gets before it is typed
+/// `CAPTURE_DRIFTED` (each followed by its land's or converge's own
+/// top-up rounds).
+const JIT_ROUNDS: usize = 2;
+
 /// The reason a plan row gives an item no map places on this host.
 const UNMAPPED: &str = "unmapped";
 
