@@ -3092,9 +3092,10 @@ pub const REBUILDABLE_DIRECTORIES: &[&str] = &[
     ".terraform",
 ];
 
-/// The rebuildable roots SPEC rule 5 adds for the streamed capture of an
-/// estate move (2026-10-22: the estate pass held 2293 files under `build/`
-/// and 686 under `.svelte-kit/` as differing seats). The legacy capture
+/// The rebuildable roots SPEC rule 5 adds for an estate move's capture.
+///
+/// 2026-10-22: the estate pass held 2293 files under `build/` and 686
+/// under `.svelte-kit/` as differing seats. The legacy capture
 /// keeps [`REBUILDABLE_DIRECTORIES`] alone, so its capture keys never move.
 pub const SPEC_REBUILDABLE_DIRECTORIES: &[&str] = &["build", "dist", ".svelte-kit"];
 
