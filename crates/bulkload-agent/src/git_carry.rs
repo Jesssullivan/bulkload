@@ -3107,6 +3107,29 @@ pub const SPEC_REBUILDABLE_DIRECTORIES: &[&str] = &["build", "dist", ".svelte-ki
 /// carried (SPEC rule 5), when Git does not track them.
 pub const REBUILDABLE_LINK_PREFIX: &str = "bazel-";
 
+/// The file Bazel writes at the root of every output base (and of its
+/// `execroot`).
+pub const BAZEL_OUTPUT_BASE_MARKER: &str = "DO_NOT_BUILD_HERE";
+
+/// Whether `directory` is a Bazel output base: its
+/// [`BAZEL_OUTPUT_BASE_MARKER`] file, an `execroot/`, and an `external/` or
+/// `action_cache/` beside them. Rebuildable (SPEC rule 5): the next
+/// `bazel build` makes it again.
+///
+/// Decided at the directory by a few `lstat`s, never by descending, and no
+/// link is followed. 2026-10-22: the homes pass walked sting's Codex home
+/// file by file for over 40 minutes through 43 output bases, named by hash
+/// or `output-base` rather than `bazel-*`.
+#[must_use]
+pub fn is_bazel_output_base(directory: &Path) -> bool {
+    let meta = |name: &str| fs::symlink_metadata(directory.join(name)).ok();
+    meta(BAZEL_OUTPUT_BASE_MARKER).is_some_and(|meta| meta.is_file())
+        && meta("execroot").is_some_and(|meta| meta.is_dir())
+        && ["external", "action_cache"]
+            .iter()
+            .any(|name| meta(name).is_some_and(|meta| meta.is_dir()))
+}
+
 /// Metadata ref naming the rebuildable roots a capture omitted.
 const REBUILDABLE_METADATA: &str = "rebuildable-omissions-v1";
 /// Reusable-key domain for the omission sidecar; only hashed when present.
@@ -3417,9 +3440,10 @@ pub fn streamed_omissions(repo: &Path, include_rebuildable: bool) -> Result<Omis
             let name = entry.file_name();
             if !include_rebuildable
                 && (rebuildable_root(&root, relative, &name)?
-                    || (SPEC_REBUILDABLE_DIRECTORIES
+                    || ((SPEC_REBUILDABLE_DIRECTORIES
                         .iter()
                         .any(|candidate| name.as_bytes() == candidate.as_bytes())
+                        || is_bazel_output_base(&path))
                         && untracked(&root, relative)?))
             {
                 omitted.push(relative.as_os_str().as_bytes().to_vec());
@@ -3562,7 +3586,8 @@ fn rebuildable_root(root: &Path, relative: &Path, name: &std::ffi::OsStr) -> Res
 ///
 /// `rel` is relative to `repo`'s worktree. The root is one the streamed
 /// capture of `repo` omits: a directory on its way named in [`REBUILDABLE_DIRECTORIES`] or
-/// [`SPEC_REBUILDABLE_DIRECTORIES`] that Git tracks nothing under, as
+/// [`SPEC_REBUILDABLE_DIRECTORIES`], or a Bazel output base
+/// ([`is_bazel_output_base`]), that Git tracks nothing under, as
 /// [`streamed_omissions`] decides it. Such a nest (a `SwiftPM` dependency
 /// checkout under `.build/checkouts/`, a Git dependency under
 /// `node_modules/`) is rebuilt with its root, never its own estate item.
@@ -3580,10 +3605,11 @@ pub fn under_rebuildable_root(repo: &Path, rel: &[u8]) -> Result<bool> {
     for component in parent.components() {
         prefix.push(component);
         let name = component.as_os_str().as_bytes();
-        if REBUILDABLE_DIRECTORIES
+        if (REBUILDABLE_DIRECTORIES
             .iter()
             .chain(SPEC_REBUILDABLE_DIRECTORIES)
             .any(|candidate| name == candidate.as_bytes())
+            || is_bazel_output_base(&repo.join(&prefix)))
             && untracked(repo, &prefix)?
         {
             return Ok(true);
@@ -11134,6 +11160,53 @@ mod tests {
         assert_eq!(rebuildable, vec![b"node_modules".to_vec()]);
         let (_, kept) = streamed_omissions(&repo, true).unwrap();
         assert!(kept.is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    // 2026-10-22: a Bazel output base is known by its marker and layout, not
+    // its name, and is never entered; a lookalike missing the layout is an
+    // ordinary directory.
+    #[test]
+    fn a_bazel_output_base_is_rebuildable_by_its_layout() {
+        let root =
+            std::env::temp_dir().join(format!("bulkload-output-base-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q", "--template="])
+            .arg(&repo)
+            .status()
+            .unwrap()
+            .success());
+        let base = repo.join("cache/7c990655ada74b38fb9dc9b1f6b6bf97");
+        fs::create_dir_all(base.join("execroot/_main/bazel-out")).unwrap();
+        fs::create_dir_all(base.join("external/dep/.git")).unwrap();
+        fs::write(base.join(BAZEL_OUTPUT_BASE_MARKER), b"/srv/somewhere\n").unwrap();
+        fs::write(base.join("execroot/DO_NOT_BUILD_HERE"), b"x").unwrap();
+        let lookalike = repo.join("notes");
+        fs::create_dir_all(lookalike.join("execroot")).unwrap();
+        fs::write(lookalike.join(BAZEL_OUTPUT_BASE_MARKER), b"x").unwrap();
+        assert!(is_bazel_output_base(&base));
+        assert!(!is_bazel_output_base(&base.join("execroot")));
+        assert!(!is_bazel_output_base(&lookalike));
+        let (nests, rebuildable) = streamed_omissions(&repo, false).unwrap();
+        assert!(nests.is_empty(), "nothing inside the base is walked: {nests:?}");
+        assert_eq!(
+            rebuildable,
+            vec![b"cache/7c990655ada74b38fb9dc9b1f6b6bf97".to_vec()]
+        );
+        assert!(under_rebuildable_root(
+            &repo,
+            b"cache/7c990655ada74b38fb9dc9b1f6b6bf97/external/dep"
+        )
+        .unwrap());
+        let (nests, kept) = streamed_omissions(&repo, true).unwrap();
+        assert!(kept.is_empty());
+        assert_eq!(
+            nests,
+            vec![b"cache/7c990655ada74b38fb9dc9b1f6b6bf97/external/dep".to_vec()]
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 

@@ -26,11 +26,33 @@ use std::io::{Read as _, Write as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::refuse::RefuseAt as _;
 use crate::{BulkloadRefusal, Result};
 
 const SITE: &str = "reseat::links";
+
+/// Bazel output bases the walks here decided at the directory and never
+/// entered ([`crate::git_carry::is_bazel_output_base`]): rebuildable, so
+/// nothing in one is a live link or a stage link, and its millions of
+/// runfiles are never listed (2026-10-22).
+static OUTPUT_BASES_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// The output bases the walks here skipped since the last call (the count
+/// restarts at 0).
+pub fn take_output_bases_skipped() -> u64 {
+    OUTPUT_BASES_SKIPPED.swap(0, Ordering::Relaxed)
+}
+
+/// Whether a walk enters the directory `path`: never a Bazel output base.
+fn descend(path: &Path) -> bool {
+    if crate::git_carry::is_bazel_output_base(path) {
+        OUTPUT_BASES_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    true
+}
 
 /// The roots, each resolved to its real path (one that does not resolve is
 /// dropped: nothing can be under it).
@@ -71,8 +93,8 @@ pub struct LiveLink {
 }
 
 /// Every link in the live home `root`, at any depth (links are never
-/// followed), whose target is a directory or regular file under one of the
-/// live-link `roots`.
+/// followed, and a Bazel output base is never entered), whose target is a
+/// directory or regular file under one of the live-link `roots`.
 ///
 /// Each is the live file or directory itself: the source's same path is
 /// merged into its target, and the link stays (operator interview
@@ -92,7 +114,9 @@ pub fn live_links(root: &Path, roots: &[PathBuf]) -> Vec<LiveLink> {
                 continue;
             };
             if meta.is_dir() {
-                pending.push(path);
+                if descend(&path) {
+                    pending.push(path);
+                }
                 continue;
             }
             let Some(target) = target_under(&path, &roots) else {
@@ -157,7 +181,9 @@ pub fn regularize(
                 continue;
             };
             if meta.is_dir() {
-                pending.push(path);
+                if descend(&path) {
+                    pending.push(path);
+                }
             } else if let Some(target) = target_under(&path, &roots) {
                 links.push((path, target));
             }
@@ -332,4 +358,39 @@ fn regularize_one(link: &Path, target: &Path) -> Result<bool> {
     std::fs::remove_file(&temp).refuse_at(SITE)?;
     crate::io::durable::seal_dir(&directory).refuse_at(SITE)?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 2026-10-22: a link inside a Bazel output base is never a live link,
+    // and the base is never entered; one beside it still is.
+    #[test]
+    fn a_bazel_output_base_is_never_walked_for_links() {
+        let root =
+            std::env::temp_dir().join(format!("bulkload-links-base-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (home, live) = (root.join("home"), root.join("live"));
+        std::fs::create_dir_all(live.join("notes")).unwrap();
+        let base = home.join("proof/7c990655ada74b38fb9dc9b1f6b6bf97");
+        std::fs::create_dir_all(base.join("execroot/_main")).unwrap();
+        std::fs::create_dir_all(base.join("action_cache")).unwrap();
+        std::fs::write(
+            base.join(crate::git_carry::BAZEL_OUTPUT_BASE_MARKER),
+            b"x",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(live.join("notes"), base.join("execroot/_main/notes"))
+            .unwrap();
+        std::os::unix::fs::symlink(live.join("notes"), home.join("notes")).unwrap();
+        let _ = take_output_bases_skipped();
+        let found = live_links(&home, &[live.clone()]);
+        assert_eq!(
+            found.iter().map(|link| link.rel.clone()).collect::<Vec<_>>(),
+            vec![PathBuf::from("notes")]
+        );
+        assert_eq!(take_output_bases_skipped(), 1);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }
