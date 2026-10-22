@@ -368,7 +368,7 @@ fn a_streamed_pass_lands_every_absent_item_with_no_payload_anywhere() {
     // The same status, but the hand-off notes the move wrote (R0.5).
     let landed_status: String = out(&dst.join("land"), &["status", "--porcelain", "--ignored"])
         .lines()
-        .filter(|line| *line != "?? AGENTS.md" && *line != "?? CLAUDE.md")
+        .filter(|line| *line != "?? CLAUDE.local.md" && *line != "!! CLAUDE.local.md")
         .fold(String::new(), |mut all, line| {
             all.push_str(line);
             all.push('\n');
@@ -384,7 +384,11 @@ fn a_streamed_pass_lands_every_absent_item_with_no_payload_anywhere() {
             .contains("estate-move phase=hand-off outcome=ok"),
         "{both}"
     );
-    assert!(dst.join("land/AGENTS.md").is_file(), "{both}");
+    // The hand-off is CLAUDE.local.md, excluded; no tracked file is
+    // written and Codex gets none (2026-10-21).
+    assert!(dst.join("land/CLAUDE.local.md").is_file(), "{both}");
+    assert!(!dst.join("land/AGENTS.md").exists(), "{both}");
+    assert!(!dst.join("land/CLAUDE.md").exists(), "{both}");
     // The linked worktree is linked, at its live path.
     assert_eq!(
         out(&dst.join("land-wt"), &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
@@ -3774,5 +3778,83 @@ fn an_object_named_after_the_snapshot_is_fetched_in_the_same_pass() {
     assert_eq!(
         out(&live, &["cat-file", "-t", later.trim()]).trim(),
         "commit"
+    );
+}
+
+/// SPEC rules 7 and 8 (the coordinator, 2026-10-21): the hand-off never
+/// modifies a tracked file. A block an earlier pass wrote into the tracked
+/// `AGENTS.md` and `CLAUDE.md` is removed, exactly, by the next pass; the
+/// note lives in `CLAUDE.local.md`, excluded through `info/exclude`. After
+/// a pass and a rerun, `git status` shows no change to either tracked file,
+/// and the plan holds nothing for them.
+#[test]
+fn the_hand_off_never_modifies_a_tracked_file() {
+    let world = World::new("handofflocal");
+    world.estate();
+    let land = world.src().join("land");
+    fs::write(land.join("AGENTS.md"), "# agents\nneo's rules\n").unwrap();
+    fs::write(land.join("CLAUDE.md"), "# claude\nneo's notes\n").unwrap();
+    git(&land, &["add", "AGENTS.md", "CLAUDE.md"]);
+    git(&land, &["commit", "--quiet", "-m", "agent files"]);
+    assert!(world.source().ok);
+    // An earlier pass (the legacy targets) wrote its block into both.
+    let legacy = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .arg("--min-free-percent=0")
+        .args(os(&[
+            &"estate-move",
+            &"--label",
+            &LABEL,
+            &"--source",
+            &"neo",
+            &"-",
+            &world.source_state(),
+            &world.state(),
+        ]))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("BULKLOAD_HANDOFF_TRACKED_TARGETS", "1")
+        .output()
+        .unwrap();
+    let live = world.dst().join("land");
+    let agents = fs::read_to_string(live.join("AGENTS.md")).unwrap();
+    assert!(
+        agents.contains("bulkload") && agents.ends_with("# agents\nneo's rules\n"),
+        "{agents}\n{}",
+        String::from_utf8_lossy(&legacy.stdout)
+    );
+    // This pass removes the block it finds there and writes the local note.
+    for pass in 0..2 {
+        assert!(world.source().ok);
+        let moved = world.moved();
+        let both = format!("{}\n{}", moved.stdout, moved.stderr);
+        assert_eq!(
+            fs::read(live.join("AGENTS.md")).unwrap(),
+            b"# agents\nneo's rules\n",
+            "pass {pass}: {both}"
+        );
+        assert_eq!(
+            fs::read(live.join("CLAUDE.md")).unwrap(),
+            b"# claude\nneo's notes\n",
+            "pass {pass}: {both}"
+        );
+        let status = out(&live, &["status", "--porcelain", "--", "AGENTS.md", "CLAUDE.md"]);
+        assert!(status.is_empty(), "pass {pass}: {status}\n{both}");
+        assert!(live.join("CLAUDE.local.md").is_file(), "{both}");
+        assert!(
+            out(&live, &["status", "--porcelain"]).lines().all(|line| !line.contains("CLAUDE.local.md")),
+            "excluded"
+        );
+        assert!(
+            !moved.stderr.lines().any(|line| line.contains("AGENTS.md")
+                || line.contains(" CLAUDE.md")),
+            "pass {pass}: {both}"
+        );
+    }
+    let planned = world.planned();
+    assert!(planned.ok, "{}\n{}", planned.stdout, planned.stderr);
+    let rows = fs::read_to_string(world.state().join("diff.jsonl")).unwrap();
+    assert!(
+        !rows.lines().any(|row| row.contains("\"path\":\"AGENTS.md\"")
+            || row.contains("\"path\":\"CLAUDE.md\"")),
+        "{rows}"
     );
 }

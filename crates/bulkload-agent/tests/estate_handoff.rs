@@ -136,6 +136,9 @@ fn agent(args: &[OsString]) -> Ran {
 fn agent_with(args: &[OsString], environ: impl FnOnce(&mut Command)) -> Ran {
     let mut command = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"));
     command.args(args);
+    // The prefix machinery's fixtures write the legacy tracked targets; a
+    // release agent never does (2026-10-21: CLAUDE.local.md only).
+    command.env("BULKLOAD_HANDOFF_TRACKED_TARGETS", "1");
     environ(&mut command);
     let out = command.output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();

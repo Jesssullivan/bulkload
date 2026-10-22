@@ -71,6 +71,19 @@ pub const HANDOFF_STRIPPED: &str = "handoff.stripped";
 /// (SPEC rules 7 and 8, 2026-10-21: the hand-off never modifies a tracked
 /// file). Codex gets no file; its hand-off is the ledger and the closure.
 pub const TARGETS: [&str; 1] = [LOCAL];
+
+/// The variable a debug build's machinery tests set to run the hand-off
+/// over the legacy tracked targets ([`LEGACY`]), the prefix machinery's
+/// fixtures. A release build never reads it: a deployed agent writes the
+/// local file alone.
+pub const TRACKED_TARGETS_ENV: &str = "BULKLOAD_HANDOFF_TRACKED_TARGETS";
+
+/// Whether this run writes the legacy tracked targets (debug test builds
+/// with [`TRACKED_TARGETS_ENV`] set only).
+#[must_use]
+pub fn tracked_targets() -> bool {
+    cfg!(debug_assertions) && std::env::var_os(TRACKED_TARGETS_ENV).is_some()
+}
 /// The hand-off's file, created holding the block alone.
 pub const LOCAL: &str = "CLAUDE.local.md";
 /// The tracked files earlier passes wrote the block into: never written
@@ -446,7 +459,7 @@ fn marked(worktree: &Path, name: &str) -> Result<Option<Vec<u8>>> {
 /// # Errors
 /// Whatever reading a target refuses.
 pub(super) fn declared_blocks(worktree: &Path, sides: &mut BTreeMap<Vec<u8>, Side>) -> Result<()> {
-    for name in TARGETS {
+    for name in LEGACY.iter().chain(TARGETS.iter()) {
         let Some(side) = sides
             .get_mut(name.as_bytes())
             .filter(|side| side.kind == Kind::Regular)
@@ -476,7 +489,7 @@ pub(super) fn declared_blocks(worktree: &Path, sides: &mut BTreeMap<Vec<u8>, Sid
 /// Whatever reading a target refuses.
 pub(super) fn marked_targets(worktree: &Path) -> Result<u64> {
     let mut found = 0;
-    for name in TARGETS {
+    for name in LEGACY.iter().chain(TARGETS.iter()) {
         if marked(worktree, name)?.is_some() {
             found += 1;
         }
@@ -539,14 +552,19 @@ fn names_for(
     readme: bool,
     record: Option<&HandoffLanded>,
 ) -> Result<Vec<&'static str>> {
-    let mut names: Vec<&'static str> = TARGETS.to_vec();
+    let tracked = tracked_targets();
+    let mut names: Vec<&'static str> = if tracked {
+        LEGACY.to_vec()
+    } else {
+        TARGETS.to_vec()
+    };
     let recorded = |name: &str| {
         record.is_some_and(|record| record.files.iter().any(|file| file.path == name.as_bytes()))
     };
     // The override and README are written only where a recorded hand-off
     // already names them (they are cleared before a new render); a new
     // render writes the local file alone.
-    if recorded(OVERRIDE) {
+    if recorded(OVERRIDE) || (tracked && lstat(&worktree.join(OVERRIDE))?.is_some()) {
         names.push(OVERRIDE);
     }
     if readme || recorded(README) {
@@ -1398,7 +1416,7 @@ pub(super) fn lift(worktree: &Path, git_dir: &Path, source: &str, adds: &[&[u8]]
             .cloned()
             .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
         let name = std::str::from_utf8(add).map_err(|_| BulkloadRefusal::PathNotPortable)?;
-        if !TARGETS.contains(&name) {
+        if !TARGETS.contains(&name) && !LEGACY.contains(&name) {
             continue;
         }
         let target = worktree.join(name);
@@ -2296,10 +2314,12 @@ pub fn run(
                 // A block an earlier pass wrote into a tracked file (or the
                 // override, or a README) is cleared first: the recorded
                 // clear restores those bytes exactly and ledgers it.
-                if legacy_recorded(&place.dir)? {
-                    clear(workspace.worktree, &place.dir, estate.source, &ours, false)?;
+                if !tracked_targets() {
+                    if legacy_recorded(&place.dir)? {
+                        clear(workspace.worktree, &place.dir, estate.source, &ours, false)?;
+                    }
+                    exclude_local(&place.common)?;
                 }
-                exclude_local(&place.common)?;
                 // The H step re-renders a record; it never starts one, and
                 // never undoes a clear it just finished.
                 if request.h_step
