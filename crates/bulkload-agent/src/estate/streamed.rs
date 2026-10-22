@@ -621,15 +621,19 @@ pub fn converge(
 /// The destination's own state (an `AUTO_MERGE` tree a gc pruned, a reflog
 /// entry of its own), never the source's drift: a top-up neither wants them
 /// (the source never held them) nor refuses for them. None when `live`
-/// holds no repository of its own yet.
+/// holds no repository Git can read yet (a fresh landing whose fetch made
+/// only `.git/objects`): the stricter reading, every lacking id the
+/// landing's own.
 ///
 /// # Errors
-/// As [`stream::lacking`].
+/// None: an unreadable administration is no baseline.
 pub fn own_lacking(live: &Path) -> Result<std::collections::BTreeSet<String>> {
     if fs::symlink_metadata(live.join(".git")).is_err() {
         return Ok(std::collections::BTreeSet::new());
     }
-    Ok(stream::lacking(live)?.into_iter().collect())
+    Ok(stream::lacking(live)
+        .map(|ids| ids.into_iter().collect())
+        .unwrap_or_default())
 }
 
 /// How many rounds [`top_up`] fetches before it holds the item.

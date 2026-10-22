@@ -3517,6 +3517,7 @@ static SEAT_ITEM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None)
 
 /// Name `item` (its id and live path) on the seat lines of the transfers
 /// that follow, until [`seat_item`] with `None`.
+#[allow(clippy::unnecessary_debug_formatting)] // Paths print escaped and quoted.
 fn seat_item(item: Option<(&str, &Path)>) {
     *SEAT_ITEM
         .lock()
