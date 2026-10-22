@@ -4083,3 +4083,97 @@ fn alternates_are_carried_and_nests_never_refuse_the_parent() {
         ""
     );
 }
+
+// The receipt line's words of the item at `live`.
+fn receipt_at(stdout: &str, live: &Path) -> BTreeMap<String, String> {
+    item_line(stdout, live)
+        .split(' ')
+        .filter_map(|word| word.split_once('='))
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect()
+}
+
+/// SPEC rule 5 (2026-10-22): untracked `build/`, `dist/`, `.svelte-kit/`
+/// and Bazel's `bazel-*` links are rebuildable output: ledgered, never
+/// carried or consolidated, so they never hold the item.
+#[test]
+fn build_output_is_never_a_seat() {
+    let world = World::new("rebuildable");
+    let (source, live) = related_pair(&world, "p");
+    for (side, word) in [(&source, "neo"), (&live, "sting")] {
+        for dir in ["build", "dist", ".svelte-kit"] {
+            fs::create_dir_all(side.join(dir)).unwrap();
+            fs::write(side.join(dir).join("out.js"), format!("{word}\n")).unwrap();
+        }
+    }
+    std::os::unix::fs::symlink("/nowhere/bazel-out", source.join("bazel-out")).unwrap();
+    assert!(world.source().ok);
+    let moved = world.moved();
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    assert_eq!(
+        receipt_at(&moved.stdout, &live)["seats_held"],
+        "false",
+        "{both}"
+    );
+    for dir in ["build", "dist", ".svelte-kit"] {
+        assert_eq!(
+            fs::read(live.join(dir).join("out.js")).unwrap(),
+            b"sting\n",
+            "{dir}: {both}"
+        );
+    }
+    assert!(
+        fs::symlink_metadata(live.join("bazel-out")).is_err(),
+        "{both}"
+    );
+}
+
+/// 2026-10-22: another writer's in-flight quarantine in the live object
+/// store (`incoming-*`, `pack/tmp_pack_*`) is never this pass's payload.
+#[test]
+fn another_writers_quarantine_never_refuses_the_item() {
+    let world = World::new("quarantine");
+    let (_source, live) = related_pair(&world, "p");
+    let objects = live.join(".git/objects");
+    fs::create_dir_all(objects.join("incoming-foreign")).unwrap();
+    fs::create_dir_all(objects.join("pack")).unwrap();
+    fs::write(objects.join("pack/tmp_pack_foreign"), b"in flight").unwrap();
+    assert!(world.source().ok);
+    let moved = world.moved();
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    assert_eq!(
+        receipt_at(&moved.stdout, &live)["outcome"],
+        "workspace-restored",
+        "{both}"
+    );
+    assert!(objects.join("incoming-foreign").is_dir());
+    assert!(objects.join("pack/tmp_pack_foreign").is_file());
+}
+
+/// 2026-10-22 (tinyland.dev's `CAPTURE_DRIFTED`): a source reflog entry
+/// naming an object the source itself no longer holds is never written into
+/// the live reflog, so the consolidated repository never names a missing
+/// object and the item is not held as drifted.
+#[test]
+fn a_reflog_entry_naming_a_pruned_object_is_never_unioned() {
+    let world = World::new("reflogmissing");
+    let (source, live) = related_pair(&world, "p");
+    git(
+        &source,
+        &["commit", "--quiet", "--allow-empty", "-m", "gone soon"],
+    );
+    let gone = out(&source, &["rev-parse", "HEAD"]).trim().to_owned();
+    git(&source, &["reset", "--quiet", "--hard", "HEAD~1"]);
+    let (dir, file) = gone.split_at(2);
+    fs::remove_file(source.join(".git/objects").join(dir).join(file)).unwrap();
+    assert!(world.source().ok);
+    let moved = world.moved();
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    assert_eq!(
+        receipt_at(&moved.stdout, &live)["outcome"],
+        "workspace-restored",
+        "{both}"
+    );
+    let logs = fs::read_to_string(live.join(".git/logs/refs/heads/main")).unwrap_or_default();
+    assert!(!logs.contains(&gone), "{logs}");
+}

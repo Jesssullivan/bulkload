@@ -228,13 +228,18 @@ pub fn snapshot(repo: &Path) -> Result<Snapshot> {
 // operation file reaches (`fsck --unreachable`, connectivity only: commits
 // and trees are read, blobs are not).
 fn unreachable(repo: &Path) -> Result<u64> {
-    let listed = output(git(repo).args([
+    // A count for the closure, never a reason to refuse: a store whose
+    // reflog names an object a gc pruned fails `fsck`, and is still carried
+    // (its missing ids are counted apart, 2026-10-22).
+    let Ok(listed) = output(git(repo).args([
         "fsck",
         "--unreachable",
         "--connectivity-only",
         "--no-progress",
         "--no-dangling",
-    ]))?;
+    ])) else {
+        return Ok(0);
+    };
     u64::try_from(
         listed
             .split(|byte| *byte == b'\n')
@@ -594,6 +599,43 @@ fn scratch(object_format: &str) -> Result<Scratch> {
 /// # Errors
 /// `GIT_CHILD_FAILED` when a fetch fails (its batch stays unmarked); IO.
 pub fn fetch_into(
+    objects: &Path,
+    object_format: &str,
+    url: &str,
+    upload_pack: &str,
+    snapshot: &Snapshot,
+    marks: &Path,
+) -> Result<Fetched> {
+    // The quarantines already in the store are another writer's: only the
+    // ones that appear while this fetch runs are this pass's own
+    // (2026-10-22: an in-flight fetch of a live user is never ours).
+    let present = quarantine_left(objects)?;
+    let fetched = fetch_batches(objects, object_format, url, upload_pack, snapshot, marks);
+    let after = quarantine_left(objects)?;
+    let mut own = OWN.lock().map_err(|_| BulkloadRefusal::WorkerLost)?;
+    own.extend(after.into_iter().filter(|path| !present.contains(path)));
+    drop(own);
+    fetched
+}
+
+/// The quarantine paths this process's own fetches made ([`fetch_into`]).
+static OWN: std::sync::Mutex<BTreeSet<PathBuf>> = std::sync::Mutex::new(BTreeSet::new());
+
+/// The quarantines this process's fetches made in `objects` that are still
+/// there: what a pass must never leave (SPEC rule 2). Another writer's
+/// in-flight quarantine is never counted.
+///
+/// # Errors
+/// IO for an unreadable store directory.
+pub fn own_quarantine_left(objects: &Path) -> Result<Vec<PathBuf>> {
+    let own = OWN.lock().map_err(|_| BulkloadRefusal::WorkerLost)?;
+    Ok(quarantine_left(objects)?
+        .into_iter()
+        .filter(|path| own.contains(path))
+        .collect())
+}
+
+fn fetch_batches(
     objects: &Path,
     object_format: &str,
     url: &str,

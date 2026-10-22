@@ -410,7 +410,7 @@ pub fn land(
         landed.topped_up = ids;
         landed.object_bytes = landed.object_bytes.saturating_add(bytes);
         let objects = stream::objects_dir(&live)?;
-        if let Some(left) = stream::quarantine_left(&objects)?.first() {
+        if let Some(left) = stream::own_quarantine_left(&objects)?.first() {
             return Err(BulkloadRefusal::StatePayloadLeft(rel_bytes(left)));
         }
     }
@@ -596,7 +596,7 @@ pub fn converge(
     )?;
     done.object_bytes = done.object_bytes.saturating_add(bytes);
     let objects = stream::objects_dir(&live)?;
-    if let Some(left) = stream::quarantine_left(&objects)?.first() {
+    if let Some(left) = stream::own_quarantine_left(&objects)?.first() {
         return Err(BulkloadRefusal::StatePayloadLeft(rel_bytes(left)));
     }
     Ok(done)

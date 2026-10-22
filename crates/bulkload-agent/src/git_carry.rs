@@ -3092,6 +3092,18 @@ pub const REBUILDABLE_DIRECTORIES: &[&str] = &[
     ".terraform",
 ];
 
+/// The rebuildable roots SPEC rule 5 adds for an estate move's capture.
+///
+/// 2026-10-22: the estate pass held 2293 files under `build/` and 686
+/// under `.svelte-kit/` as differing seats. The legacy capture
+/// keeps [`REBUILDABLE_DIRECTORIES`] alone, so its capture keys never move.
+pub const SPEC_REBUILDABLE_DIRECTORIES: &[&str] = &["build", "dist", ".svelte-kit"];
+
+/// The prefix of Bazel's convenience links at a workspace root
+/// (`bazel-bin`, `bazel-out`, `bazel-<workspace>`): rebuildable, never
+/// carried (SPEC rule 5), when Git does not track them.
+pub const REBUILDABLE_LINK_PREFIX: &str = "bazel-";
+
 /// Metadata ref naming the rebuildable roots a capture omitted.
 const REBUILDABLE_METADATA: &str = "rebuildable-omissions-v1";
 /// Reusable-key domain for the omission sidecar; only hashed when present.
@@ -3378,17 +3390,35 @@ pub fn streamed_omissions(repo: &Path, include_rebuildable: bool) -> Result<Omis
             let Ok(meta) = fs::symlink_metadata(&path) else {
                 continue;
             };
-            if !meta.is_dir() {
-                continue;
-            }
             let relative = path
                 .strip_prefix(&root)
                 .map_err(|_| BulkloadRefusal::PathEscapesRoot)?;
+            if meta.is_symlink()
+                && !include_rebuildable
+                && entry
+                    .file_name()
+                    .as_bytes()
+                    .starts_with(REBUILDABLE_LINK_PREFIX.as_bytes())
+                && untracked(&root, relative)?
+            {
+                omitted.push(relative.as_os_str().as_bytes().to_vec());
+                continue;
+            }
+            if !meta.is_dir() {
+                continue;
+            }
             if fs::symlink_metadata(path.join(".git")).is_ok() {
                 nests.push(relative.as_os_str().as_bytes().to_vec());
                 continue;
             }
-            if !include_rebuildable && rebuildable_root(&root, relative, &entry.file_name())? {
+            let name = entry.file_name();
+            if !include_rebuildable
+                && (rebuildable_root(&root, relative, &name)?
+                    || (SPEC_REBUILDABLE_DIRECTORIES
+                        .iter()
+                        .any(|candidate| name.as_bytes() == candidate.as_bytes())
+                        && untracked(&root, relative)?))
+            {
                 omitted.push(relative.as_os_str().as_bytes().to_vec());
                 continue;
             }
@@ -3522,6 +3552,11 @@ fn rebuildable_root(root: &Path, relative: &Path, name: &std::ffi::OsStr) -> Res
     {
         return Ok(false);
     }
+    untracked(root, relative)
+}
+
+// Whether Git tracks nothing at or below `relative` in `root`.
+fn untracked(root: &Path, relative: &Path) -> Result<bool> {
     let mut pathspec = std::ffi::OsString::from(":(top,literal)");
     pathspec.push(relative.as_os_str());
     Ok(output(git(root).args(["ls-files", "-z", "--"]).arg(pathspec))?.is_empty())
