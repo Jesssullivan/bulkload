@@ -3970,3 +3970,48 @@ fn the_hand_off_never_modifies_a_tracked_file() {
         "{rows}"
     );
 }
+
+/// The estate pass's new holds, 2026-10-22 (operator: "Hold all 22, run
+/// now"; the follow-up handles them): a store that borrows objects through
+/// `objects/info/alternates` is carried whole by the fetch; a stale nested
+/// `.git` pointer and a nested repository with its own conversion
+/// attributes are their own items and never refuse the parent's capture.
+#[test]
+fn alternates_are_carried_and_nests_never_refuse_the_parent() {
+    let world = World::new("holds22");
+    world.estate();
+    let src = world.src();
+    git(
+        &src,
+        &["clone", "--quiet", "--shared", "--template=", "other", "alt"],
+    );
+    assert!(src.join("alt/.git/objects/info/alternates").is_file());
+    let land = src.join("land");
+    fs::create_dir_all(land.join("stale")).unwrap();
+    fs::write(land.join("stale/.git"), "gitdir: /nowhere\n").unwrap();
+    repo(&land.join("vendor/nest"), "n.txt");
+    fs::write(land.join("vendor/nest/.gitattributes"), "* text eol=crlf\n").unwrap();
+    let sourced = world.source();
+    let both = format!("{}\n{}", sourced.stdout, sourced.stderr);
+    assert!(sourced.ok, "{both}");
+    for name in ["alt", "land"] {
+        let path = format!("source={:?}", src.join(name));
+        assert!(
+            sourced
+                .stdout
+                .lines()
+                .any(|line| line.contains("outcome=captured") && line.ends_with(&path)),
+            "{name}: {both}"
+        );
+    }
+    let moved = world.moved();
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    let alt = world.dst().join("alt");
+    assert!(
+        item_line(&moved.stdout, &alt).contains("outcome=workspace-restored"),
+        "{both}"
+    );
+    assert!(!alt.join(".git/objects/info/alternates").exists(), "{both}");
+    assert_eq!(out(&alt, &["cat-file", "-t", "HEAD"]).trim(), "commit");
+    assert_eq!(out(&alt, &["fsck", "--connectivity-only", "--no-progress"]), "");
+}

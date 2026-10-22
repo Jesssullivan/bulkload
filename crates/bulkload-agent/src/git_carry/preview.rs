@@ -652,4 +652,29 @@ mod tests {
         let back: Ask = unframe(&mut framed.as_slice()).unwrap();
         assert_eq!(back, ask);
     }
+
+    // 2026-10-22: an unreadable source worktree is typed with its errno.
+    #[test]
+    fn an_unreadable_worktree_is_typed_with_its_errno() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("w");
+        fs::create_dir(&worktree).unwrap();
+        fs::set_permissions(&worktree, fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = fs::read_dir(&worktree).is_ok();
+        let answer = answer(&Ask::Files(vec![FilesAsk {
+            worktree: worktree.clone(),
+            ..FilesAsk::default()
+        }]));
+        fs::set_permissions(&worktree, fs::Permissions::from_mode(0o700)).unwrap();
+        if readable {
+            return; // root reads anything: nothing to prove here
+        }
+        let Answer::Files(files) = answer else {
+            panic!("not a files answer");
+        };
+        let (code, detail) = files[0].unreadable.clone().unwrap();
+        assert_eq!(code, "SOURCE_ROOT_UNREADABLE");
+        assert!(detail.contains("13"), "{detail}");
+    }
 }

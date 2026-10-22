@@ -11039,6 +11039,36 @@ mod tests {
         seats.into_iter().map(|row| row.rel_path).collect()
     }
 
+    // 2026-10-22: the streamed capture finds nests by a plain walk and judges
+    // none of them (their own items do).
+    #[test]
+    fn nests_are_found_by_a_plain_walk_and_never_judged() {
+        let root =
+            std::env::temp_dir().join(format!("bulkload-streamed-omit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q", "--template="])
+            .arg(&repo)
+            .status()
+            .unwrap()
+            .success());
+        // A stale pointer, a nested repository, a rebuildable root, a link.
+        fs::create_dir_all(repo.join("stale")).unwrap();
+        fs::write(repo.join("stale/.git"), "gitdir: /nowhere\n").unwrap();
+        fs::create_dir_all(repo.join("vendor/nested/.git")).unwrap();
+        fs::create_dir_all(repo.join("node_modules/x")).unwrap();
+        fs::create_dir_all(repo.join("src/deep")).unwrap();
+        std::os::unix::fs::symlink(repo.join("vendor"), repo.join("link")).unwrap();
+        let (nests, rebuildable) = streamed_omissions(&repo, false).unwrap();
+        assert_eq!(nests, vec![b"stale".to_vec(), b"vendor/nested".to_vec()]);
+        assert_eq!(rebuildable, vec![b"node_modules".to_vec()]);
+        let (_, kept) = streamed_omissions(&repo, true).unwrap();
+        assert!(kept.is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     // The measured failure this change exists for: a capture of a repository
     // holding target/ and node_modules/ carried 34 GB of rebuildable bytes and
     // was then refused outright because cargo rewrote one of them mid-pass.
