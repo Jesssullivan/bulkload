@@ -4110,7 +4110,11 @@ fn build_output_is_never_a_seat() {
     assert!(world.source().ok);
     let moved = world.moved();
     let both = format!("{}\n{}", moved.stdout, moved.stderr);
-    assert_eq!(receipt_at(&moved.stdout, &live)["seats_held"], "false", "{both}");
+    assert_eq!(
+        receipt_at(&moved.stdout, &live)["seats_held"],
+        "false",
+        "{both}"
+    );
     for dir in ["build", "dist", ".svelte-kit"] {
         assert_eq!(
             fs::read(live.join(dir).join("out.js")).unwrap(),
@@ -4118,7 +4122,10 @@ fn build_output_is_never_a_seat() {
             "{dir}: {both}"
         );
     }
-    assert!(fs::symlink_metadata(live.join("bazel-out")).is_err(), "{both}");
+    assert!(
+        fs::symlink_metadata(live.join("bazel-out")).is_err(),
+        "{both}"
+    );
 }
 
 /// 2026-10-22: another writer's in-flight quarantine in the live object
@@ -4151,7 +4158,10 @@ fn another_writers_quarantine_never_refuses_the_item() {
 fn a_reflog_entry_naming_a_pruned_object_is_never_unioned() {
     let world = World::new("reflogmissing");
     let (source, live) = related_pair(&world, "p");
-    git(&source, &["commit", "--quiet", "--allow-empty", "-m", "gone soon"]);
+    git(
+        &source,
+        &["commit", "--quiet", "--allow-empty", "-m", "gone soon"],
+    );
     let gone = out(&source, &["rev-parse", "HEAD"]).trim().to_owned();
     git(&source, &["reset", "--quiet", "--hard", "HEAD~1"]);
     let (dir, file) = gone.split_at(2);

@@ -1270,7 +1270,11 @@ fn move_pass(run: &Move) -> Result<()> {
         let planned = estate::Item {
             source: stale.item.source.clone(),
             repository: stale.item.source.clone(),
-            workspace: stale.item.workspace.as_ref().map(|_| stale.item.source.clone()),
+            workspace: stale
+                .item
+                .workspace
+                .as_ref()
+                .map(|_| stale.item.source.clone()),
         };
         let answer = super::negotiate(
             &run.host,
@@ -1305,7 +1309,10 @@ fn move_pass(run: &Move) -> Result<()> {
                 if converged.as_ref().err() != Some(&BulkloadRefusal::CaptureDrifted) {
                     break;
                 }
-                out(&format!("estate-move item={} recapture=just-in-time", row.id))?;
+                out(&format!(
+                    "estate-move item={} recapture=just-in-time",
+                    row.id
+                ))?;
                 converged = recapture(&current).and_then(|(fresh, fetched)| {
                     current = fresh;
                     estate::streamed::converge(&current, &reach, fetched, &run.source, &map)
@@ -1422,7 +1429,10 @@ fn move_pass(run: &Move) -> Result<()> {
             if landing.as_ref().err() != Some(&BulkloadRefusal::CaptureDrifted) {
                 break;
             }
-            out(&format!("estate-move item={} recapture=just-in-time", row.id))?;
+            out(&format!(
+                "estate-move item={} recapture=just-in-time",
+                row.id
+            ))?;
             landing = recapture(&current).and_then(|(fresh, fetched)| {
                 current = fresh;
                 estate::streamed::land(&current, &private, &map, &reach, fetched)

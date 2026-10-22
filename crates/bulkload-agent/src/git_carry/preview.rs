@@ -145,7 +145,9 @@ pub fn answer(ask: &Ask) -> Answer {
         Ask::Capture(items) => {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |since| i128::try_from(since.as_nanos()).unwrap_or(i128::MAX));
+                .map_or(0, |since| {
+                    i128::try_from(since.as_nanos()).unwrap_or(i128::MAX)
+                });
             Answer::Capture(
                 items
                     .iter()
@@ -708,7 +710,15 @@ mod tests {
         let run = |args: &[&str]| {
             assert!(std::process::Command::new("git")
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .args(["-c", "user.name=t", "-c", "user.email=t@l", "-c", "commit.gpgsign=false", "-C"])
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@l",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-C"
+                ])
                 .arg(&repo)
                 .args(args)
                 .status()
