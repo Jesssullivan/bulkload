@@ -22,7 +22,7 @@
 //! transcript is forbidden): per file, whether the destination key holds a
 //! byte-identical copy, or one the file is a byte prefix of.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
@@ -160,6 +160,7 @@ pub fn derive(options: &Options) -> Result<KeyMaps> {
             .or_default()
             .push((source, to));
     }
+    let known: BTreeSet<String> = by_key.keys().cloned().collect();
     let mut out = KeyMaps::default();
     let mut candidates = Vec::new();
     // Source keys that land as they are (a same-key lane, a held key): their
@@ -197,6 +198,8 @@ pub fn derive(options: &Options) -> Result<KeyMaps> {
             }
         }
     }
+    let pruned = pruned_lane_maps(options, &lanes, &known, (&candidates, &native));
+    candidates.extend(pruned);
     // A destination key two keys would land at (two maps, or a map and a
     // key that lands as it is) holds every map to it; a held key then lands
     // as it is too, so this runs until nothing more is held (#294 review 3:
@@ -230,6 +233,81 @@ pub fn derive(options: &Options) -> Result<KeyMaps> {
         candidates = kept;
     }
     Ok(out)
+}
+
+/// The maps of lanes no source path is left for (2026-10-22: homes-20261021
+/// held 30 sessions "under another key no map covers"; their worktrees were
+/// pruned on both hosts, so no directory derives their lane).
+///
+/// A key is bytewise compositional (`key(S/rest)` is `key(S)` then
+/// `key(/rest)`), so a destination project key `key(D)+rest`, under the
+/// lane root `S -> D` whose destination key is its longest such prefix, is
+/// exactly where a session of `S/rest` lands. Its source key `key(S)+rest`
+/// is mapped there when no lane source keys to it already and no other map
+/// or native key lands at that destination key: the derived lanes always
+/// win, and nothing is ever merged across two keys.
+fn pruned_lane_maps(
+    options: &Options,
+    lanes: &Lanes,
+    known: &BTreeSet<String>,
+    (candidates, native): (&[KeyMap], &[String]),
+) -> Vec<KeyMap> {
+    use std::os::unix::ffi::OsStrExt as _;
+    // The lane roots: the run's --map sources and the git root, each as
+    // (source root key, destination root key, source root).
+    let roots = options
+        .maps
+        .iter()
+        .map(|(source, _)| source.clone())
+        .chain(std::iter::once(options.source_home.join("git")));
+    let pairs: Vec<(String, String, PathBuf)> = roots
+        .filter_map(|root| {
+            let lane = lanes.lane(&root).ok()??;
+            Some((key::project_key(root.to_str()?), lane.key, root))
+        })
+        .collect();
+    let taken: BTreeSet<&str> = candidates
+        .iter()
+        .map(|map| map.to.as_str())
+        .chain(native.iter().map(String::as_str))
+        .collect();
+    let mut out: Vec<KeyMap> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(options.dest_claude.join("projects")) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let Ok(to) = std::str::from_utf8(entry.file_name().as_bytes()).map(str::to_owned) else {
+            continue;
+        };
+        if taken.contains(to.as_str()) {
+            continue;
+        }
+        let Some((from_root, dest_root, root)) = pairs
+            .iter()
+            .filter(|(_, dest_root, _)| {
+                to.len() > dest_root.len()
+                    && to.starts_with(dest_root.as_str())
+                    && to.as_bytes().get(dest_root.len()) == Some(&b'-')
+            })
+            .max_by_key(|(_, dest_root, _)| dest_root.len())
+        else {
+            continue;
+        };
+        let from = format!("{from_root}{}", &to[dest_root.len()..]);
+        if from == to || known.contains(&from) || out.iter().any(|map| map.from == from) {
+            continue;
+        }
+        out.push(KeyMap {
+            from,
+            to,
+            cwd: root.clone(),
+        });
+    }
+    out.sort_by(|a, b| a.from.cmp(&b.from));
+    out
 }
 
 /// A derived map no landed session used (#294 review 4).
@@ -651,6 +729,56 @@ mod tests {
             "a file is no lane: {maps:?}"
         );
         assert!(derived.held.is_empty(), "{:?}", derived.held);
+    }
+
+    /// homes-20261021 (2026-10-22): a worktree pruned on both hosts derives
+    /// no lane, so its sessions were held "under another key no map
+    /// covers". The destination's key under a lane root maps the source
+    /// key the same path keys to; a key under no lane root (the 10-15 side
+    /// root) and a derived lane's own key gain nothing.
+    #[test]
+    fn a_pruned_lanes_key_maps_to_the_destination_key_under_its_root() {
+        let base = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(base.path()).unwrap();
+        std::fs::create_dir_all(base.join("srv/git/lab")).unwrap();
+        std::fs::create_dir_all(base.join("home/jess")).unwrap();
+        std::os::unix::fs::symlink(base.join("srv/git"), base.join("home/jess/git")).unwrap();
+        let options = options(&base, &[("Users/jess/git", "home/jess/git")]);
+        let key = |path: &str| key::project_key(base.join(path).to_str().unwrap());
+        let projects = options.dest_claude.join("projects");
+        for dest in [
+            "srv/git/gftb.org.worktrees/lm1-recovery",
+            "srv/estate/gftb/git/gftb.org.worktrees/lm1-recovery",
+            "srv/git/lab",
+        ] {
+            std::fs::create_dir_all(projects.join(key(dest))).unwrap();
+        }
+        let derived = derive(&options).unwrap();
+        let maps: Vec<(String, String)> = derived
+            .maps
+            .iter()
+            .map(|map| (map.from.clone(), map.to.clone()))
+            .collect();
+        assert!(
+            maps.contains(&(
+                key("Users/jess/git/gftb.org.worktrees/lm1-recovery"),
+                key("srv/git/gftb.org.worktrees/lm1-recovery")
+            )),
+            "{maps:?}"
+        );
+        assert!(
+            !maps.iter().any(|(_, to)| to.contains("estate")),
+            "a side root is under no lane root: {maps:?}"
+        );
+        assert_eq!(
+            maps.iter()
+                .filter(|(_, to)| *to == key("srv/git/lab"))
+                .count(),
+            1,
+            "the derived lane alone: {maps:?}"
+        );
+        assert!(derived.held.is_empty(), "{:?}", derived.held);
+        crate::transfer::PrefixMap::new(derived.prefixes()).unwrap();
     }
 
     /// A lossy key two lane sources share, and two keys landing at one
