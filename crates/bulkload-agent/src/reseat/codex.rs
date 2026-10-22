@@ -582,7 +582,12 @@ pub fn unindexed(options: &Options, named: &BTreeSet<PathBuf>) -> Result<Vec<Uni
             if link && options.landed_codex(&found) != landed {
                 continue;
             }
-            let link = link && suffix.is_some();
+            // Consolidated homes (no beside suffix, 2026-10-20) too: the
+            // pull holds a link at a live path typed and writes nothing
+            // through it, so the link is still the destination's own. Read
+            // with O_NOFOLLOW it was ELOOP, a bare IO that ended the whole
+            // re-seat (homes-20261021, 2026-10-22).
+            let link = link && live;
             let rel = mapped.unwrap_or(found);
             if named.contains(&rel) {
                 continue;
@@ -1759,7 +1764,26 @@ fn reseat_unindexed(
             emit(&thread_line((&id, ""), None, "in-place", None, None))?;
             continue;
         }
-        let Some(cwd) = unindexed_cwd(ledger, &id, &landed)? else {
+        // One unreadable rollout is its own refused row, never the end of
+        // the re-seat: the rest go on (homes-20261021, 2026-10-22).
+        let found = match unindexed_cwd(ledger, &id, &landed) {
+            Ok(found) => found,
+            Err(refusal @ BulkloadRefusal::Io(_)) => {
+                remember_refused(ledger, (&id, &landed), "", &refusal)?;
+                summary.session(TOOL, refusal.code());
+                emit(&io_error_line(&landed, &refusal))?;
+                emit(&thread_line(
+                    (&id, ""),
+                    None,
+                    "refused",
+                    Some(&refusal),
+                    Some("absent"),
+                ))?;
+                continue;
+            }
+            Err(refusal) => return Err(refusal),
+        };
+        let Some(cwd) = found else {
             remember_refused(
                 ledger,
                 (&id, &landed),
@@ -2585,6 +2609,19 @@ pub fn cached_cwds(
         }
     }
     out
+}
+
+/// The path and errno of a rollout the re-seat could not read.
+fn io_error_line(path: &Path, refusal: &BulkloadRefusal) -> String {
+    let errno = match refusal {
+        BulkloadRefusal::Io(Some(errno)) => errno.to_string(),
+        _ => "null".to_owned(),
+    };
+    format!(
+        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"io-error\",\"tool\":\"{TOOL}\",\"path\":{},\"errno\":{errno},\"refused\":{}}}",
+        super::shown(path),
+        json_string(refusal.code()),
+    )
 }
 
 fn thread_line(
