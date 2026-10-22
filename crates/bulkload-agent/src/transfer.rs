@@ -8209,6 +8209,53 @@ impl<W: Write> Inbound<'_, W> {
         Ok(())
     }
 
+    /// A streamed seat whose live path is a link or another kind: covered
+    /// when the link holds exactly its bytes ([`linked_equal`]), unioned
+    /// when it links into an archive root, and held otherwise (or, planning,
+    /// reported).
+    fn streamed_occupied(
+        &mut self,
+        staged: Option<StagedFile>,
+        row: &RowSchema,
+        (key, racy): (&[u8], bool),
+        manifest: &Manifest,
+        settings: &Consolidation,
+    ) -> Result<()> {
+        let class = crate::consolidate::Class::of(&row.rel_path, false);
+        let archived = archive_target(self.target.path(), &row.rel_path, &settings.archived);
+        let staged = match staged {
+            Some(staged) if archived.is_some() && !settings.plan_only => Some(staged),
+            other => {
+                if let Some(other) = other {
+                    let _ = other.discard();
+                }
+                None
+            }
+        };
+        if linked_equal(self.target.path(), &row.rel_path, manifest)? {
+            if let Some(staged) = staged {
+                let _ = staged.discard();
+            }
+            return self.linked_covered(row, key, racy, settings.plan_only);
+        }
+        let (action, reason) = if archived.is_some() {
+            ("consolidate", ARCHIVE_LINK)
+        } else {
+            ("hold", OTHER_KIND)
+        };
+        if settings.plan_only {
+            self.plan_seat(row, class.word(), action, None, Some(reason));
+            self.answered_now = Some(false);
+            return Ok(());
+        }
+        if archived.is_some() {
+            let staged = staged.ok_or(BulkloadRefusal::ProtocolStateViolation)?;
+            return self.consolidate_log(staged, row, key, racy);
+        }
+        self.stats.held.push((row.rel_path.clone(), OTHER_KIND));
+        Err(BulkloadRefusal::HomesConsolidateUnsupported)
+    }
+
     /// `--consolidate`: a live link to exactly the seat's bytes
     /// ([`linked_equal`]) is covered, nothing written (or, planning,
     /// reported covered).
@@ -8487,35 +8534,7 @@ impl<W: Write> Inbound<'_, W> {
                 drop_staged(staged);
                 return Err(BulkloadRefusal::ProtocolStateViolation);
             }
-            Err(_) if linked_equal(self.target.path(), &row.rel_path, manifest)? => {
-                drop_staged(staged);
-                return self.linked_covered(row, &key, racy, settings.plan_only);
-            }
-            Err(_)
-                if archive_target(self.target.path(), &row.rel_path, &settings.archived)
-                    .is_some() =>
-            {
-                if settings.plan_only {
-                    drop_staged(staged);
-                    self.plan_seat(row, class.word(), "consolidate", None, Some(ARCHIVE_LINK));
-                    self.answered_now = Some(false);
-                    return Ok(());
-                }
-                let Some(staged) = staged else {
-                    return Err(BulkloadRefusal::ProtocolStateViolation);
-                };
-                return self.consolidate_log(staged, row, &key, racy);
-            }
-            Err(_) => {
-                drop_staged(staged);
-                if settings.plan_only {
-                    self.plan_seat(row, class.word(), "hold", None, Some(OTHER_KIND));
-                    self.answered_now = Some(false);
-                    return Ok(());
-                }
-                self.stats.held.push((row.rel_path.clone(), OTHER_KIND));
-                return Err(BulkloadRefusal::HomesConsolidateUnsupported);
-            }
+            Err(_) => return self.streamed_occupied(staged, row, (&key, racy), manifest, settings),
         };
         let live_size = file.metadata().ok().map(|found| found.len());
         let (verified, settled) = verify_settled(self.target.path(), &file, row, manifest);
