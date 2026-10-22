@@ -11191,7 +11191,10 @@ mod tests {
         assert!(!is_bazel_output_base(&base.join("execroot")));
         assert!(!is_bazel_output_base(&lookalike));
         let (nests, rebuildable) = streamed_omissions(&repo, false).unwrap();
-        assert!(nests.is_empty(), "nothing inside the base is walked: {nests:?}");
+        assert!(
+            nests.is_empty(),
+            "nothing inside the base is walked: {nests:?}"
+        );
         assert_eq!(
             rebuildable,
             vec![b"cache/7c990655ada74b38fb9dc9b1f6b6bf97".to_vec()]

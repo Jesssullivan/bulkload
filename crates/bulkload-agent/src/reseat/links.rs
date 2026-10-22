@@ -368,26 +368,23 @@ mod tests {
     // and the base is never entered; one beside it still is.
     #[test]
     fn a_bazel_output_base_is_never_walked_for_links() {
-        let root =
-            std::env::temp_dir().join(format!("bulkload-links-base-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("bulkload-links-base-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let (home, live) = (root.join("home"), root.join("live"));
         std::fs::create_dir_all(live.join("notes")).unwrap();
         let base = home.join("proof/7c990655ada74b38fb9dc9b1f6b6bf97");
         std::fs::create_dir_all(base.join("execroot/_main")).unwrap();
         std::fs::create_dir_all(base.join("action_cache")).unwrap();
-        std::fs::write(
-            base.join(crate::git_carry::BAZEL_OUTPUT_BASE_MARKER),
-            b"x",
-        )
-        .unwrap();
-        std::os::unix::fs::symlink(live.join("notes"), base.join("execroot/_main/notes"))
-            .unwrap();
+        std::fs::write(base.join(crate::git_carry::BAZEL_OUTPUT_BASE_MARKER), b"x").unwrap();
+        std::os::unix::fs::symlink(live.join("notes"), base.join("execroot/_main/notes")).unwrap();
         std::os::unix::fs::symlink(live.join("notes"), home.join("notes")).unwrap();
         let _ = take_output_bases_skipped();
         let found = live_links(&home, &[live.clone()]);
         assert_eq!(
-            found.iter().map(|link| link.rel.clone()).collect::<Vec<_>>(),
+            found
+                .iter()
+                .map(|link| link.rel.clone())
+                .collect::<Vec<_>>(),
             vec![PathBuf::from("notes")]
         );
         assert_eq!(take_output_bases_skipped(), 1);
