@@ -575,8 +575,9 @@ fn names_for(
     Ok(names)
 }
 
-/// Whether `worktree` holds a recorded hand-off block in a file other than
-/// the local one (an earlier pass's, in a tracked file): what
+/// Whether `worktree` holds a recorded block outside the local file.
+///
+/// That is an earlier pass's block, in a tracked file: what
 /// `estate-handoff --clear --legacy-only` clears. `false` for anything it
 /// cannot read (an absent workspace, no record).
 #[must_use]

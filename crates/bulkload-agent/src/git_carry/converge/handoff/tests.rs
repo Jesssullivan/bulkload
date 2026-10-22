@@ -485,12 +485,15 @@ enum Edit {
 /// its prints (C03), and is judged by its ctime as well as its mtime (F1).
 fn an_edit_after_the_exchange_survives(rerun: Rerun, edit: Edit) {
     use crate::estate::{self, HandoffMode, HandoffOptions};
+    // The prefix machinery's fixture: the legacy tracked targets (debug
+    // builds only; every hand-off test in this module asks for them).
+    std::env::set_var(super::TRACKED_TARGETS_ENV, "1");
     let dir = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(dir.path()).unwrap();
     let source = root.join("src");
     fs::create_dir(&source).unwrap();
     git_run(&source, &["init", "--quiet", "--template=", "-b", "main"]);
-    fs::write(source.join(super::LOCAL), LANDED).unwrap();
+    fs::write(source.join("AGENTS.md"), LANDED).unwrap();
     fs::write(source.join("a.txt"), b"alpha\n").unwrap();
     git_run(&source, &["add", "-A"]);
     git_run(&source, &["commit", "--quiet", "-m", "c0"]);
@@ -529,7 +532,7 @@ fn an_edit_after_the_exchange_survives(rerun: Rerun, edit: Edit) {
     tick();
     capture();
     apply();
-    let agents = target.join(super::LOCAL);
+    let agents = target.join("AGENTS.md");
     let edited = agents.clone();
     super::super::super::mid_pass::arm_at(
         &target,
@@ -568,7 +571,7 @@ fn an_edit_after_the_exchange_survives(rerun: Rerun, edit: Edit) {
         }
         Rerun::Renew => handoff(true),
     }
-    fs::write(source.join(super::LOCAL), b"# Agents, v2\n").unwrap();
+    fs::write(source.join("AGENTS.md"), b"# Agents, v2\n").unwrap();
     git_run(&source, &["commit", "--quiet", "-am", "agents v2"]);
     tick();
     capture();
