@@ -1289,7 +1289,15 @@ fn move_pass(run: &Move) -> Result<()> {
             bulkload_agent::git_carry::preview::Answer::Capture(mut captured) => captured
                 .pop()
                 .ok_or(BulkloadRefusal::ProtocolStateViolation)?
-                .map_err(|_| BulkloadRefusal::CaptureDrifted)?,
+                .map_err(|code| {
+                    // The source's own refusal, by its code: never drift by
+                    // another name (2026-10-22).
+                    let _ = out(&format!(
+                        "estate-move item={} recapture-refused code={code}",
+                        stale.item.source.display()
+                    ));
+                    capture_refusal(&code)
+                })?,
             _ => return Err(BulkloadRefusal::ProtocolStateViolation),
         };
         fresh.item = stale.item.clone();
@@ -1302,6 +1310,8 @@ fn move_pass(run: &Move) -> Result<()> {
     };
     for ((row, planned_snapshot, related), (fetched, fetch_ms)) in landing.iter().zip(fetched) {
         let place = row.item.workspace.as_ref().unwrap_or(&row.item.repository);
+        // Its held and refused seat lines name it (2026-10-22).
+        super::seat_item(Some((row.id.as_str(), place.as_path())));
         let started = std::time::Instant::now();
         let mut current = planned_snapshot.clone();
         if *related {
@@ -1390,7 +1400,7 @@ fn move_pass(run: &Move) -> Result<()> {
                         first_refusal.get_or_insert(refusal);
                     }
                     out(&format!(
-                        "estate-move item={} outcome={} union=consolidated refs_created={} refs_forwarded={} refs_switched={} refs_tracked={} refs_kept={} stash_added={} reflog_added={} seats_held={} object_bytes={} fetch_ms={fetch_ms} land_ms={} live={place:?}",
+                        "estate-move item={} outcome={} union=consolidated refs_created={} refs_forwarded={} refs_switched={} refs_tracked={} refs_kept={} stash_added={} reflog_added={} seats_held={} object_bytes={} dest_lacking_own={} fetch_ms={fetch_ms} land_ms={} live={place:?}",
                         row.id,
                         if done.seats_held || done.branches_held.is_some() { "held" } else { outcome },
                         count("created"),
@@ -1402,6 +1412,7 @@ fn move_pass(run: &Move) -> Result<()> {
                         done.reflog_added,
                         done.seats_held,
                         done.object_bytes,
+                        done.dest_lacking_own,
                         started.elapsed().as_millis(),
                     ))?;
                     if !done.seats_held && done.branches_held.is_none() {
@@ -1464,7 +1475,7 @@ fn move_pass(run: &Move) -> Result<()> {
                 };
                 estate::streamed::record_outcome(&private, &row.item, outcome, None, None)?;
                 out(&format!(
-                    "estate-move item={} outcome={outcome} object_batches={} object_batches_skipped={} object_bytes={} fetch_ms={fetch_ms} topped_up={} missing_at_source={} unreachable_not_carried={} index={} land_ms={} live={place:?}",
+                    "estate-move item={} outcome={outcome} object_batches={} object_batches_skipped={} object_bytes={} fetch_ms={fetch_ms} topped_up={} missing_at_source={} unreachable_not_carried={} dest_lacking_own={} index={} land_ms={} live={place:?}",
                     row.id,
                     done.batches,
                     done.skipped,
@@ -1472,6 +1483,7 @@ fn move_pass(run: &Move) -> Result<()> {
                     done.topped_up,
                     done.missing_at_source,
                     snapshot.snapshot.unreachable,
+                    done.dest_lacking_own,
                     done.index,
                     started.elapsed().as_millis(),
                 ))?;
@@ -1494,6 +1506,7 @@ fn move_pass(run: &Move) -> Result<()> {
             }
         }
     }
+    super::seat_item(None);
     // 3b. SPEC rule 3 (no duplicates): a copy an older pass left beside a
     // live path this pass landed or consolidated (`.neo-*`, `.sting-*`,
     // `.LABEL`) is consolidated into it through the B2 rules (refs unioned,
@@ -1785,6 +1798,30 @@ fn print_plan(rows: &[moving::Row], notes: &std::collections::BTreeMap<String, u
 /// `CAPTURE_DRIFTED` (each followed by its land's or converge's own
 /// top-up rounds).
 const JIT_ROUNDS: usize = 2;
+
+/// The refusal a just-in-time recapture's source answered with, by its
+/// wire code: the capture's own codes typed, any other its code kept on
+/// the `recapture-refused` line and raised as `GIT_CHILD_FAILED` (a
+/// capture is Git's reading of the source), never `CAPTURE_DRIFTED`
+/// unless the source said so.
+fn capture_refusal(code: &str) -> BulkloadRefusal {
+    use bulkload_agent::git_carry::estimate::StderrClass;
+    [
+        BulkloadRefusal::CaptureDrifted,
+        BulkloadRefusal::CaptureAbsent,
+        BulkloadRefusal::SourceVanished,
+        BulkloadRefusal::SourceRootMissing,
+        BulkloadRefusal::SourceRootUnreadable(None),
+        BulkloadRefusal::GitSourcePartialClone,
+        BulkloadRefusal::GitHavesUnprovable,
+        BulkloadRefusal::GitInventoryMalformed,
+        BulkloadRefusal::PathNotPortable,
+        BulkloadRefusal::Io(None),
+    ]
+    .into_iter()
+    .find(|refusal| refusal.code() == code)
+    .unwrap_or(BulkloadRefusal::GitChildFailed(StderrClass::Other))
+}
 
 /// The reason a plan row gives an item no map places on this host.
 const UNMAPPED: &str = "unmapped";

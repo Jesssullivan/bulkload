@@ -312,6 +312,10 @@ pub struct Landed {
     pub topped_up: u64,
     /// Ids the snapshot named that the source no longer held.
     pub missing_at_source: u64,
+    /// Ids the live administration already named, and its store lacked,
+    /// before this landing: the destination's own, never the source's
+    /// drift, counted and never fetched ([`own_lacking`]).
+    pub dest_lacking_own: u64,
     /// What the index settle did.
     pub index: &'static str,
 }
@@ -361,6 +365,8 @@ pub fn land(
     landed.batches = fetched.batches;
     landed.skipped = fetched.skipped;
     landed.object_bytes = fetched.bytes;
+    let own = own_lacking(&live)?;
+    landed.dest_lacking_own = u64::try_from(own.len()).unwrap_or(u64::MAX);
     // 2a. A separate administration (a submodule's): its own files, its
     // objects (fetched) and index (settled) left out.
     if let (Some(from), Some(to)) = (&snapshot.separate_admin, admin_of(snapshot, map)) {
@@ -404,6 +410,7 @@ pub fn land(
         let (ids, bytes) = top_up(
             snapshot,
             &live,
+            &own,
             reach.upload_pack,
             &state.join(format!("{identity}.top-up.objects")),
         )?;
@@ -492,6 +499,9 @@ pub struct Converged {
     /// The seat transfer held paths it could not union (typed in its
     /// record): the item is not consolidated whole.
     pub seats_held: bool,
+    /// Ids the live repository already named, and its store lacked, before
+    /// this consolidation ([`own_lacking`]): counted, never fetched.
+    pub dest_lacking_own: u64,
     /// The destination's checkout was switched to the source's branch.
     pub switched_to: Option<String>,
     /// The two sides have different branches checked out and the
@@ -532,6 +542,8 @@ pub fn converge(
         ..Converged::default()
     };
     let owns_store = store_of(snapshot, &live, map).is_some();
+    let own = own_lacking(&live)?;
+    done.dest_lacking_own = u64::try_from(own.len()).unwrap_or(u64::MAX);
     if owns_store {
         done.refs = union::refs(&live, &snapshot.snapshot.refs, source)?;
         done.stash_added = union::stash(&live, &snapshot.history.stash)?;
@@ -591,6 +603,7 @@ pub fn converge(
     let (_, bytes) = top_up(
         snapshot,
         &live,
+        &own,
         reach.upload_pack,
         &reach.scratch.join(format!("{}.top-up.objects", id(item)?)),
     )?;
@@ -602,11 +615,27 @@ pub fn converge(
     Ok(done)
 }
 
+/// The ids `live`'s administration names that its store lacks before a
+/// landing writes anything: the destination's own state (an `AUTO_MERGE`
+/// tree a gc pruned, a reflog entry of its own), never the source's drift.
+/// A top-up neither wants them (the source never held them) nor refuses
+/// for them. None when `live` holds no repository of its own yet.
+///
+/// # Errors
+/// As [`stream::lacking`].
+pub fn own_lacking(live: &Path) -> Result<std::collections::BTreeSet<String>> {
+    if fs::symlink_metadata(live.join(".git")).is_err() {
+        return Ok(std::collections::BTreeSet::new());
+    }
+    Ok(stream::lacking(live)?.into_iter().collect())
+}
+
 /// How many rounds [`top_up`] fetches before it holds the item.
 pub const TOP_UPS: usize = 3;
 
 /// Fetch, by id from the live source, every object the live repository's
-/// administration names and its store lacks.
+/// administration names and its store lacks, except `own`: what it lacked
+/// before the landing ([`own_lacking`]), the destination's own.
 ///
 /// At most [`TOP_UPS`] rounds: a source that moved after its snapshot (an
 /// agent committing under the pass) lands as it is now. Returns the ids
@@ -614,11 +643,13 @@ pub const TOP_UPS: usize = 3;
 /// file, removed after it.
 ///
 /// # Errors
-/// `CAPTURE_DRIFTED` when the store still lacks an object after the last
-/// round (the source does not hold it either); IO.
+/// `CAPTURE_DRIFTED` when the store still lacks an object the landing named
+/// after the last round (the source does not hold it either); a fetch's
+/// own refusal other than `GIT_CHILD_FAILED`; IO.
 fn top_up(
     snapshot: &ItemSnapshot,
     live: &Path,
+    own: &std::collections::BTreeSet<String>,
     upload_pack: &str,
     marks: &Path,
 ) -> Result<(u64, u64)> {
@@ -627,9 +658,16 @@ fn top_up(
         .source
         .to_str()
         .ok_or(BulkloadRefusal::PathNotPortable)?;
+    // What the landing made the live administration name that its store
+    // lacks: the destination's own lacking ids are not this item's.
+    let wanted = |live: &Path| -> Result<Vec<String>> {
+        let mut lacking = stream::lacking(live)?;
+        lacking.retain(|id| !own.contains(id));
+        Ok(lacking)
+    };
     let (mut ids, mut bytes) = (0u64, 0u64);
     for _ in 0..TOP_UPS {
-        let lacking = stream::lacking(live)?;
+        let lacking = wanted(live)?;
         if lacking.is_empty() {
             break;
         }
@@ -651,12 +689,14 @@ fn top_up(
         let _ = fs::remove_file(marks);
         match fetched {
             Ok(fetched) => bytes = bytes.saturating_add(fetched.bytes),
-            // The source no longer holds it, or the session failed: the
-            // proof below decides.
-            Err(_) => break,
+            // The source no longer holds it (Git's fetch fails): the proof
+            // below decides, and drift recaptures.
+            Err(BulkloadRefusal::GitChildFailed(_)) => break,
+            // Anything else keeps its own code: never drift by another name.
+            Err(refusal) => return Err(refusal),
         }
     }
-    if stream::lacking(live)?.is_empty() {
+    if wanted(live)?.is_empty() {
         Ok((ids, bytes))
     } else {
         Err(BulkloadRefusal::CaptureDrifted)

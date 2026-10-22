@@ -135,19 +135,59 @@ fn worktree_paths(repo: &Path) -> Result<Vec<(PathBuf, bool)>> {
     Ok(found)
 }
 
-// Every full object id token in `bytes` (an operation file or a reflog).
-fn ids_in(bytes: &[u8], ids: &mut BTreeSet<String>) {
+/// The hex width of one object id in `object_format`: 64 for `sha256`,
+/// else 40 (`sha1`).
+fn id_width(object_format: &str) -> usize {
+    if object_format == "sha256" {
+        64
+    } else {
+        40
+    }
+}
+
+// Whether `token` is a full, non-null object id of `width` hex digits.
+fn id_of_width(token: &str, width: usize) -> bool {
+    token.len() == width && oid(token) && token.bytes().any(|byte| byte != b'0')
+}
+
+// Every full object id token of the repository's width in `bytes` (an
+// operation file). A token of the other width is never an id here: a
+// branch named `carry/neo/<64 hex>` in a SHA-1 repository is text
+// (2026-10-22: tinyland.dev, site.scaffold and prompts-enqueue refused
+// CAPTURE_DRIFTED every pass on such a name in a checkout message).
+fn ids_in(bytes: &[u8], width: usize, ids: &mut BTreeSet<String>) {
     for token in bytes.split(|byte| !byte.is_ascii_hexdigit()) {
         if let Ok(token) = std::str::from_utf8(token) {
-            if oid(token) && token.bytes().any(|byte| byte != b'0') {
+            if id_of_width(token, width) {
                 ids.insert(token.to_owned());
             }
         }
     }
 }
 
-// Every file under `dir`, read whole (a missing `dir` holds none).
-fn read_tree_files(dir: &Path, ids: &mut BTreeSet<String>) -> Result<()> {
+// A reflog's ids: each line's old and new values only. Its message is
+// text, and a 40-hex word in it ("checkout: moving from <name> to
+// <name>", a commit subject) names no object of this repository.
+fn reflog_ids(bytes: &[u8], width: usize, ids: &mut BTreeSet<String>) {
+    for line in bytes.split(|byte| *byte == b'\n') {
+        for word in line.split(|byte| *byte == b' ').take(2) {
+            if let Ok(word) = std::str::from_utf8(word) {
+                if id_of_width(word, width) {
+                    ids.insert(word.to_owned());
+                }
+            }
+        }
+    }
+}
+
+// Every file under `dir`, read whole (a missing `dir` holds none): as
+// reflogs when `reflogs`, else every token of the id width.
+fn read_tree_files(
+    dir: &Path,
+    width: usize,
+    reflogs: bool,
+    ids: &mut BTreeSet<String>,
+) -> Result<()> {
     let read = match fs::read_dir(dir) {
         Ok(read) => read,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -161,10 +201,11 @@ fn read_tree_files(dir: &Path, ids: &mut BTreeSet<String>) -> Result<()> {
             Err(error) => return Err(crate::refuse::io(&error, SITE)),
         };
         if meta.is_dir() {
-            read_tree_files(&path, ids)?;
+            read_tree_files(&path, width, reflogs, ids)?;
         } else if meta.is_file() {
             match fs::read(&path) {
-                Ok(bytes) => ids_in(&bytes, ids),
+                Ok(bytes) if reflogs => reflog_ids(&bytes, width, ids),
+                Ok(bytes) => ids_in(&bytes, width, ids),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(crate::refuse::io(&error, SITE)),
             }
@@ -186,21 +227,22 @@ const OPERATION_FILES: &[&str] = &[
     "REBASE_HEAD",
 ];
 
-/// The operation directories of one administration directory, read whole.
-const OPERATION_DIRS: &[&str] = &["rebase-merge", "rebase-apply", "sequencer", "logs"];
+/// The operation directories of one administration directory, read whole;
+/// `logs` (its reflogs) is read by each line's old and new values.
+const OPERATION_DIRS: &[&str] = &["rebase-merge", "rebase-apply", "sequencer"];
 
-fn operation_ids(admin: &Path, ids: &mut BTreeSet<String>) -> Result<()> {
+fn operation_ids(admin: &Path, width: usize, ids: &mut BTreeSet<String>) -> Result<()> {
     for name in OPERATION_FILES {
         match fs::read(admin.join(name)) {
-            Ok(bytes) => ids_in(&bytes, ids),
+            Ok(bytes) => ids_in(&bytes, width, ids),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(crate::refuse::io(&error, SITE)),
         }
     }
     for name in OPERATION_DIRS {
-        read_tree_files(&admin.join(name), ids)?;
+        read_tree_files(&admin.join(name), width, false, ids)?;
     }
-    Ok(())
+    read_tree_files(&admin.join("logs"), width, true, ids)
 }
 
 /// Read what `repo` (any worktree of it, or a bare repository) holds to be
@@ -321,6 +363,7 @@ type Named = (
 fn named(repo: &Path) -> Result<Named> {
     let common = super::common_repository(repo)?;
     let object_format = text(git(repo).args(["rev-parse", "--show-object-format"]))?;
+    let width = id_width(&object_format);
     let refs = ref_lines(&text(
         git(repo).args(["for-each-ref", "--format=%(objectname) %(refname)"]),
     )?)?;
@@ -362,7 +405,7 @@ fn named(repo: &Path) -> Result<Named> {
             let mut words = entry.split(|byte| *byte == b' ');
             if let (Some(mode), Some(id)) = (words.next(), words.next()) {
                 if mode != b"160000" {
-                    ids_in(id, &mut named);
+                    ids_in(id, width, &mut named);
                 }
             }
         }
@@ -374,12 +417,12 @@ fn named(repo: &Path) -> Result<Named> {
     }
     // Reflogs and operation files: the common directory's, and each linked
     // worktree's administration.
-    operation_ids(&common, &mut named)?;
+    operation_ids(&common, width, &mut named)?;
     if let Ok(read) = fs::read_dir(common.join("worktrees")) {
         for entry in read {
             let admin = entry.refuse_at(SITE)?.path();
             if fs::symlink_metadata(&admin).is_ok_and(|meta| meta.is_dir()) {
-                operation_ids(&admin, &mut named)?;
+                operation_ids(&admin, width, &mut named)?;
             }
         }
     }
@@ -816,6 +859,51 @@ mod tests {
         g(&wt, &["add", "c"]);
         let wt_staged = g(&wt, &["rev-parse", ":c"]);
         (repo, vec![reflog_only, stash, staged, side, wt_staged])
+    }
+
+    // 2026-10-22 (tinyland.dev, site.scaffold, prompts-enqueue): a branch
+    // named with 64 hex digits in a SHA-1 repository, and a 40-hex word in
+    // a commit subject, are reflog text, never ids: the live repository
+    // lacks nothing, so a landing's top-up never refuses CAPTURE_DRIFTED.
+    #[test]
+    fn a_reflog_message_names_no_object() {
+        let root = scratch("reflog-text");
+        let repo = root.0.join("r");
+        fs::create_dir_all(&repo).unwrap();
+        g(&repo, &["init", "-q", "--template=", "-b", "main"]);
+        g(&repo, &["commit", "-q", "--allow-empty", "-m", "c1"]);
+        let branch = format!("carry/neo/{}", "ab".repeat(32));
+        g(&repo, &["checkout", "-q", "-b", &branch]);
+        g(&repo, &["checkout", "-q", "main"]);
+        let subject = format!("revert {}", "cd".repeat(20));
+        g(&repo, &["commit", "-q", "--allow-empty", "-m", &subject]);
+        let head_log = fs::read_to_string(repo.join(".git/logs/HEAD")).unwrap();
+        assert!(head_log.contains(&"ab".repeat(32)), "{head_log}");
+        assert!(head_log.contains(&"cd".repeat(20)), "{head_log}");
+        assert_eq!(lacking(&repo).unwrap(), Vec::<String>::new());
+        // The reflog's own old and new values are still named.
+        let (_, _, _, named) = named(&repo).unwrap();
+        let head = g(&repo, &["rev-parse", "HEAD"]);
+        let first = g(&repo, &["rev-parse", "HEAD~1"]);
+        assert!(named.contains(&head) && named.contains(&first));
+        assert!(!named.contains(&"cd".repeat(20)));
+    }
+
+    #[test]
+    fn ids_are_read_at_the_repositorys_width() {
+        let mut ids = BTreeSet::new();
+        let sha1 = "1".repeat(40);
+        let sha256 = "2".repeat(64);
+        ids_in(format!("{sha1} {sha256}\n").as_bytes(), 40, &mut ids);
+        assert_eq!(ids.iter().cloned().collect::<Vec<_>>(), vec![sha1.clone()]);
+        ids.clear();
+        ids_in(format!("{sha1} {sha256}\n").as_bytes(), 64, &mut ids);
+        assert_eq!(ids.iter().cloned().collect::<Vec<_>>(), vec![sha256.clone()]);
+        ids.clear();
+        let null = "0".repeat(40);
+        let line = format!("{null} {sha1} t <t@localhost> 1 +0000\tcheckout: moving from x to {}\n", "3".repeat(40));
+        reflog_ids(line.as_bytes(), 40, &mut ids);
+        assert_eq!(ids.iter().cloned().collect::<Vec<_>>(), vec![sha1]);
     }
 
     #[test]
