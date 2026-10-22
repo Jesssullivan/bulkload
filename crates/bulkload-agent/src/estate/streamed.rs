@@ -362,11 +362,6 @@ pub fn land(
         .workspace
         .clone()
         .unwrap_or_else(|| item.repository.clone());
-    let source_url = item
-        .source
-        .to_str()
-        .ok_or(BulkloadRefusal::PathNotPortable)?
-        .to_owned();
     let mut landed = Landed {
         missing_at_source: snapshot.snapshot.missing,
         ..Landed::default()

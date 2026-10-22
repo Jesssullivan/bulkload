@@ -60,7 +60,7 @@ pub struct HandoffOptions {
     /// `--as-of NS`: the block's instant, for a reproducible render.
     pub as_of: Option<i128>,
     /// `--place SOURCE_PREFIX=LIVE_PREFIX` (repeatable): where a planned
-    /// workspace under SOURCE_PREFIX was placed (estate-move's default home
+    /// workspace under `SOURCE_PREFIX` was placed (estate-move's default home
     /// map, 2026-10-21): the block goes to the placed path, never the plan's
     /// raw source path.
     pub places: Vec<(PathBuf, PathBuf)>,
