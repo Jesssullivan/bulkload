@@ -3333,6 +3333,16 @@ struct Census {
 ///
 /// # Errors
 /// Refuses any Git or filesystem state capture itself refuses.
+pub fn rebuildable_omissions(repo: &Path) -> Result<Vec<RebuildableOmission>> {
+    let repo = fs::canonicalize(repo).refuse_at("git_carry::rebuildable_omissions")?;
+    let common = common_repository(&repo)?;
+    let census = capture_census(&repo, &common, CapturePolicy::default())?;
+    measure_omissions(&repo, &census.omitted)
+}
+
+/// A streamed capture's omissions: the nests, then the rebuildable roots.
+pub type Omissions = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+
 /// What a streamed capture leaves out of an item's seats, by one plain walk.
 ///
 /// A directory holding a `.git` entry of any kind (a nested repository, a
@@ -3351,7 +3361,7 @@ struct Census {
 pub fn streamed_omissions(
     repo: &Path,
     include_rebuildable: bool,
-) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
+) -> Result<Omissions> {
     use std::os::unix::ffi::OsStrExt as _;
     const SITE: &str = "git_carry::streamed_omissions";
     let root = fs::canonicalize(repo).refuse_at(SITE)?;
@@ -3393,12 +3403,6 @@ pub fn streamed_omissions(
     Ok((nests, omitted))
 }
 
-pub fn rebuildable_omissions(repo: &Path) -> Result<Vec<RebuildableOmission>> {
-    let repo = fs::canonicalize(repo).refuse_at("git_carry::rebuildable_omissions")?;
-    let common = common_repository(&repo)?;
-    let census = capture_census(&repo, &common, CapturePolicy::default())?;
-    measure_omissions(&repo, &census.omitted)
-}
 
 // Apparent size and seat count below one omitted root. A vanished entry is
 // rebuildable churn, not a fault: skip it rather than refuse the capture.
