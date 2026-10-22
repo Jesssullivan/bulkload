@@ -1900,7 +1900,20 @@ fn inputs_digest(
         put(&planned.map_or([0; 32], |item| item.records));
     }
     put(&encode(&sibling)?);
+    // A streamed pass's block names its move state (2026-10-22): a block
+    // rendered before that names a corpus that does not exist, and is
+    // re-rendered. A corpus pass's digest is as it was.
+    if let Some(move_state) = streamed(estate) {
+        put(b"streamed-move-state");
+        put(&move_state);
+    }
     Ok(*hasher.finalize().as_bytes())
+}
+
+/// The move state of a streamed pass, as a block names it.
+fn streamed(estate: &Estate<'_>) -> Option<Vec<u8>> {
+    crate::estate::streamed_move_state(estate.plan, estate.corpus, estate.state)
+        .map(|move_state| move_state.as_os_str().as_bytes().to_vec())
 }
 
 /// postcard bytes of a value, for the digest.
@@ -2051,6 +2064,7 @@ fn gather(
         plan_digest: estate.plan_digest,
         corpus: estate.corpus.as_os_str().as_bytes().to_vec(),
         state: estate.state.as_os_str().as_bytes().to_vec(),
+        move_state: streamed(estate),
         build: build(),
         item: workspace.item.to_owned(),
         capture: ledger.capture,

@@ -2849,3 +2849,35 @@ fn h57_check_never_runs_a_destination_gpg_program() {
     let _check = world.handoff(&["--check"]);
     assert!(!mark.exists(), "--check ran the destination's gpg.program");
 }
+
+/// H50 (2026-10-22, estate pass 4): with `--keep-going` a workspace the
+/// hand-off cannot write (a read-only directory, as a `SwiftPM` checkout
+/// is) is its own refused row, code and errno, and the run exits 0;
+/// without it the run still refuses with the workspace's refusal.
+#[test]
+fn h50_keep_going_makes_a_workspace_refusal_its_row() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let world = World::new();
+    // Root writes through any mode: nothing to prove.
+    if fs::metadata(&world.root).unwrap().uid() == 0 {
+        return;
+    }
+    let locked = world.dst_wt();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+    let plain = world.handoff(&[]);
+    let kept = world.handoff(&["--keep-going"]);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!plain.ok, "{}\n{}", plain.stdout, plain.stderr);
+    assert!(kept.ok, "{}\n{}", kept.stdout, kept.stderr);
+    let refused = row(&kept.stdout, &locked);
+    assert!(refused.contains("\"outcome\":\"refused\""), "{refused}");
+    assert!(refused.contains("\"refusal\":\"IO\""), "{refused}");
+    assert!(refused.contains("\"errno\":13"), "{refused}");
+    // The other workspace's block is in place.
+    assert!(split(&fs::read(world.dst().join("AGENTS.md")).unwrap()).is_some());
+    assert!(
+        kept.stdout.contains("\"kind\":\"summary\"") && kept.stdout.contains("\"refused\":1"),
+        "{}",
+        kept.stdout
+    );
+}

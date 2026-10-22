@@ -82,6 +82,14 @@ pub const RECORD_DIR: &str = "transfer.closure.d";
 /// A record's file extension.
 pub const RECORD_EXT: &str = "closure";
 
+/// The extension of a record's held-reasons sidecar (2026-10-22).
+///
+/// Each seat `--consolidate` held, with why, beside `<session item>.closure`.
+pub const HELD_EXT: &str = "held";
+
+/// The largest held-reasons sidecar read: 16 MiB.
+const HELD_LIMIT: u64 = 16 * 1024 * 1024;
+
 /// The first line of a transfer manifest.
 pub const MANIFEST_SCHEMA: &str = "bulkload.transfer-manifest.v1";
 
@@ -446,6 +454,56 @@ pub fn write(state: &Path, record: &TransferRecord) -> Result<bool> {
     Ok(true)
 }
 
+/// Where `DEST_STATE`'s held-reasons sidecar of the transfer `item` lives.
+#[must_use]
+pub fn held_path(state: &Path, item: &str) -> PathBuf {
+    record_dir(state).join(format!("{item}.{HELD_EXT}"))
+}
+
+// The held seats of a session that ran to its end, with why (2026-10-22):
+// the closure lists them on the item they belong to. A session that held
+// nothing leaves no sidecar (an earlier one is removed).
+fn write_held(state: &Path, item: &str, held: &[(Vec<u8>, &'static str)]) -> Result<()> {
+    const SITE: &str = "transfer_outcome::write_held";
+    let path = held_path(state, item);
+    if held.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                Err(crate::refuse::io(&error, SITE))
+            }
+            _ => Ok(()),
+        };
+    }
+    let rows: Vec<(&[u8], &str)> = held
+        .iter()
+        .map(|(path, why)| (path.as_slice(), *why))
+        .collect();
+    let bytes = postcard::to_allocvec(&rows).map_err(|_| BulkloadRefusal::FrameCodec)?;
+    crate::estate::write_bytes(&path, &bytes)
+}
+
+/// The held seats `DEST_STATE` recorded for the transfer `item`.
+///
+/// By path, with why: empty when there is no sidecar or it does not decode
+/// (a reason is a note on a typed row, never the row).
+#[must_use]
+pub fn held_reasons(state: &Path, item: &str) -> std::collections::BTreeMap<Vec<u8>, String> {
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(held_path(state, item))
+    else {
+        return std::collections::BTreeMap::new();
+    };
+    let mut bytes = Vec::new();
+    if file.take(HELD_LIMIT).read_to_end(&mut bytes).is_err() {
+        return std::collections::BTreeMap::new();
+    }
+    postcard::from_bytes::<Vec<(Vec<u8>, String)>>(&bytes)
+        .map(|rows| rows.into_iter().collect())
+        .unwrap_or_default()
+}
+
 // The refused and covered rows a session that does not run to its end
 // keeps: the record it replaces. An unreadable record refuses: its rows are
 // unknown, and replacing it would lose them (CLOSURE_UNACCOUNTED).
@@ -508,6 +566,12 @@ pub fn record_session(
             ended.entries = earlier;
         }
         let written = lock.is_some() && write(state, &ended)?;
+        // Why each held seat was held: the record keeps the code only.
+        if written {
+            if let Ok(stats) = &result {
+                write_held(state, &item, &stats.held)?;
+            }
+        }
         // Review finding 3: a DEST_STATE that is there (a symlink, say)
         // but took no closing record never passes as recorded.
         if !written && std::fs::symlink_metadata(state).is_ok() {

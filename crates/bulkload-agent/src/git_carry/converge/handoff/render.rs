@@ -136,6 +136,10 @@ pub struct Inputs {
     pub plan_digest: [u8; 32],
     pub corpus: Vec<u8>,
     pub state: Vec<u8>,
+    /// A streamed pass's `MOVE_STATE` (2026-10-22): no corpus exists, so
+    /// the block names the move state and gives the `--move-state`
+    /// commands. `None` for a corpus pass.
+    pub move_state: Option<Vec<u8>>,
     pub build: Build,
     pub item: String,
     /// The capture the landing holds, and the corpus's current one.
@@ -321,6 +325,10 @@ enum Verb {
 }
 
 /// The commands a block gives, with every path absolute.
+///
+/// A streamed pass has no corpus for `estate-diff` to read: its differences
+/// are this block's own, re-read by `--dry-run`, and every command names
+/// the move state (`--move-state`, 2026-10-22).
 fn command(inputs: &Inputs, verb: Verb) -> String {
     let exe = word(&inputs.build.exe);
     let (plan, corpus, state) = (
@@ -330,6 +338,17 @@ fn command(inputs: &Inputs, verb: Verb) -> String {
     );
     let source = word(inputs.source.as_bytes());
     let workspace = word(&inputs.workspace);
+    if let Some(move_state) = &inputs.move_state {
+        let move_state = word(move_state);
+        let mode = match verb {
+            Verb::Differences => "--dry-run",
+            Verb::Check => "--check",
+            Verb::Clear => "--clear",
+        };
+        return format!(
+            "{exe} estate-handoff {mode} --workspace {workspace} --move-state {move_state} {source}"
+        );
+    }
     match verb {
         Verb::Differences => format!("{exe} estate-diff {plan} {corpus} {source} {state}"),
         Verb::Check => format!(
@@ -428,19 +447,40 @@ pub fn render(inputs: &Inputs, compact: bool) -> Vec<u8> {
         shown(&inputs.plan),
         hex(inputs.plan_digest.get(..6).unwrap_or_default())
     );
-    let _ = writeln!(out, "| Corpus | `{}` |", shown(&inputs.corpus));
+    // A streamed pass (2026-10-22) keeps one snapshot per item in its
+    // move state and no corpus: the block names what exists.
+    let (holder, kind) = if let Some(move_state) = &inputs.move_state {
+        use std::os::unix::ffi::OsStrExt as _;
+        let binding = std::path::Path::new(std::ffi::OsStr::from_bytes(move_state))
+            .file_name()
+            .map_or_else(String::new, |name| shown(name.as_bytes()));
+        let _ = writeln!(
+            out,
+            "| Move state | `{}` (binding `{binding}`; a streamed pass: one snapshot per item in `carry/`, no corpus) |",
+            shown(move_state)
+        );
+        ("the move state", "snapshot")
+    } else {
+        let _ = writeln!(out, "| Corpus | `{}` |", shown(&inputs.corpus));
+        ("the corpus", "capture")
+    };
     let _ = writeln!(out, "| State | `{}` |", shown(&inputs.state));
     let current = match inputs.current {
-        Some(current) if current == inputs.capture => "the corpus's current capture".to_owned(),
+        Some(current) if current == inputs.capture => format!("{holder}'s current {kind}"),
         Some(current) => format!(
-            "the corpus holds a newer capture `{}…`, not applied",
+            "{holder} holds a newer {kind} `{}…`, not applied",
             hex(current.get(..6).unwrap_or_default())
         ),
-        None => "the corpus holds no capture record for the item".to_owned(),
+        None => format!("{holder} holds no {kind} record for the item"),
     };
     let _ = writeln!(
         out,
-        "| Capture | bundle `{}…`, item `{}…`; {current} |",
+        "| Capture | {} `{}…`, item `{}…`; {current} |",
+        if inputs.move_state.is_some() {
+            "snapshot"
+        } else {
+            "bundle"
+        },
         hex(inputs.capture.get(..6).unwrap_or_default()),
         inputs.item.get(..12).unwrap_or(&inputs.item)
     );
@@ -634,7 +674,12 @@ pub fn render(inputs: &Inputs, compact: bool) -> Vec<u8> {
     out.push_str("1. Tell the user this hand-off is open. Do not start other work until it is cleared or the user explicitly defers it.\n");
     let _ = writeln!(
         out,
-        "2. See what differs, read-only:\n   `{}`",
+        "2. See what differs, read-only{}:\n   `{}`",
+        if inputs.move_state.is_some() {
+            " (this block's facts re-read against the live refs, printed, nothing written)"
+        } else {
+            ""
+        },
         command(inputs, Verb::Differences)
     );
     out.push_str("3. For each diverged or source-ahead ref, each destination-only worktree and the live sibling, decide with the user which copy carries the work forward, and bring the other side's commits into it (merge or cherry-pick). Settle uncommitted changes in the sibling and in destination-only worktrees with the user (commit them where the work goes on). Never reset, force-push, delete a branch, or delete either copy: removing a copy is the operator's call.\n");
@@ -739,6 +784,7 @@ pub(super) fn sample() -> Inputs {
         plan_digest: [7; 32],
         corpus: b"/estate/corpus".to_vec(),
         state: b"/estate/state".to_vec(),
+        move_state: None,
         build: Build {
             version: "0.1.0".to_owned(),
             rev: "unknown".to_owned(),

@@ -215,11 +215,14 @@ pub fn ledger(rel: &[&OsStr]) -> bool {
         [home, .., last]
             if STORE_HOMES.contains(home) && *last == crate::transfer_outcome::RECORD_DIR =>
         {
-            // A record's lock (`ITEM.lock`) or the record (`ITEM.closure`):
-            // the transfer outcome's own names, matched exactly.
+            // A record's lock (`ITEM.lock`), the record (`ITEM.closure`) or
+            // its held reasons (`ITEM.held`, 2026-10-22): the transfer
+            // outcome's own names, matched exactly.
             name.rsplit_once('.').is_some_and(|(item, extension)| {
                 !item.is_empty()
-                    && (extension == "lock" || extension == crate::transfer_outcome::RECORD_EXT)
+                    && (extension == "lock"
+                        || extension == crate::transfer_outcome::RECORD_EXT
+                        || extension == crate::transfer_outcome::HELD_EXT)
             }) || pending(name)
         }
         // The session pulls' provenance listings (`pull/claude.listing`,
@@ -477,6 +480,7 @@ mod tests {
             "pull/corpus/writer.lock",
             "pull/corpus/transfer.closure.d/item.closure",
             "pull/corpus/transfer.closure.d/item.lock",
+            "pull/corpus/transfer.closure.d/item.held",
             "pull/corpus/transfer.closure.d/item.pending-0",
             "serve/carry/item/transfer.sqlite-shm",
             "carry-files/item/dest/transfer.sqlite",

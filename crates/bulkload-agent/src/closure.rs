@@ -463,6 +463,22 @@ pub struct Row {
     /// the capture beside (`GIT_DESTINATION_DIVERGED`,
     /// `GIT_DESTINATION_NONREPO_DIFFERS`), printed as `beside_reason`.
     pub beside_reason: Option<String>,
+    /// 2026-10-22: the seats a consolidating landing held, from the item's
+    /// seat transfer ([`Report::attach_held_seats`]), printed as
+    /// `held_seats` so a held lane's files are named on its own row.
+    pub held_seats: Vec<HeldSeat>,
+}
+
+/// One seat a consolidating landing held (2026-10-22).
+///
+/// Its path under the item's live path, the typed refusal its transfer
+/// recorded, and why, when the transfer recorded a reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldSeat {
+    pub path: Vec<u8>,
+    pub refusal: String,
+    pub errno: Option<i32>,
+    pub reason: Option<String>,
 }
 
 /// The per-item closure ledger and its totals.
@@ -616,6 +632,7 @@ impl Report {
                 refs_in: entry.refs_in.clone(),
                 detail: beside_foreign_detail(entry),
                 beside_reason: entry.beside_reason.clone(),
+                held_seats: Vec::new(),
             });
         }
         report.recount();
@@ -775,6 +792,39 @@ impl Report {
             .iter()
             .filter(|row| row.kind != RowKind::Estate)
             .count() as u64
+    }
+
+    /// Name on `item`'s estate row the seats its seat transfer, recorded
+    /// in `state`, refused (2026-10-22): each refused entry of every
+    /// record there, with its code, errno and the reason the transfer
+    /// recorded for a held seat. Annotation only: the row's outcome,
+    /// disposition and every total stay as they were.
+    pub fn attach_held_seats(&mut self, item: &str, state: &std::path::Path) {
+        use crate::transfer_outcome::EntryOutcome;
+        let mut seats = Vec::new();
+        for (session, path) in crate::transfer_outcome::records(state) {
+            let Some(Ok(record)) = crate::transfer_outcome::read_file(&path) else {
+                continue;
+            };
+            let reasons = crate::transfer_outcome::held_reasons(state, &session);
+            for entry in &record.entries {
+                if let EntryOutcome::Refused { refusal, .. } = &entry.outcome {
+                    seats.push(HeldSeat {
+                        path: entry.rel_path.clone(),
+                        refusal: refusal.code().to_owned(),
+                        errno: refusal.errno(),
+                        reason: reasons.get(&entry.rel_path).cloned(),
+                    });
+                }
+            }
+        }
+        seats.sort_by(|a, b| a.path.cmp(&b.path));
+        seats.dedup();
+        for row in &mut self.rows {
+            if row.kind == RowKind::Estate && row.item == item {
+                row.held_seats.clone_from(&seats);
+            }
+        }
     }
 
     /// Join every transfer session recorded in each `DEST_STATE` (WP3 PR
@@ -1068,6 +1118,24 @@ impl Report {
             {
                 let _ = write!(out, ",\"beside_reason\":{}", json_string(reason));
             }
+            if !row.held_seats.is_empty() {
+                out.push_str(",\"held_seats\":[");
+                for (index, seat) in row.held_seats.iter().enumerate() {
+                    let _ = write!(
+                        out,
+                        "{}{{\"path\":{},\"refusal\":{},\"errno\":{},\"reason\":{}}}",
+                        if index == 0 { "" } else { "," },
+                        json_string(&seat.path.escape_ascii().to_string()),
+                        json_string(&seat.refusal),
+                        seat.errno
+                            .map_or_else(|| "null".to_owned(), |errno| errno.to_string()),
+                        seat.reason
+                            .as_deref()
+                            .map_or_else(|| "null".to_owned(), json_string),
+                    );
+                }
+                out.push(']');
+            }
             if let Some(proof) = &row.carried {
                 let _ = write!(
                     out,
@@ -1315,6 +1383,7 @@ fn transfer_row(
         refs_in: None,
         detail: None,
         beside_reason: None,
+        held_seats: Vec::new(),
     }
 }
 

@@ -59,11 +59,18 @@ pub struct Note {
     /// could not be read; `code`, typed for a root:
     /// `SOURCE_ROOT_UNREADABLE`), `source-vanished` (a `SOURCE_ROOT` gone
     /// when the pass reached it, `SOURCE_ROOT_MISSING`, #277; or a name
-    /// beneath one gone mid-walk, `SOURCE_VANISHED`).
+    /// beneath one gone mid-walk, `SOURCE_VANISHED`), `rebuildable-nest`
+    /// ([`REBUILDABLE_NEST`]: a nested repository under a rebuildable root).
     pub what: &'static str,
     pub count: u64,
     pub code: Option<&'static str>,
 }
+
+/// The note of a nested repository under a rebuildable root.
+///
+/// SPEC rule 5 (2026-10-22): counted and printed, never planned, and never
+/// holds the move's gate (its root is omitted by rule, not left behind).
+pub const REBUILDABLE_NEST: &str = "rebuildable-nest";
 
 /// What [`inventory`] found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -139,14 +146,7 @@ fn walk(roots: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<Note>)> {
                 // B2 part 3: a nested repository or a populated submodule
                 // under this one's worktree is its own item, walked as one
                 // (the enclosing item excludes its path).
-                if let Ok(nests) = crate::git_carry::nested_repositories(&directory) {
-                    use std::os::unix::ffi::OsStrExt as _;
-                    for nest in nests.iter().rev() {
-                        if nest.kind == crate::git_carry::NestedRepositoryKind::Directory {
-                            stack.push(directory.join(std::ffi::OsStr::from_bytes(&nest.rel_path)));
-                        }
-                    }
-                }
+                nests(&directory, &mut stack, &mut notes);
                 found.push(directory);
                 continue;
             }
@@ -224,6 +224,33 @@ fn walk(roots: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<Note>)> {
         }
     }
     Ok((found, notes))
+}
+
+// The nested repositories under `directory`'s worktree, each walked as its
+// own item; one under a rebuildable root its capture omits (SPEC rule 5: a
+// `SwiftPM` `.build/checkouts/` clone) is rebuilt with that root: a
+// `rebuildable-nest` note, never an item.
+fn nests(directory: &Path, stack: &mut Vec<PathBuf>, notes: &mut Vec<Note>) {
+    use std::os::unix::ffi::OsStrExt as _;
+    let Ok(nests) = crate::git_carry::nested_repositories(directory) else {
+        return;
+    };
+    for nest in nests.iter().rev() {
+        if nest.kind != crate::git_carry::NestedRepositoryKind::Directory {
+            continue;
+        }
+        let path = directory.join(std::ffi::OsStr::from_bytes(&nest.rel_path));
+        if crate::git_carry::under_rebuildable_root(directory, &nest.rel_path).unwrap_or(false) {
+            notes.push(Note {
+                path,
+                what: REBUILDABLE_NEST,
+                count: 1,
+                code: None,
+            });
+        } else {
+            stack.push(path);
+        }
+    }
 }
 
 const fn unreadable(path: PathBuf, refusal: &BulkloadRefusal) -> Note {
