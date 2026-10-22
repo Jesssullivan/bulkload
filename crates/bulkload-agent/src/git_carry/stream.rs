@@ -898,10 +898,7 @@ mod tests {
         assert_eq!(ids.iter().cloned().collect::<Vec<_>>(), vec![sha1.clone()]);
         ids.clear();
         ids_in(format!("{sha1} {sha256}\n").as_bytes(), 64, &mut ids);
-        assert_eq!(
-            ids.iter().cloned().collect::<Vec<_>>(),
-            vec![sha256.clone()]
-        );
+        assert_eq!(ids.iter().cloned().collect::<Vec<_>>(), vec![sha256]);
         ids.clear();
         let null = "0".repeat(40);
         let line = format!(

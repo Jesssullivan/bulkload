@@ -616,10 +616,12 @@ pub fn converge(
 }
 
 /// The ids `live`'s administration names that its store lacks before a
-/// landing writes anything: the destination's own state (an `AUTO_MERGE`
-/// tree a gc pruned, a reflog entry of its own), never the source's drift.
-/// A top-up neither wants them (the source never held them) nor refuses
-/// for them. None when `live` holds no repository of its own yet.
+/// landing writes anything.
+///
+/// The destination's own state (an `AUTO_MERGE` tree a gc pruned, a reflog
+/// entry of its own), never the source's drift: a top-up neither wants them
+/// (the source never held them) nor refuses for them. None when `live`
+/// holds no repository of its own yet.
 ///
 /// # Errors
 /// As [`stream::lacking`].
