@@ -3505,6 +3505,12 @@ fn a_path_outside_the_maps_lands_under_the_destination_home() {
     let moved = agent_home(&args(false), &dst_home);
     let both = format!("{}\n{}", moved.stdout, moved.stderr);
     assert!(mapped.join("a.txt").is_file(), "{both}");
+    // The hand-off reads the placed path, never the plan's source path.
+    assert!(!moved.stdout.contains("HANDOFF_NOT_LANDED"), "{both}");
+    assert!(
+        moved.stdout.contains("estate-move phase=hand-off outcome=ok"),
+        "{both}"
+    );
     for level in [dst_home.join(".cache"), dst_home.join(".cache/lanes")] {
         let mode = fs::symlink_metadata(&level).unwrap().mode() & 0o7777;
         assert_eq!(mode, 0o700, "{} {both}", level.display());
@@ -3643,4 +3649,99 @@ fn no_pass_leaves_an_empty_corpus_and_an_old_one_is_removed() {
             tree(&state)
         );
     }
+}
+
+// The receipt line of the item at `live` on a pass's stdout.
+fn receipt_words(stdout: &str, live: &Path) -> BTreeMap<String, String> {
+    words(item_line(stdout, live))
+}
+
+/// The coordinator, 2026-10-21: a registered worktree nested in a main's
+/// checkout (`.worktrees/NAME`, tinyland.dev's layout) is its own item,
+/// never the main's seats. A destination that holds other files at that
+/// path leaves the main's consolidation whole.
+#[test]
+fn nested_worktrees_are_never_the_mains_seats() {
+    let world = World::new("nestedwt");
+    let (source, live) = related_pair(&world, "p");
+    git(
+        &source,
+        &["worktree", "add", "--quiet", "-b", "side", ".worktrees/side"],
+    );
+    fs::write(source.join(".worktrees/side/u.txt"), "neo's untracked\n").unwrap();
+    fs::create_dir_all(live.join(".worktrees/side")).unwrap();
+    fs::write(live.join(".worktrees/side/u.txt"), "sting's own\n").unwrap();
+    assert!(world.source().ok);
+    let moved = world.moved();
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    let main = receipt_words(&moved.stdout, &live);
+    assert_eq!(main["seats_held"], "false", "{both}");
+    assert!(
+        !moved.stderr.lines().any(|line| line.starts_with("held .worktrees/")),
+        "{both}"
+    );
+    assert_eq!(
+        fs::read(live.join(".worktrees/side/u.txt")).unwrap(),
+        b"sting's own\n"
+    );
+}
+
+/// The coordinator, 2026-10-21 (add/add, no merge base): a file both sides
+/// made is adopted when equal, unioned by its class when #297 has one (an
+/// append log, JSON config), and held typed otherwise.
+#[test]
+fn a_file_both_sides_added_is_adopted_unioned_or_held() {
+    let world = World::new("addadd");
+    let (source, live) = related_pair(&world, "p");
+    for (side, notes, config) in [
+        (&source, "{\"n\":1}\n", "{\"neo\": true}\n"),
+        (&live, "{\"n\":1}\n{\"n\":2}\n", "{\"sting\": true}\n"),
+    ] {
+        fs::write(side.join("same.md"), "equal on both\n").unwrap();
+        fs::write(side.join("notes.jsonl"), notes).unwrap();
+        fs::write(side.join("settings.json"), config).unwrap();
+    }
+    assert!(world.source().ok);
+    let moved = world.moved();
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    let main = receipt_words(&moved.stdout, &live);
+    assert_eq!(main["seats_held"], "false", "{both}");
+    let config = fs::read_to_string(live.join("settings.json")).unwrap();
+    assert!(config.contains("neo") && config.contains("sting"), "{config}\n{both}");
+    assert_eq!(
+        fs::read_to_string(live.join("notes.jsonl")).unwrap(),
+        "{\"n\":1}\n{\"n\":2}\n"
+    );
+    // A file with no union, differing on both sides: held, the live kept.
+    fs::write(source.join("other.md"), "neo\n").unwrap();
+    fs::write(live.join("other.md"), "sting\n").unwrap();
+    assert!(world.source().ok);
+    let again = world.moved();
+    let both = format!("{}\n{}", again.stdout, again.stderr);
+    assert_eq!(
+        receipt_words(&again.stdout, &live)["seats_held"],
+        "true",
+        "{both}"
+    );
+    assert_eq!(fs::read(live.join("other.md")).unwrap(), b"sting\n");
+}
+
+/// SPEC rule 6 (never halt), the coordinator 2026-10-21: an object the live
+/// repository names after its snapshot (the source moved under the pass) is
+/// fetched by id from the live source in the same pass, not refused
+/// `CAPTURE_DRIFTED`.
+#[test]
+fn an_object_named_after_the_snapshot_is_fetched_in_the_same_pass() {
+    let world = World::new("drift");
+    let (source, live) = related_pair(&world, "p");
+    assert!(world.source().ok);
+    git(&source, &["commit", "--quiet", "--allow-empty", "-m", "after the snapshot"]);
+    let later = out(&source, &["rev-parse", "HEAD"]);
+    fs::write(live.join(".git/refs/heads/later"), format!("{}\n", later.trim())).unwrap();
+    let moved = world.moved();
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    let main = receipt_words(&moved.stdout, &live);
+    assert_eq!(main["outcome"], "workspace-restored", "{both}");
+    assert!(!moved.stdout.contains("CAPTURE_DRIFTED"), "{both}");
+    assert_eq!(out(&live, &["cat-file", "-t", later.trim()]).trim(), "commit");
 }
