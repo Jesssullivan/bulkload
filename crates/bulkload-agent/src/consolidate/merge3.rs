@@ -12,6 +12,10 @@ use super::{Action, Live, Outcome};
 use crate::refuse::RefuseAt as _;
 use crate::{BulkloadRefusal, Result};
 
+/// The hold of a file both sides added (no merge base holds it): the
+/// transfer then tries the file's class union (2026-10-21, add/add).
+pub const NO_BASE: &str = "git: the merge base has no such file";
+
 /// The merge base a worktree's consolidation merges against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Base {
@@ -51,7 +55,7 @@ pub fn union(live: &Live<'_>, theirs: &[u8], base: &Base) -> Result<Outcome> {
     }
     let Some(original) = crate::git_carry::union::blob_at(&base.repo, &base.commit, live.rel)?
     else {
-        return Ok(held("git: the merge base has no such file"));
+        return Ok(held(NO_BASE));
     };
     let Some(merged) =
         crate::git_carry::union::merge_file(&base.scratch, &original, &ours, theirs)?

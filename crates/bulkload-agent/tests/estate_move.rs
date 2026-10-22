@@ -368,7 +368,7 @@ fn a_streamed_pass_lands_every_absent_item_with_no_payload_anywhere() {
     // The same status, but the hand-off notes the move wrote (R0.5).
     let landed_status: String = out(&dst.join("land"), &["status", "--porcelain", "--ignored"])
         .lines()
-        .filter(|line| *line != "?? AGENTS.md" && *line != "?? CLAUDE.md")
+        .filter(|line| *line != "?? CLAUDE.local.md" && *line != "!! CLAUDE.local.md")
         .fold(String::new(), |mut all, line| {
             all.push_str(line);
             all.push('\n');
@@ -384,7 +384,11 @@ fn a_streamed_pass_lands_every_absent_item_with_no_payload_anywhere() {
             .contains("estate-move phase=hand-off outcome=ok"),
         "{both}"
     );
-    assert!(dst.join("land/AGENTS.md").is_file(), "{both}");
+    // The hand-off is CLAUDE.local.md, excluded; no tracked file is
+    // written and Codex gets none (2026-10-21).
+    assert!(dst.join("land/CLAUDE.local.md").is_file(), "{both}");
+    assert!(!dst.join("land/AGENTS.md").exists(), "{both}");
+    assert!(!dst.join("land/CLAUDE.md").exists(), "{both}");
     // The linked worktree is linked, at its live path.
     assert_eq!(
         out(&dst.join("land-wt"), &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
@@ -3505,6 +3509,14 @@ fn a_path_outside_the_maps_lands_under_the_destination_home() {
     let moved = agent_home(&args(false), &dst_home);
     let both = format!("{}\n{}", moved.stdout, moved.stderr);
     assert!(mapped.join("a.txt").is_file(), "{both}");
+    // The hand-off reads the placed path, never the plan's source path.
+    assert!(!moved.stdout.contains("HANDOFF_NOT_LANDED"), "{both}");
+    assert!(
+        moved
+            .stdout
+            .contains("estate-move phase=hand-off outcome=ok"),
+        "{both}"
+    );
     for level in [dst_home.join(".cache"), dst_home.join(".cache/lanes")] {
         let mode = fs::symlink_metadata(&level).unwrap().mode() & 0o7777;
         assert_eq!(mode, 0o700, "{} {both}", level.display());
@@ -3643,4 +3655,215 @@ fn no_pass_leaves_an_empty_corpus_and_an_old_one_is_removed() {
             tree(&state)
         );
     }
+}
+
+// The receipt line of the item at `live` on a pass's stdout.
+fn receipt_words(stdout: &str, live: &Path) -> BTreeMap<String, String> {
+    words(item_line(stdout, live))
+}
+
+/// The coordinator, 2026-10-21: a registered worktree nested in a main's
+/// checkout (`.worktrees/NAME`, tinyland.dev's layout) is its own item,
+/// never the main's seats. A destination that holds other files at that
+/// path leaves the main's consolidation whole.
+#[test]
+fn nested_worktrees_are_never_the_mains_seats() {
+    let world = World::new("nestedwt");
+    let (source, live) = related_pair(&world, "p");
+    git(
+        &source,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "side",
+            ".worktrees/side",
+        ],
+    );
+    fs::write(source.join(".worktrees/side/u.txt"), "neo's untracked\n").unwrap();
+    fs::create_dir_all(live.join(".worktrees/side")).unwrap();
+    fs::write(live.join(".worktrees/side/u.txt"), "sting's own\n").unwrap();
+    assert!(world.source().ok);
+    let moved = world.moved();
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    let main = receipt_words(&moved.stdout, &live);
+    assert_eq!(main["seats_held"], "false", "{both}");
+    assert!(
+        !moved
+            .stderr
+            .lines()
+            .any(|line| line.starts_with("held .worktrees/")),
+        "{both}"
+    );
+    assert_eq!(
+        fs::read(live.join(".worktrees/side/u.txt")).unwrap(),
+        b"sting's own\n"
+    );
+}
+
+/// The coordinator, 2026-10-21 (add/add, no merge base): a file both sides
+/// made is adopted when equal, unioned by its class when #297 has one (an
+/// append log, JSON config), and held typed otherwise.
+#[test]
+fn a_file_both_sides_added_is_adopted_unioned_or_held() {
+    let world = World::new("addadd");
+    let (source, live) = related_pair(&world, "p");
+    for (side, notes, config) in [
+        (&source, "{\"n\":1}\n", "{\"neo\": true}\n"),
+        (&live, "{\"n\":1}\n{\"n\":2}\n", "{\"sting\": true}\n"),
+    ] {
+        fs::write(side.join("same.md"), "equal on both\n").unwrap();
+        fs::write(side.join("notes.jsonl"), notes).unwrap();
+        fs::write(side.join("settings.json"), config).unwrap();
+    }
+    assert!(world.source().ok);
+    let moved = world.moved();
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    let main = receipt_words(&moved.stdout, &live);
+    assert_eq!(main["seats_held"], "false", "{both}");
+    let config = fs::read_to_string(live.join("settings.json")).unwrap();
+    assert!(
+        config.contains("neo") && config.contains("sting"),
+        "{config}\n{both}"
+    );
+    assert_eq!(
+        fs::read_to_string(live.join("notes.jsonl")).unwrap(),
+        "{\"n\":1}\n{\"n\":2}\n"
+    );
+    // A file with no union, differing on both sides: held, the live kept.
+    fs::write(source.join("other.md"), "neo\n").unwrap();
+    fs::write(live.join("other.md"), "sting\n").unwrap();
+    assert!(world.source().ok);
+    let again = world.moved();
+    let both = format!("{}\n{}", again.stdout, again.stderr);
+    assert_eq!(
+        receipt_words(&again.stdout, &live)["seats_held"],
+        "true",
+        "{both}"
+    );
+    assert_eq!(fs::read(live.join("other.md")).unwrap(), b"sting\n");
+}
+
+/// SPEC rule 6 (never halt), the coordinator 2026-10-21: an object the live
+/// repository names after its snapshot (the source moved under the pass) is
+/// fetched by id from the live source in the same pass, not refused
+/// `CAPTURE_DRIFTED`.
+#[test]
+fn an_object_named_after_the_snapshot_is_fetched_in_the_same_pass() {
+    let world = World::new("drift");
+    let (source, live) = related_pair(&world, "p");
+    assert!(world.source().ok);
+    git(
+        &source,
+        &[
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "after the snapshot",
+        ],
+    );
+    let later = out(&source, &["rev-parse", "HEAD"]);
+    fs::write(
+        live.join(".git/refs/heads/later"),
+        format!("{}\n", later.trim()),
+    )
+    .unwrap();
+    let moved = world.moved();
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    let main = receipt_words(&moved.stdout, &live);
+    assert_eq!(main["outcome"], "workspace-restored", "{both}");
+    assert!(!moved.stdout.contains("CAPTURE_DRIFTED"), "{both}");
+    assert_eq!(
+        out(&live, &["cat-file", "-t", later.trim()]).trim(),
+        "commit"
+    );
+}
+
+/// SPEC rules 7 and 8 (the coordinator, 2026-10-21): the hand-off never
+/// modifies a tracked file. A block an earlier pass wrote into the tracked
+/// `AGENTS.md` and `CLAUDE.md` is removed, exactly, by the next pass; the
+/// note lives in `CLAUDE.local.md`, excluded through `info/exclude`. After
+/// a pass and a rerun, `git status` shows no change to either tracked file,
+/// and the plan holds nothing for them.
+#[test]
+fn the_hand_off_never_modifies_a_tracked_file() {
+    let world = World::new("handofflocal");
+    world.estate();
+    let land = world.src().join("land");
+    fs::write(land.join("AGENTS.md"), "# agents\nneo's rules\n").unwrap();
+    fs::write(land.join("CLAUDE.md"), "# claude\nneo's notes\n").unwrap();
+    git(&land, &["add", "AGENTS.md", "CLAUDE.md"]);
+    git(&land, &["commit", "--quiet", "-m", "agent files"]);
+    assert!(world.source().ok);
+    // An earlier pass (the legacy targets) wrote its block into both.
+    let legacy = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .arg("--min-free-percent=0")
+        .args(os(&[
+            &"estate-move",
+            &"--label",
+            &LABEL,
+            &"--source",
+            &"neo",
+            &"-",
+            &world.source_state(),
+            &world.state(),
+        ]))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("BULKLOAD_HANDOFF_TRACKED_TARGETS", "1")
+        .output()
+        .unwrap();
+    let live = world.dst().join("land");
+    let agents = fs::read_to_string(live.join("AGENTS.md")).unwrap();
+    assert!(
+        agents.contains("bulkload") && agents.ends_with("# agents\nneo's rules\n"),
+        "{agents}\n{}",
+        String::from_utf8_lossy(&legacy.stdout)
+    );
+    // This pass removes the block it finds there and writes the local note.
+    for pass in 0..2 {
+        assert!(world.source().ok);
+        let moved = world.moved();
+        let both = format!("{}\n{}", moved.stdout, moved.stderr);
+        assert_eq!(
+            fs::read(live.join("AGENTS.md")).unwrap(),
+            b"# agents\nneo's rules\n",
+            "pass {pass}: {both}"
+        );
+        assert_eq!(
+            fs::read(live.join("CLAUDE.md")).unwrap(),
+            b"# claude\nneo's notes\n",
+            "pass {pass}: {both}"
+        );
+        let status = out(
+            &live,
+            &["status", "--porcelain", "--", "AGENTS.md", "CLAUDE.md"],
+        );
+        assert!(status.is_empty(), "pass {pass}: {status}\n{both}");
+        assert!(live.join("CLAUDE.local.md").is_file(), "{both}");
+        assert!(
+            out(&live, &["status", "--porcelain"])
+                .lines()
+                .all(|line| !line.contains("CLAUDE.local.md")),
+            "excluded"
+        );
+        assert!(
+            !moved
+                .stderr
+                .lines()
+                .any(|line| line.contains("AGENTS.md") || line.contains(" CLAUDE.md")),
+            "pass {pass}: {both}"
+        );
+    }
+    let planned = world.planned();
+    assert!(planned.ok, "{}\n{}", planned.stdout, planned.stderr);
+    let rows = fs::read_to_string(world.state().join("diff.jsonl")).unwrap();
+    assert!(
+        !rows
+            .lines()
+            .any(|row| row.contains("\"path\":\"AGENTS.md\"")
+                || row.contains("\"path\":\"CLAUDE.md\"")),
+        "{rows}"
+    );
 }

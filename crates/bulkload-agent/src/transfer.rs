@@ -1465,6 +1465,15 @@ fn archive_target(root: &Path, rel_path: &[u8], archived: &[PathBuf]) -> Option<
     .then_some(target)
 }
 
+/// A class #297 can union (append logs, JSON and TOML config): what an
+/// add/add in a Git worktree falls back to.
+const fn unionable(class: crate::consolidate::Class) -> bool {
+    matches!(
+        class,
+        crate::consolidate::Class::AppendLog | crate::consolidate::Class::Config(_)
+    )
+}
+
 static CONSOLIDATE: Mutex<Option<Arc<Consolidation>>> = Mutex::new(None);
 
 /// The consolidation by canonical destination root, for tests that run
@@ -8309,7 +8318,15 @@ impl<W: Write> Inbound<'_, W> {
                 bytes,
                 base,
             )?;
-            return Ok((outcome, before));
+            // Add/add (both sides made it; no merge base holds it): equal
+            // bytes were adopted above; a class #297 can union (append
+            // logs, JSON and TOML config) is unioned below; anything else
+            // stays held typed.
+            let add_add = outcome.action
+                == crate::consolidate::Action::Held(crate::consolidate::merge3::NO_BASE);
+            if !(add_add && unionable(class)) {
+                return Ok((outcome, before));
+            }
         }
         let Some(union) = crate::consolidate::union_of(class) else {
             let reason = if class == crate::consolidate::Class::Sqlite {

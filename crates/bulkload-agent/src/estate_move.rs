@@ -1082,7 +1082,29 @@ fn move_pass(run: &Move) -> Result<()> {
     // engine into the live path. A live path holding anything else is held,
     // typed, for the consolidate path (B2): nothing is written there.
     moving::private_dir(&private)?;
+    // The hand-off never modifies a tracked file (SPEC rules 7 and 8,
+    // 2026-10-21): a block an earlier pass wrote into a tracked `AGENTS.md`
+    // or `CLAUDE.md` is cleared first, restored byte for byte and recorded,
+    // so it never holds the consolidation of the file it sits in.
+    {
+        let mut args: Vec<OsString> = vec!["--clear".into(), "--legacy-only".into()];
+        if let Some((from, to)) = homes.as_ref() {
+            let mut pair = from.clone().into_os_string();
+            pair.push("=");
+            pair.push(to);
+            args.extend(["--place".into(), pair]);
+        }
+        args.extend([
+            plan.clone().into_os_string(),
+            corpus.clone().into_os_string(),
+            private.clone().into_os_string(),
+            run.source.clone().into(),
+        ]);
+        let cleared = super::estate_command("estate-handoff", &args);
+        reached(&mut ledger, &ledger_path, "hand-off-legacy", word(&cleared))?;
+    }
     let placed: Vec<estate::Item> = rows.iter().map(|row| row.item.clone()).collect();
+    let sources: Vec<PathBuf> = rows.iter().map(|row| row.item.source.clone()).collect();
     let map = estate::streamed::path_map(&placed);
     let upload_pack = upload_pack_program(run);
     let transfer = |from: &Path, to: &Path| -> Result<()> {
@@ -1133,6 +1155,20 @@ fn move_pass(run: &Move) -> Result<()> {
         };
         // Placed where the plan placed it (the default home map included).
         snapshot.item = row.item.clone();
+        // Every other item under this item's source path is its own item,
+        // never this one's seats (2026-10-21: the `.worktrees/` children of
+        // tinyland.dev; registered or not, repository or not).
+        for other in &sources {
+            if let Ok(rest) = other.strip_prefix(&row.item.source) {
+                if !rest.as_os_str().is_empty() {
+                    snapshot
+                        .excluded
+                        .push(std::os::unix::ffi::OsStrExt::as_bytes(rest.as_os_str()).to_vec());
+                }
+            }
+        }
+        snapshot.excluded.sort();
+        snapshot.excluded.dedup();
         let place = row.item.workspace.as_ref().unwrap_or(&row.item.repository);
         // Ours to land again: a landing of this item, never a
         // consolidation of the destination's own repository.
@@ -1460,6 +1496,14 @@ fn move_pass(run: &Move) -> Result<()> {
         let mut args: Vec<OsString> = Vec::new();
         for item in &landed {
             args.extend(["--item".into(), item.into()]);
+        }
+        // The workspaces the default home map placed: their blocks go to the
+        // placed paths, never the plan's source paths.
+        if let Some((from, to)) = homes.as_ref() {
+            let mut pair = from.clone().into_os_string();
+            pair.push("=");
+            pair.push(to);
+            args.extend(["--place".into(), pair]);
         }
         args.extend([
             plan.clone().into_os_string(),

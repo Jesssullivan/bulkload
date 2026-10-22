@@ -485,6 +485,9 @@ enum Edit {
 /// its prints (C03), and is judged by its ctime as well as its mtime (F1).
 fn an_edit_after_the_exchange_survives(rerun: Rerun, edit: Edit) {
     use crate::estate::{self, HandoffMode, HandoffOptions};
+    // The prefix machinery's fixture: the legacy tracked targets (debug
+    // builds only; every hand-off test in this module asks for them).
+    std::env::set_var(super::TRACKED_TARGETS_ENV, "1");
     let dir = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(dir.path()).unwrap();
     let source = root.join("src");

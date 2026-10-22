@@ -72,6 +72,8 @@ fn agent_with(args: &[OsString], envs: &[(&str, &std::ffi::OsStr)]) -> Ran {
     let out = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        // The hand-off fixtures (p117, p122) use the legacy tracked targets.
+        .env("BULKLOAD_HANDOFF_TRACKED_TARGETS", "1")
         .envs(envs.iter().copied())
         .output()
         .unwrap();
