@@ -898,10 +898,16 @@ mod tests {
         assert_eq!(ids.iter().cloned().collect::<Vec<_>>(), vec![sha1.clone()]);
         ids.clear();
         ids_in(format!("{sha1} {sha256}\n").as_bytes(), 64, &mut ids);
-        assert_eq!(ids.iter().cloned().collect::<Vec<_>>(), vec![sha256.clone()]);
+        assert_eq!(
+            ids.iter().cloned().collect::<Vec<_>>(),
+            vec![sha256.clone()]
+        );
         ids.clear();
         let null = "0".repeat(40);
-        let line = format!("{null} {sha1} t <t@localhost> 1 +0000\tcheckout: moving from x to {}\n", "3".repeat(40));
+        let line = format!(
+            "{null} {sha1} t <t@localhost> 1 +0000\tcheckout: moving from x to {}\n",
+            "3".repeat(40)
+        );
         reflog_ids(line.as_bytes(), 40, &mut ids);
         assert_eq!(ids.iter().cloned().collect::<Vec<_>>(), vec![sha1]);
     }
