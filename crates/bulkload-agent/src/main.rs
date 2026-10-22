@@ -489,11 +489,11 @@ SUBCOMMANDS:
                 MOVE_STATE/carry/plan.postcard, MOVE_STATE/carry/corpus and
                 MOVE_STATE/private: a streamed pass, which keeps no corpus,
                 renders its block naming the move state and these commands
-                (its "see what differs" is --dry-run). --keep-going makes a
+                (its see-what-differs command is --dry-run). --keep-going makes a
                 workspace's refusal its own row (code, and errno for IO) and
                 exits 0 unless the run itself refuses. A planned workspace
                 under another planned checkout's rebuildable root (SPEC rule
-                5; a SwiftPM .build/checkouts clone) is a "rebuildable" row:
+                5; a SwiftPM .build/checkouts clone) is a rebuildable row:
                 no block is rendered into it
     estate-carry-files [--dry-run] [--beside SUFFIX] [--item ID]... [--bind ID=DEST_STATE]...
                 [--bind-only] [--recarry]

@@ -3570,12 +3570,13 @@ fn rebuildable_root(root: &Path, relative: &Path, name: &std::ffi::OsStr) -> Res
 /// Git's refusal to list the index.
 pub fn under_rebuildable_root(repo: &Path, rel: &[u8]) -> Result<bool> {
     use std::os::unix::ffi::OsStrExt as _;
-    let rel = Path::new(std::ffi::OsStr::from_bytes(rel));
-    let mut prefix = PathBuf::new();
-    let components: Vec<_> = rel.components().collect();
     // The nest itself is never its own rebuildable root: a directory
     // holding `.git` is a nest before it is a name (`streamed_omissions`).
-    for component in components.iter().take(components.len().saturating_sub(1)) {
+    let Some(parent) = Path::new(std::ffi::OsStr::from_bytes(rel)).parent() else {
+        return Ok(false);
+    };
+    let mut prefix = PathBuf::new();
+    for component in parent.components() {
         prefix.push(component);
         let name = component.as_os_str().as_bytes();
         if REBUILDABLE_DIRECTORIES
