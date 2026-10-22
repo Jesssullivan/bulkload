@@ -1816,8 +1816,10 @@ fn print_plan(rows: &[moving::Row], notes: &std::collections::BTreeMap<String, u
 /// top-up rounds).
 const JIT_ROUNDS: usize = 2;
 
-/// The name of the seat transfer that lands an item at `live`: its state is
-/// `MOVE_STATE/pull/<name>`, where the closure reads its held seats.
+/// The name of the seat transfer that lands an item at `live`.
+///
+/// Its state is `MOVE_STATE/pull/<name>`, where the closure reads its held
+/// seats.
 fn seat_transfer(live: &Path) -> String {
     format!(
         "item-{}",

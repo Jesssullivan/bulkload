@@ -3558,9 +3558,10 @@ fn rebuildable_root(root: &Path, relative: &Path, name: &std::ffi::OsStr) -> Res
     untracked(root, relative)
 }
 
-/// Whether the nest at `rel` (relative to `repo`'s worktree) lies under a
-/// rebuildable root the streamed capture of `repo` omits (SPEC rule 5): a
-/// directory on its way named in [`REBUILDABLE_DIRECTORIES`] or
+/// Whether the nest at `rel` lies under a rebuildable root (SPEC rule 5).
+///
+/// `rel` is relative to `repo`'s worktree. The root is one the streamed
+/// capture of `repo` omits: a directory on its way named in [`REBUILDABLE_DIRECTORIES`] or
 /// [`SPEC_REBUILDABLE_DIRECTORIES`] that Git tracks nothing under, as
 /// [`streamed_omissions`] decides it. Such a nest (a `SwiftPM` dependency
 /// checkout under `.build/checkouts/`, a Git dependency under

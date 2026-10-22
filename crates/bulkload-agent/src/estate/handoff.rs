@@ -79,10 +79,11 @@ pub struct HandoffOptions {
     pub keep_going: bool,
 }
 
-/// `estate-move`'s hand-off inputs under `MOVE_STATE`: its plan
-/// (`carry/plan.postcard`), its corpus path (`carry/corpus`) and its
-/// private state (`private`). `estate-handoff --move-state MOVE_STATE`
-/// reads them so (2026-10-22).
+/// `estate-move`'s hand-off inputs under `MOVE_STATE`.
+///
+/// Its plan (`carry/plan.postcard`), its corpus path (`carry/corpus`) and
+/// its private state (`private`), as `estate-handoff --move-state
+/// MOVE_STATE` reads them (2026-10-22).
 #[must_use]
 pub fn move_state_inputs(move_state: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let carry = move_state.join("carry");
@@ -93,10 +94,12 @@ pub fn move_state_inputs(move_state: &Path) -> (PathBuf, PathBuf, PathBuf) {
     )
 }
 
-/// The `MOVE_STATE` of a streamed pass (SPEC rule 2 reset, B1): PLAN,
-/// CORPUS and STATE are its [`move_state_inputs`] and no corpus exists
-/// (the pass keeps one snapshot per item in `carry/`, never a corpus).
-/// `None` for a corpus pass: its block names the corpus, as before.
+/// The `MOVE_STATE` of a streamed pass (SPEC rule 2 reset, B1).
+///
+/// PLAN, CORPUS and STATE are its [`move_state_inputs`] and no corpus
+/// exists (the pass keeps one snapshot per item in `carry/`, never a
+/// corpus). `None` for a corpus pass: its block names the corpus, as
+/// before.
 #[must_use]
 pub fn streamed_move_state(plan: &Path, corpus: &Path, state: &Path) -> Option<PathBuf> {
     let carry = fs::canonicalize(plan.parent()?).ok()?;
@@ -127,10 +130,17 @@ pub struct HandoffSummary {
     pub rebuildable: u64,
 }
 
-/// `path` canonical when it exists, else absolute: a block names every
-/// path absolutely, so its commands run from any directory.
+/// `path` canonical when it exists, else under its canonical parent.
+///
+/// A streamed pass's corpus, which never exists, is so spelled as its
+/// `--move-state` form spells it; anything else is absolute. A block names
+/// every path absolutely, so its commands run from any directory.
 fn canonical(path: &Path) -> PathBuf {
     fs::canonicalize(path)
+        .or_else(|error| match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => fs::canonicalize(parent).map(|parent| parent.join(name)),
+            _ => Err(error),
+        })
         .or_else(|_| std::path::absolute(path))
         .unwrap_or_else(|_| path.to_path_buf())
 }
@@ -451,11 +461,12 @@ pub fn handoff(
     first.map_or(Ok(summary), Err)
 }
 
-/// Whether `workspace` lies under a rebuildable root of the nearest other
-/// planned checkout that holds it (SPEC rule 5, 2026-10-22: a `SwiftPM`
-/// dependency clone under `.build/checkouts/`, planned by a pass from
-/// before the rule): it is rebuilt with that root, not a workspace, and a
-/// block is never written into it.
+/// Whether `workspace` lies under another planned checkout's rebuildable root.
+///
+/// SPEC rule 5, 2026-10-22: a `SwiftPM` dependency clone under
+/// `.build/checkouts/`, planned by a pass from before the rule, is rebuilt
+/// with that root, not a workspace, and a block is never written into it.
+/// The nearest planned checkout holding it decides.
 fn under_planned_rebuildable(workspace: &Path, checkouts: &[PathBuf]) -> bool {
     let Some(enclosing) = checkouts
         .iter()

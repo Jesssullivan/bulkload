@@ -324,10 +324,11 @@ enum Verb {
     Clear,
 }
 
-/// The commands a block gives, with every path absolute. A streamed pass
-/// has no corpus for `estate-diff` to read: its differences are this
-/// block's own, re-read by `--dry-run`, and every command names the move
-/// state (`--move-state`, 2026-10-22).
+/// The commands a block gives, with every path absolute.
+///
+/// A streamed pass has no corpus for `estate-diff` to read: its differences
+/// are this block's own, re-read by `--dry-run`, and every command names
+/// the move state (`--move-state`, 2026-10-22).
 fn command(inputs: &Inputs, verb: Verb) -> String {
     let exe = word(&inputs.build.exe);
     let (plan, corpus, state) = (
@@ -448,23 +449,20 @@ pub fn render(inputs: &Inputs, compact: bool) -> Vec<u8> {
     );
     // A streamed pass (2026-10-22) keeps one snapshot per item in its
     // move state and no corpus: the block names what exists.
-    let (holder, kind) = match &inputs.move_state {
-        Some(move_state) => {
-            use std::os::unix::ffi::OsStrExt as _;
-            let binding = std::path::Path::new(std::ffi::OsStr::from_bytes(move_state))
-                .file_name()
-                .map_or_else(String::new, |name| shown(name.as_bytes()));
-            let _ = writeln!(
-                out,
-                "| Move state | `{}` (binding `{binding}`; a streamed pass: one snapshot per item in `carry/`, no corpus) |",
-                shown(move_state)
-            );
-            ("the move state", "snapshot")
-        }
-        None => {
-            let _ = writeln!(out, "| Corpus | `{}` |", shown(&inputs.corpus));
-            ("the corpus", "capture")
-        }
+    let (holder, kind) = if let Some(move_state) = &inputs.move_state {
+        use std::os::unix::ffi::OsStrExt as _;
+        let binding = std::path::Path::new(std::ffi::OsStr::from_bytes(move_state))
+            .file_name()
+            .map_or_else(String::new, |name| shown(name.as_bytes()));
+        let _ = writeln!(
+            out,
+            "| Move state | `{}` (binding `{binding}`; a streamed pass: one snapshot per item in `carry/`, no corpus) |",
+            shown(move_state)
+        );
+        ("the move state", "snapshot")
+    } else {
+        let _ = writeln!(out, "| Corpus | `{}` |", shown(&inputs.corpus));
+        ("the corpus", "capture")
     };
     let _ = writeln!(out, "| State | `{}` |", shown(&inputs.state));
     let current = match inputs.current {

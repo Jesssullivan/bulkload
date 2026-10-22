@@ -469,9 +469,10 @@ pub struct Row {
     pub held_seats: Vec<HeldSeat>,
 }
 
-/// One seat a consolidating landing held (2026-10-22): its path under the
-/// item's live path, the typed refusal its transfer recorded, and why,
-/// when the transfer recorded a reason.
+/// One seat a consolidating landing held (2026-10-22).
+///
+/// Its path under the item's live path, the typed refusal its transfer
+/// recorded, and why, when the transfer recorded a reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeldSeat {
     pub path: Vec<u8>,

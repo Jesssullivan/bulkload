@@ -82,8 +82,9 @@ pub const RECORD_DIR: &str = "transfer.closure.d";
 /// A record's file extension.
 pub const RECORD_EXT: &str = "closure";
 
-/// The extension of a record's held-reasons sidecar (2026-10-22): each seat
-/// `--consolidate` held, with why, beside `<session item>.closure`.
+/// The extension of a record's held-reasons sidecar (2026-10-22).
+///
+/// Each seat `--consolidate` held, with why, beside `<session item>.closure`.
 pub const HELD_EXT: &str = "held";
 
 /// The largest held-reasons sidecar read: 16 MiB.
@@ -481,9 +482,10 @@ fn write_held(state: &Path, item: &str, held: &[(Vec<u8>, &'static str)]) -> Res
     crate::estate::write_bytes(&path, &bytes)
 }
 
-/// The held seats `DEST_STATE` recorded for the transfer `item`, by path,
-/// with why: empty when there is no sidecar or it does not decode (a
-/// reason is a note on a typed row, never the row).
+/// The held seats `DEST_STATE` recorded for the transfer `item`.
+///
+/// By path, with why: empty when there is no sidecar or it does not decode
+/// (a reason is a note on a typed row, never the row).
 #[must_use]
 pub fn held_reasons(state: &Path, item: &str) -> std::collections::BTreeMap<Vec<u8>, String> {
     let Ok(file) = std::fs::OpenOptions::new()

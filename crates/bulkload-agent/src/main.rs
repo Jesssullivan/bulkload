@@ -2195,14 +2195,9 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
                 .and_then(|arg| arg.to_str())
                 .ok_or(BulkloadRefusal::FieldDomainViolation)?;
             let mut output = std::io::stdout().lock();
-            let outcome = estate::handoff(
-                &plan,
-                &corpus,
-                &state,
-                source,
-                &options,
-                &mut |line| writeln!(output, "{line}").refuse_at("main::estate_command"),
-            );
+            let outcome = estate::handoff(&plan, &corpus, &state, source, &options, &mut |line| {
+                writeln!(output, "{line}").refuse_at("main::estate_command")
+            });
             output.flush().refuse_at("main::estate_command")?;
             outcome.map(drop)
         }
