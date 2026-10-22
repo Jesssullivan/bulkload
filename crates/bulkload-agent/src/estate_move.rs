@@ -2517,6 +2517,17 @@ fn pull_links(
         };
         match run.transfer_kind(kind, &source, &link.target, &pull) {
             Ok(()) | Err(BulkloadRefusal::SourceRootMissing) => {}
+            // A file link whose source path is absent (the one-file pull
+            // records it SOURCE_VANISHED): nothing to merge, as a missing
+            // directory source is; the target stays the live copy, and the
+            // record of the absent file is not kept (2026-10-21 ruling).
+            Err(_) if !link.dir && source_had_none(&run.state.join("pull").join(&pull)) => {
+                let _ = std::fs::remove_dir_all(run.state.join("pull").join(&pull));
+                out(&format!(
+                    "estate-move live-link home={name} rel={} source=absent (nothing to merge)",
+                    link.rel.display()
+                ))?;
+            }
             Err(refusal) => {
                 if result.is_ok() {
                     result = Err(refusal);
