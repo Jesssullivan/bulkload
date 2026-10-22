@@ -128,10 +128,9 @@ pub fn capture_source(
     if common.join("shallow").try_exists().refuse_at(SITE)? {
         return Err(BulkloadRefusal::GitHavesUnprovable);
     }
-    let alternates = common.join("objects/info/alternates");
-    if alternates.try_exists().refuse_at(SITE)? {
-        return Err(BulkloadRefusal::GitSourceAlternates(rel_bytes(&alternates)));
-    }
+    // A store that borrows objects through `objects/info/alternates` is
+    // carried whole: the fetch by id is served from the source's alternates
+    // too, so the live store holds every object itself (2026-10-22).
     let snapshot = stream::snapshot(source)?;
     let mut excluded = Vec::new();
     let mut host_files = Vec::new();
@@ -176,19 +175,12 @@ pub fn capture_source(
             host_files.push((b".git".to_vec(), read_file(&source.join(".git"))?));
         }
     }
-    if !include_rebuildable {
-        for omission in crate::git_carry::rebuildable_omissions(source)? {
-            excluded.push(omission.rel_path.clone());
-        }
-    }
-    for nest in crate::git_carry::nested_repositories(source)? {
-        excluded.push(nest.rel_path.clone());
-    }
-    // Registered worktrees nested in the checkout are their own items, never
-    // this one's seats (2026-10-21: tinyland.dev's `.worktrees/`).
-    for nest in crate::git_carry::nested_worktrees(source).unwrap_or_default() {
-        excluded.push(nest.rel_path.clone());
-    }
+    // Nests (each its own item) and rebuildable roots, by one plain walk:
+    // nothing about a nest refuses this item (2026-10-22).
+    let (nests, rebuildable) =
+        crate::git_carry::streamed_omissions(source, include_rebuildable)?;
+    excluded.extend(nests);
+    excluded.extend(rebuildable);
     for (rel, _) in &host_files {
         excluded.push(rel.clone());
     }

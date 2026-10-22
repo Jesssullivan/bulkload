@@ -3333,6 +3333,66 @@ struct Census {
 ///
 /// # Errors
 /// Refuses any Git or filesystem state capture itself refuses.
+/// What a streamed capture leaves out of an item's seats, by one plain walk.
+///
+/// A directory holding a `.git` entry of any kind (a nested repository, a
+/// registered or stale worktree, a submodule; valid or not) is its own item
+/// and is never entered; with `include_rebuildable` false, a rebuildable
+/// root is ledgered and not entered either. Nothing about a nest is judged
+/// here (its conversion attributes, its pointer, its index): that is its
+/// own item's capture (2026-10-22, the estate pass's
+/// `GIT_NEST_CONVERSION_ATTRIBUTE`, `GIT_NEST_POINTER_STALE`,
+/// `GIT_INVENTORY_INDEX_ABSENT` and `GIT_INVENTORY_MALFORMED` holds came
+/// from the census's nest and index checks). Symbolic links are never
+/// followed. Returns `(nests, rebuildable roots)`, relative, sorted.
+///
+/// # Errors
+/// IO reading a directory.
+pub fn streamed_omissions(
+    repo: &Path,
+    include_rebuildable: bool,
+) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
+    use std::os::unix::ffi::OsStrExt as _;
+    const SITE: &str = "git_carry::streamed_omissions";
+    let root = fs::canonicalize(repo).refuse_at(SITE)?;
+    let common = common_repository(&root).ok();
+    let (mut nests, mut omitted) = (Vec::new(), Vec::new());
+    let mut pending = vec![root.clone()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).refuse_at(SITE)? {
+            let entry = entry.refuse_at(SITE)?;
+            let path = entry.path();
+            if directory == root && entry.file_name() == ".git" {
+                continue;
+            }
+            if common.as_deref() == Some(path.as_path()) {
+                continue;
+            }
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !meta.is_dir() {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(&root)
+                .map_err(|_| BulkloadRefusal::PathEscapesRoot)?;
+            if fs::symlink_metadata(path.join(".git")).is_ok() {
+                nests.push(relative.as_os_str().as_bytes().to_vec());
+                continue;
+            }
+            if !include_rebuildable && rebuildable_root(&root, relative, &entry.file_name())? {
+                omitted.push(relative.as_os_str().as_bytes().to_vec());
+                continue;
+            }
+            pending.push(path);
+        }
+    }
+    nests.sort();
+    omitted.sort();
+    Ok((nests, omitted))
+}
+
 pub fn rebuildable_omissions(repo: &Path) -> Result<Vec<RebuildableOmission>> {
     let repo = fs::canonicalize(repo).refuse_at("git_carry::rebuildable_omissions")?;
     let common = common_repository(&repo)?;

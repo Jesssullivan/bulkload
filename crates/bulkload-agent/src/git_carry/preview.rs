@@ -110,8 +110,10 @@ pub struct FilesAnswer {
     /// holds the destination's HEAD, or they are equal).
     pub diff_known: bool,
     pub files: Vec<FileAnswer>,
-    /// The source's worktree could not be read.
-    pub unreadable: bool,
+    /// The source's worktree could not be read: the refusal's code and its
+    /// detail (the errno of an unreadable root, a Git child's stderr
+    /// class), 2026-10-22.
+    pub unreadable: Option<(String, String)>,
 }
 
 /// A negotiation request.
@@ -330,11 +332,16 @@ fn head(repo: &Path) -> Option<String> {
 }
 
 fn files_answer(ask: &FilesAsk) -> FilesAnswer {
-    let Ok(status) = status(&ask.worktree, true) else {
-        return FilesAnswer {
-            unreadable: true,
-            ..FilesAnswer::default()
-        };
+    let unreadable = |refusal: &BulkloadRefusal| FilesAnswer {
+        unreadable: Some((refusal.code().to_owned(), format!("{refusal:?}"))),
+        ..FilesAnswer::default()
+    };
+    if let Err(error) = fs::read_dir(&ask.worktree) {
+        return unreadable(&BulkloadRefusal::SourceRootUnreadable(error.raw_os_error()));
+    }
+    let status = match status(&ask.worktree, true) {
+        Ok(status) => status,
+        Err(refusal) => return unreadable(&refusal),
     };
     if !ask.bytes {
         return FilesAnswer {
@@ -392,7 +399,7 @@ fn files_answer(ask: &FilesAsk) -> FilesAnswer {
         status,
         diff_known,
         files,
-        unreadable: false,
+        unreadable: None,
     }
 }
 
