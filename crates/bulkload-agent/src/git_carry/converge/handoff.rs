@@ -66,9 +66,17 @@ pub const HANDOFF_INTENT: &str = "handoff.intent";
 /// `workspace.landed`. It outlives `handoff.landed`: converge needs it
 /// while the landed blob stands.
 pub const HANDOFF_STRIPPED: &str = "handoff.stripped";
-/// The targets, at the worktree root: Codex reads `AGENTS.md`, Claude
-/// `CLAUDE.md`.
-pub const TARGETS: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
+/// The target, at the worktree root: Claude Code's per-checkout memory,
+/// untracked and excluded through the repository's shared `info/exclude`
+/// (SPEC rules 7 and 8, 2026-10-21: the hand-off never modifies a tracked
+/// file). Codex gets no file; its hand-off is the ledger and the closure.
+pub const TARGETS: [&str; 1] = [LOCAL];
+/// The hand-off's file, created holding the block alone.
+pub const LOCAL: &str = "CLAUDE.local.md";
+/// The tracked files earlier passes wrote the block into: never written
+/// now; a block a recorded hand-off left there is cleared (restored byte
+/// for byte) before the next render.
+pub const LEGACY: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
 /// The opt-in target (`--readme`), never created.
 pub const README: &str = "README.md";
 /// Codex reads `AGENTS.override.md` instead of `AGENTS.md` in a directory
@@ -77,7 +85,7 @@ pub const README: &str = "README.md";
 pub const OVERRIDE: &str = "AGENTS.override.md";
 /// The name every hand-off temporary starts with, beside its target.
 const TEMP_PREFIX: &str = ".bulkload-handoff-";
-const ALL_NAMES: [&str; 4] = ["AGENTS.md", "CLAUDE.md", OVERRIDE, README];
+const ALL_NAMES: [&str; 5] = ["AGENTS.md", "CLAUDE.md", OVERRIDE, README, LOCAL];
 const LANDED_MAGIC: &[u8; 16] = b"bulkload-hoff-v1";
 const INTENT_MAGIC: &[u8; 16] = b"bulkload-hoffi-1";
 const STRIPPED_MAGIC: &[u8; 16] = b"bulkload-hofs-v1";
@@ -535,13 +543,63 @@ fn names_for(
     let recorded = |name: &str| {
         record.is_some_and(|record| record.files.iter().any(|file| file.path == name.as_bytes()))
     };
-    if lstat(&worktree.join(OVERRIDE))?.is_some() || recorded(OVERRIDE) {
+    // The override and README are written only where a recorded hand-off
+    // already names them (they are cleared before a new render); a new
+    // render writes the local file alone.
+    if recorded(OVERRIDE) {
         names.push(OVERRIDE);
     }
     if readme || recorded(README) {
         names.push(README);
     }
     Ok(names)
+}
+
+/// Whether the hand-off record in `dir` names a file other than the local
+/// one (a block an earlier pass wrote into a tracked file).
+fn legacy_recorded(dir: &Path) -> Result<bool> {
+    Ok(landed::read::<HandoffLanded>(&dir.join(HANDOFF_LANDED))?.is_some_and(|record| {
+        record
+            .files
+            .iter()
+            .any(|file| file.path != LOCAL.as_bytes())
+    }))
+}
+
+/// Add [`LOCAL`] to the repository's shared `info/exclude` (in its common
+/// directory) when no line there names it, appended and synced: Git never
+/// shows the hand-off's file.
+fn exclude_local(common: &Path) -> Result<()> {
+    const SITE: &str = "git_carry::converge::handoff::exclude_local";
+    let info = common.join("info");
+    let path = info.join("exclude");
+    let held = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(crate::refuse::io(&error, SITE)),
+    };
+    let line = format!("/{LOCAL}");
+    if held
+        .split(|byte| *byte == b'\n')
+        .any(|entry| entry == line.as_bytes() || entry == LOCAL.as_bytes())
+    {
+        return Ok(());
+    }
+    fs::create_dir_all(&info).refuse_at(SITE)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .refuse_at(SITE)?;
+    let mut entry = Vec::new();
+    if !held.is_empty() && !held.ends_with(b"\n") {
+        entry.push(b'\n');
+    }
+    entry.extend_from_slice(b"# bulkload hand-off (never tracked)\n");
+    entry.extend_from_slice(line.as_bytes());
+    entry.push(b'\n');
+    file.write_all(&entry).refuse_at(SITE)?;
+    file.sync_all().refuse_at(SITE)
 }
 
 /// A target bulkload never creates.
@@ -2235,6 +2293,13 @@ pub fn run(
             let _lock = if request.mode == Mode::Render {
                 let lock = landed::lock(&place.common, estate.source)?;
                 let settled = settle(workspace.worktree, &place.dir, estate.source, &ours)?;
+                // A block an earlier pass wrote into a tracked file (or the
+                // override, or a README) is cleared first: the recorded
+                // clear restores those bytes exactly and ledgers it.
+                if legacy_recorded(&place.dir)? {
+                    clear(workspace.worktree, &place.dir, estate.source, &ours, false)?;
+                }
+                exclude_local(&place.common)?;
                 // The H step re-renders a record; it never starts one, and
                 // never undoes a clear it just finished.
                 if request.h_step
