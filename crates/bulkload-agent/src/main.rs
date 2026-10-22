@@ -3510,8 +3510,32 @@ fn report_counters(verb: &str, started: std::time::Instant, priority: Priority) 
     }
 }
 
+/// The git item whose seats a transfer is landing (`estate-move`): its
+/// ` item=ID live="PATH"`, appended to every held and refused seat line so
+/// a held seat maps to its lane (2026-10-22). None outside an item.
+static SEAT_ITEM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Name `item` (its id and live path) on the seat lines of the transfers
+/// that follow, until [`seat_item`] with `None`.
+#[allow(clippy::unnecessary_debug_formatting)] // Paths print escaped and quoted.
+fn seat_item(item: Option<(&str, &Path)>) {
+    *SEAT_ITEM
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        item.map(|(id, live)| format!(" item={id} live={live:?}"));
+}
+
+fn seat_item_suffix() -> String {
+    SEAT_ITEM
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .unwrap_or_default()
+}
+
 #[allow(clippy::too_many_lines)] // One line per field, then one per path.
 fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()> {
+    let item = seat_item_suffix();
     println!(
         "completed={} reused={} bytes_received={} source_bytes_read={} refusals={} \
          source_engine_temporaries={} capped_subtrees={} sqlite_mode={} sqlite_snapshots={} \
@@ -3536,7 +3560,7 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
     }
     for (path, reason) in &stats.held {
         eprintln!(
-            "held {}: HOMES_CONSOLIDATE_UNSUPPORTED reason=\"{reason}\"",
+            "held {}: HOMES_CONSOLIDATE_UNSUPPORTED reason=\"{reason}\"{item}",
             path.escape_ascii()
         );
     }
@@ -3577,8 +3601,11 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
         // S4 (TIN-6592): an IO raised here prints its errno, as its record
         // keeps it.
         match stats.refusal_errnos.get(path) {
-            Some(errno) => eprintln!("refused {}: {code} (errno {errno})", path.escape_ascii()),
-            None => eprintln!("refused {}: {code}", path.escape_ascii()),
+            Some(errno) => eprintln!(
+                "refused {}: {code} (errno {errno}){item}",
+                path.escape_ascii()
+            ),
+            None => eprintln!("refused {}: {code}{item}", path.escape_ascii()),
         }
         if let Some(disposition) = stats.default_disposition(path, code) {
             eprintln!(
