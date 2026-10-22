@@ -2094,9 +2094,9 @@ fn archive_links_follow_a106_and_destination_links_stay() {
         assert_eq!(fs::read(dst_codex.join(rel)).unwrap(), archived);
     }
     assert!(
-        !moved.stderr.contains(&format!(
-            "held {same_rel}: HOMES_CONSOLIDATE_UNSUPPORTED"
-        )),
+        !moved
+            .stderr
+            .contains(&format!("held {same_rel}: HOMES_CONSOLIDATE_UNSUPPORTED")),
         "{}",
         moved.stderr
     );

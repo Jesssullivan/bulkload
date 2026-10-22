@@ -8209,6 +8209,25 @@ impl<W: Write> Inbound<'_, W> {
         Ok(())
     }
 
+    /// `--consolidate`: a live link to exactly the seat's bytes
+    /// ([`linked_equal`]) is covered, nothing written (or, planning,
+    /// reported covered).
+    fn linked_covered(
+        &mut self,
+        row: &RowSchema,
+        key: &[u8],
+        racy: bool,
+        plan: bool,
+    ) -> Result<()> {
+        if plan {
+            let class = crate::consolidate::Class::of(&row.rel_path, false);
+            self.plan_seat(row, class.word(), "covered", Some(row.size), None);
+            self.answered_now = Some(false);
+            return Ok(());
+        }
+        self.covered(row, key, racy)
+    }
+
     /// `--consolidate`: an append log, staged in the live file's directory
     /// (`staged`, never wholly in memory), merged into the live file by
     /// streaming ([`crate::consolidate::append_log::union_stream`], or
@@ -8470,12 +8489,7 @@ impl<W: Write> Inbound<'_, W> {
             }
             Err(_) if linked_equal(self.target.path(), &row.rel_path, manifest)? => {
                 drop_staged(staged);
-                if settings.plan_only {
-                    self.plan_seat(row, class.word(), "covered", Some(row.size), None);
-                    self.answered_now = Some(false);
-                    return Ok(());
-                }
-                return self.covered(row, &key, racy);
+                return self.linked_covered(row, &key, racy, settings.plan_only);
             }
             Err(_)
                 if archive_target(self.target.path(), &row.rel_path, &settings.archived)
