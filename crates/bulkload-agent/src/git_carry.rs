@@ -3340,6 +3340,66 @@ pub fn rebuildable_omissions(repo: &Path) -> Result<Vec<RebuildableOmission>> {
     measure_omissions(&repo, &census.omitted)
 }
 
+/// A streamed capture's omissions: the nests, then the rebuildable roots.
+pub type Omissions = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+/// What a streamed capture leaves out of an item's seats, by one plain walk.
+///
+/// A directory holding a `.git` entry of any kind (a nested repository, a
+/// registered or stale worktree, a submodule; valid or not) is its own item
+/// and is never entered; with `include_rebuildable` false, a rebuildable
+/// root is ledgered and not entered either. Nothing about a nest is judged
+/// here (its conversion attributes, its pointer, its index): that is its
+/// own item's capture (2026-10-22, the estate pass's
+/// `GIT_NEST_CONVERSION_ATTRIBUTE`, `GIT_NEST_POINTER_STALE`,
+/// `GIT_INVENTORY_INDEX_ABSENT` and `GIT_INVENTORY_MALFORMED` holds came
+/// from the census's nest and index checks). Symbolic links are never
+/// followed. Returns `(nests, rebuildable roots)`, relative, sorted.
+///
+/// # Errors
+/// IO reading a directory.
+pub fn streamed_omissions(repo: &Path, include_rebuildable: bool) -> Result<Omissions> {
+    use std::os::unix::ffi::OsStrExt as _;
+    const SITE: &str = "git_carry::streamed_omissions";
+    let root = fs::canonicalize(repo).refuse_at(SITE)?;
+    let common = common_repository(&root).ok();
+    let (mut nests, mut omitted) = (Vec::new(), Vec::new());
+    let mut pending = vec![root.clone()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).refuse_at(SITE)? {
+            let entry = entry.refuse_at(SITE)?;
+            let path = entry.path();
+            if directory == root && entry.file_name() == ".git" {
+                continue;
+            }
+            if common.as_deref() == Some(path.as_path()) {
+                continue;
+            }
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !meta.is_dir() {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(&root)
+                .map_err(|_| BulkloadRefusal::PathEscapesRoot)?;
+            if fs::symlink_metadata(path.join(".git")).is_ok() {
+                nests.push(relative.as_os_str().as_bytes().to_vec());
+                continue;
+            }
+            if !include_rebuildable && rebuildable_root(&root, relative, &entry.file_name())? {
+                omitted.push(relative.as_os_str().as_bytes().to_vec());
+                continue;
+            }
+            pending.push(path);
+        }
+    }
+    nests.sort();
+    omitted.sort();
+    Ok((nests, omitted))
+}
+
 // Apparent size and seat count below one omitted root. A vanished entry is
 // rebuildable churn, not a fault: skip it rather than refuse the capture.
 fn measure_omissions(root: &Path, omitted: &[Vec<u8>]) -> Result<Vec<RebuildableOmission>> {
@@ -10973,6 +11033,36 @@ mod tests {
         )
         .unwrap();
         seats.into_iter().map(|row| row.rel_path).collect()
+    }
+
+    // 2026-10-22: the streamed capture finds nests by a plain walk and judges
+    // none of them (their own items do).
+    #[test]
+    fn nests_are_found_by_a_plain_walk_and_never_judged() {
+        let root =
+            std::env::temp_dir().join(format!("bulkload-streamed-omit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q", "--template="])
+            .arg(&repo)
+            .status()
+            .unwrap()
+            .success());
+        // A stale pointer, a nested repository, a rebuildable root, a link.
+        fs::create_dir_all(repo.join("stale")).unwrap();
+        fs::write(repo.join("stale/.git"), "gitdir: /nowhere\n").unwrap();
+        fs::create_dir_all(repo.join("vendor/nested/.git")).unwrap();
+        fs::create_dir_all(repo.join("node_modules/x")).unwrap();
+        fs::create_dir_all(repo.join("src/deep")).unwrap();
+        std::os::unix::fs::symlink(repo.join("vendor"), repo.join("link")).unwrap();
+        let (nests, rebuildable) = streamed_omissions(&repo, false).unwrap();
+        assert_eq!(nests, vec![b"stale".to_vec(), b"vendor/nested".to_vec()]);
+        assert_eq!(rebuildable, vec![b"node_modules".to_vec()]);
+        let (_, kept) = streamed_omissions(&repo, true).unwrap();
+        assert!(kept.is_empty());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     // The measured failure this change exists for: a capture of a repository

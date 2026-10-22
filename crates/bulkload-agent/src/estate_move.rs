@@ -331,8 +331,9 @@ fn source_pass(
                 ))?,
                 Err(refusal) => {
                     out(&format!(
-                        "estate-move-source item={identity} outcome=refused code={} source={:?}",
+                        "estate-move-source item={identity} outcome=refused code={} detail={:?} source={:?}",
                         refusal.code(),
+                        format!("{refusal:?}"),
                         item.source,
                     ))?;
                     refusals
@@ -1762,6 +1763,8 @@ fn remap_item(
 struct B2 {
     action: &'static str,
     code: Option<String>,
+    /// The hold's detail (an errno, a Git child's stderr class).
+    detail: Option<String>,
     refs: std::collections::BTreeMap<&'static str, u64>,
     status: std::collections::BTreeMap<&'static str, u64>,
     verdicts: std::collections::BTreeMap<&'static str, u64>,
@@ -2091,13 +2094,10 @@ fn preview(
             continue;
         };
         let place = row.item.workspace.as_ref().unwrap_or(&row.item.repository);
-        if answer.unreadable {
+        if let Some((code, detail)) = &answer.unreadable {
             decision.action = "held";
-            decision.code = Some(
-                BulkloadRefusal::SourceRootUnreadable(None)
-                    .code()
-                    .to_owned(),
-            );
+            decision.code = Some(code.clone());
+            decision.detail = Some(detail.clone());
             continue;
         }
         decision.tree_known = answer.diff_known;
@@ -2173,13 +2173,17 @@ fn preview(
         let count =
             |map: &BTreeMap<&'static str, u64>, key: &str| map.get(key).copied().unwrap_or(0);
         out(&format!(
-            "estate-move item={} action={}{} reason={} presence={} refs_created={} refs_forwarded={} refs_switched={} refs_tracked={} refs_kept={} refs_same={} changed={} untracked={} ignored={} land={} merges={} conflicts={} same={} unknown={} tree={} worktree={} asides={} parents={} under_home={} source={:?} live={place:?}",
+            "estate-move item={} action={}{}{} reason={} presence={} refs_created={} refs_forwarded={} refs_switched={} refs_tracked={} refs_kept={} refs_same={} changed={} untracked={} ignored={} land={} merges={} conflicts={} same={} unknown={} tree={} worktree={} asides={} parents={} under_home={} source={:?} live={place:?}",
             row.id,
             decision.action,
             decision
                 .code
                 .as_ref()
                 .map_or_else(String::new, |code| format!(" code={code}")),
+            decision
+                .detail
+                .as_ref()
+                .map_or_else(String::new, |detail| format!(" detail={detail:?}")),
             row.decision.reason,
             row.decision.presence.word(),
             count(&decision.refs, "created"),
