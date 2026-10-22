@@ -314,7 +314,7 @@ pub struct Landed {
     pub missing_at_source: u64,
     /// Ids the live administration already named, and its store lacked,
     /// before this landing: the destination's own, never the source's
-    /// drift, counted and never fetched ([`own_lacking`]).
+    /// drift, counted and never refused for ([`own_lacking`]).
     pub dest_lacking_own: u64,
     /// What the index settle did.
     pub index: &'static str,
@@ -500,7 +500,7 @@ pub struct Converged {
     /// record): the item is not consolidated whole.
     pub seats_held: bool,
     /// Ids the live repository already named, and its store lacked, before
-    /// this consolidation ([`own_lacking`]): counted, never fetched.
+    /// this consolidation ([`own_lacking`]): counted, never refused for.
     pub dest_lacking_own: u64,
     /// The destination's checkout was switched to the source's branch.
     pub switched_to: Option<String>,
@@ -619,8 +619,8 @@ pub fn converge(
 /// landing writes anything.
 ///
 /// The destination's own state (an `AUTO_MERGE` tree a gc pruned, a reflog
-/// entry of its own), never the source's drift: a top-up neither wants them
-/// (the source never held them) nor refuses for them. None when `live`
+/// entry of its own), never the source's drift: a top-up fetches them when
+/// the source holds them and never refuses for them. None when `live`
 /// holds no repository Git can read yet (a fresh landing whose fetch made
 /// only `.git/objects`): the stricter reading, every lacking id the
 /// landing's own.
@@ -640,8 +640,8 @@ pub fn own_lacking(live: &Path) -> Result<std::collections::BTreeSet<String>> {
 pub const TOP_UPS: usize = 3;
 
 /// Fetch, by id from the live source, every object the live repository's
-/// administration names and its store lacks, except `own`: what it lacked
-/// before the landing ([`own_lacking`]), the destination's own.
+/// administration names and its store lacks. `own` (what it lacked before
+/// the landing, [`own_lacking`]) is tried after, best effort, never required.
 ///
 /// At most [`TOP_UPS`] rounds: a source that moved after its snapshot (an
 /// agent committing under the pass) lands as it is now. Returns the ids
