@@ -3090,12 +3090,13 @@ pub const REBUILDABLE_DIRECTORIES: &[&str] = &[
     ".parcel-cache",
     ".swc",
     ".terraform",
-    // SPEC rule 5 names these (2026-10-22: the estate pass held 2293 files
-    // under `build/` and 686 under `.svelte-kit/` as differing seats).
-    "build",
-    "dist",
-    ".svelte-kit",
 ];
+
+/// The rebuildable roots SPEC rule 5 adds for the streamed capture of an
+/// estate move (2026-10-22: the estate pass held 2293 files under `build/`
+/// and 686 under `.svelte-kit/` as differing seats). The legacy capture
+/// keeps [`REBUILDABLE_DIRECTORIES`] alone, so its capture keys never move.
+pub const SPEC_REBUILDABLE_DIRECTORIES: &[&str] = &["build", "dist", ".svelte-kit"];
 
 /// The prefix of Bazel's convenience links at a workspace root
 /// (`bazel-bin`, `bazel-out`, `bazel-<workspace>`): rebuildable, never
@@ -3409,7 +3410,14 @@ pub fn streamed_omissions(repo: &Path, include_rebuildable: bool) -> Result<Omis
                 nests.push(relative.as_os_str().as_bytes().to_vec());
                 continue;
             }
-            if !include_rebuildable && rebuildable_root(&root, relative, &entry.file_name())? {
+            let name = entry.file_name();
+            if !include_rebuildable
+                && (rebuildable_root(&root, relative, &name)?
+                    || (SPEC_REBUILDABLE_DIRECTORIES
+                        .iter()
+                        .any(|candidate| name.as_bytes() == candidate.as_bytes())
+                        && untracked(&root, relative)?))
+            {
                 omitted.push(relative.as_os_str().as_bytes().to_vec());
                 continue;
             }

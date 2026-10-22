@@ -228,13 +228,18 @@ pub fn snapshot(repo: &Path) -> Result<Snapshot> {
 // operation file reaches (`fsck --unreachable`, connectivity only: commits
 // and trees are read, blobs are not).
 fn unreachable(repo: &Path) -> Result<u64> {
-    let listed = output(git(repo).args([
+    // A count for the closure, never a reason to refuse: a store whose
+    // reflog names an object a gc pruned fails `fsck`, and is still carried
+    // (its missing ids are counted apart, 2026-10-22).
+    let Ok(listed) = output(git(repo).args([
         "fsck",
         "--unreachable",
         "--connectivity-only",
         "--no-progress",
         "--no-dangling",
-    ]))?;
+    ])) else {
+        return Ok(0);
+    };
     u64::try_from(
         listed
             .split(|byte| *byte == b'\n')
