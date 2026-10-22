@@ -144,14 +144,6 @@ pub fn derive(options: &Options) -> Result<KeyMaps> {
     }
     sources.sort();
     sources.dedup();
-    // The lane roots a pruned lane's key is derived under
-    // ([`pruned_lane_maps`]): the run's --map sources and the git root.
-    let mut roots: Vec<PathBuf> = options
-        .maps
-        .iter()
-        .map(|(source, _)| source.clone())
-        .collect();
-    roots.push(source_git.clone());
     // Source key → (lane source, its destination key or none).
     let mut by_key: BTreeMap<String, Vec<(PathBuf, Option<String>)>> = BTreeMap::new();
     for source in sources {
@@ -206,7 +198,7 @@ pub fn derive(options: &Options) -> Result<KeyMaps> {
             }
         }
     }
-    let pruned = pruned_lane_maps(options, &lanes, &roots, &known, (&candidates, &native));
+    let pruned = pruned_lane_maps(options, &lanes, &known, (&candidates, &native));
     candidates.extend(pruned);
     // A destination key two keys would land at (two maps, or a map and a
     // key that lands as it is) holds every map to it; a held key then lands
@@ -257,17 +249,21 @@ pub fn derive(options: &Options) -> Result<KeyMaps> {
 fn pruned_lane_maps(
     options: &Options,
     lanes: &Lanes,
-    roots: &[PathBuf],
     known: &BTreeSet<String>,
     (candidates, native): (&[KeyMap], &[String]),
 ) -> Vec<KeyMap> {
     use std::os::unix::ffi::OsStrExt as _;
+    // The lane roots: the run's --map sources and the git root, each as
     // (source root key, destination root key, source root).
-    let pairs: Vec<(String, String, PathBuf)> = roots
+    let roots = options
+        .maps
         .iter()
+        .map(|(source, _)| source.clone())
+        .chain(std::iter::once(options.source_home.join("git")));
+    let pairs: Vec<(String, String, PathBuf)> = roots
         .filter_map(|root| {
-            let lane = lanes.lane(root).ok()??;
-            Some((key::project_key(root.to_str()?), lane.key, root.clone()))
+            let lane = lanes.lane(&root).ok()??;
+            Some((key::project_key(root.to_str()?), lane.key, root))
         })
         .collect();
     let taken: BTreeSet<&str> = candidates
