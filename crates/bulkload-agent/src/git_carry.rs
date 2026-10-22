@@ -3358,10 +3358,7 @@ pub type Omissions = (Vec<Vec<u8>>, Vec<Vec<u8>>);
 ///
 /// # Errors
 /// IO reading a directory.
-pub fn streamed_omissions(
-    repo: &Path,
-    include_rebuildable: bool,
-) -> Result<Omissions> {
+pub fn streamed_omissions(repo: &Path, include_rebuildable: bool) -> Result<Omissions> {
     use std::os::unix::ffi::OsStrExt as _;
     const SITE: &str = "git_carry::streamed_omissions";
     let root = fs::canonicalize(repo).refuse_at(SITE)?;
@@ -3402,7 +3399,6 @@ pub fn streamed_omissions(
     omitted.sort();
     Ok((nests, omitted))
 }
-
 
 // Apparent size and seat count below one omitted root. A vanished entry is
 // rebuildable churn, not a fault: skip it rather than refuse the capture.

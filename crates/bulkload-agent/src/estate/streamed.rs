@@ -177,8 +177,7 @@ pub fn capture_source(
     }
     // Nests (each its own item) and rebuildable roots, by one plain walk:
     // nothing about a nest refuses this item (2026-10-22).
-    let (nests, rebuildable) =
-        crate::git_carry::streamed_omissions(source, include_rebuildable)?;
+    let (nests, rebuildable) = crate::git_carry::streamed_omissions(source, include_rebuildable)?;
     excluded.extend(nests);
     excluded.extend(rebuildable);
     for (rel, _) in &host_files {

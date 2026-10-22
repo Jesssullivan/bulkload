@@ -3983,7 +3983,14 @@ fn alternates_are_carried_and_nests_never_refuse_the_parent() {
     let src = world.src();
     git(
         &src,
-        &["clone", "--quiet", "--shared", "--template=", "other", "alt"],
+        &[
+            "clone",
+            "--quiet",
+            "--shared",
+            "--template=",
+            "other",
+            "alt",
+        ],
     );
     assert!(src.join("alt/.git/objects/info/alternates").is_file());
     let land = src.join("land");
@@ -4013,5 +4020,8 @@ fn alternates_are_carried_and_nests_never_refuse_the_parent() {
     );
     assert!(!alt.join(".git/objects/info/alternates").exists(), "{both}");
     assert_eq!(out(&alt, &["cat-file", "-t", "HEAD"]).trim(), "commit");
-    assert_eq!(out(&alt, &["fsck", "--connectivity-only", "--no-progress"]), "");
+    assert_eq!(
+        out(&alt, &["fsck", "--connectivity-only", "--no-progress"]),
+        ""
+    );
 }
