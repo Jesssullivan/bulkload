@@ -3508,7 +3508,9 @@ fn a_path_outside_the_maps_lands_under_the_destination_home() {
     // The hand-off reads the placed path, never the plan's source path.
     assert!(!moved.stdout.contains("HANDOFF_NOT_LANDED"), "{both}");
     assert!(
-        moved.stdout.contains("estate-move phase=hand-off outcome=ok"),
+        moved
+            .stdout
+            .contains("estate-move phase=hand-off outcome=ok"),
         "{both}"
     );
     for level in [dst_home.join(".cache"), dst_home.join(".cache/lanes")] {
@@ -3666,7 +3668,14 @@ fn nested_worktrees_are_never_the_mains_seats() {
     let (source, live) = related_pair(&world, "p");
     git(
         &source,
-        &["worktree", "add", "--quiet", "-b", "side", ".worktrees/side"],
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "side",
+            ".worktrees/side",
+        ],
     );
     fs::write(source.join(".worktrees/side/u.txt"), "neo's untracked\n").unwrap();
     fs::create_dir_all(live.join(".worktrees/side")).unwrap();
@@ -3677,7 +3686,10 @@ fn nested_worktrees_are_never_the_mains_seats() {
     let main = receipt_words(&moved.stdout, &live);
     assert_eq!(main["seats_held"], "false", "{both}");
     assert!(
-        !moved.stderr.lines().any(|line| line.starts_with("held .worktrees/")),
+        !moved
+            .stderr
+            .lines()
+            .any(|line| line.starts_with("held .worktrees/")),
         "{both}"
     );
     assert_eq!(
@@ -3707,7 +3719,10 @@ fn a_file_both_sides_added_is_adopted_unioned_or_held() {
     let main = receipt_words(&moved.stdout, &live);
     assert_eq!(main["seats_held"], "false", "{both}");
     let config = fs::read_to_string(live.join("settings.json")).unwrap();
-    assert!(config.contains("neo") && config.contains("sting"), "{config}\n{both}");
+    assert!(
+        config.contains("neo") && config.contains("sting"),
+        "{config}\n{both}"
+    );
     assert_eq!(
         fs::read_to_string(live.join("notes.jsonl")).unwrap(),
         "{\"n\":1}\n{\"n\":2}\n"
@@ -3735,13 +3750,29 @@ fn an_object_named_after_the_snapshot_is_fetched_in_the_same_pass() {
     let world = World::new("drift");
     let (source, live) = related_pair(&world, "p");
     assert!(world.source().ok);
-    git(&source, &["commit", "--quiet", "--allow-empty", "-m", "after the snapshot"]);
+    git(
+        &source,
+        &[
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "after the snapshot",
+        ],
+    );
     let later = out(&source, &["rev-parse", "HEAD"]);
-    fs::write(live.join(".git/refs/heads/later"), format!("{}\n", later.trim())).unwrap();
+    fs::write(
+        live.join(".git/refs/heads/later"),
+        format!("{}\n", later.trim()),
+    )
+    .unwrap();
     let moved = world.moved();
     let both = format!("{}\n{}", moved.stdout, moved.stderr);
     let main = receipt_words(&moved.stdout, &live);
     assert_eq!(main["outcome"], "workspace-restored", "{both}");
     assert!(!moved.stdout.contains("CAPTURE_DRIFTED"), "{both}");
-    assert_eq!(out(&live, &["cat-file", "-t", later.trim()]).trim(), "commit");
+    assert_eq!(
+        out(&live, &["cat-file", "-t", later.trim()]).trim(),
+        "commit"
+    );
 }

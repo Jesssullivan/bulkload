@@ -601,9 +601,7 @@ pub fn converge(
         snapshot,
         &live,
         reach.upload_pack,
-        &reach
-            .scratch
-            .join(format!("{}.top-up.objects", id(item)?)),
+        &reach.scratch.join(format!("{}.top-up.objects", id(item)?)),
     )?;
     done.object_bytes = done.object_bytes.saturating_add(bytes);
     let objects = stream::objects_dir(&live)?;

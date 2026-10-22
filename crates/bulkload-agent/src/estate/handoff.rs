@@ -308,12 +308,10 @@ pub fn handoff(
         let Some(planned_at) = item.workspace.as_deref() else {
             continue;
         };
-        let placed = options.places.iter().find_map(|(from, to)| {
-            planned_at
-                .strip_prefix(from)
-                .ok()
-                .map(|rest| to.join(rest))
-        });
+        let placed = options
+            .places
+            .iter()
+            .find_map(|(from, to)| planned_at.strip_prefix(from).ok().map(|rest| to.join(rest)));
         let workspace = placed.as_deref().unwrap_or(planned_at);
         let identity = id(item)?;
         if seen.contains(&identity) {
