@@ -66,15 +66,17 @@ pub const HANDOFF_INTENT: &str = "handoff.intent";
 /// `workspace.landed`. It outlives `handoff.landed`: converge needs it
 /// while the landed blob stands.
 pub const HANDOFF_STRIPPED: &str = "handoff.stripped";
-/// The target, at the worktree root: Claude Code's per-checkout memory,
-/// untracked and excluded through the repository's shared `info/exclude`
+/// The target at the worktree root: Claude Code's per-checkout memory.
+///
+/// Untracked and excluded through the repository's shared `info/exclude`
 /// (SPEC rules 7 and 8, 2026-10-21: the hand-off never modifies a tracked
 /// file). Codex gets no file; its hand-off is the ledger and the closure.
 pub const TARGETS: [&str; 1] = [LOCAL];
 
-/// The variable a debug build's machinery tests set to run the hand-off
-/// over the legacy tracked targets ([`LEGACY`]), the prefix machinery's
-/// fixtures. A release build never reads it: a deployed agent writes the
+/// The variable that selects the legacy tracked targets in a debug build.
+///
+/// The prefix machinery's fixtures set it to run the hand-off over
+/// [`LEGACY`]. A release build never reads it: a deployed agent writes the
 /// local file alone.
 pub const TRACKED_TARGETS_ENV: &str = "BULKLOAD_HANDOFF_TRACKED_TARGETS";
 
@@ -571,6 +573,18 @@ fn names_for(
         names.push(README);
     }
     Ok(names)
+}
+
+/// Whether `worktree` holds a recorded hand-off block in a file other than
+/// the local one (an earlier pass's, in a tracked file): what
+/// `estate-handoff --clear --legacy-only` clears. `false` for anything it
+/// cannot read (an absent workspace, no record).
+#[must_use]
+pub fn has_legacy_block(worktree: &Path, source: &str) -> bool {
+    place(worktree, source)
+        .ok()
+        .and_then(|place| legacy_recorded(&place.dir).ok())
+        .unwrap_or(false)
 }
 
 /// Whether the hand-off record in `dir` names a file other than the local

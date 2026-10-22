@@ -64,6 +64,10 @@ pub struct HandoffOptions {
     /// map, 2026-10-21): the block goes to the placed path, never the plan's
     /// raw source path.
     pub places: Vec<(PathBuf, PathBuf)>,
+    /// `--legacy-only` (with `--clear`): only the workspaces whose recorded
+    /// block an earlier pass wrote into a tracked file; any other is
+    /// skipped (2026-10-21).
+    pub legacy_only: bool,
 }
 
 /// The counts of one run.
@@ -97,6 +101,7 @@ fn hex(bytes: &[u8]) -> String {
 fn validate(options: &HandoffOptions, source: &str) -> Result<()> {
     if (options.renew && matches!(options.mode, HandoffMode::Check | HandoffMode::Clear))
         || (options.clear_carried && options.mode != HandoffMode::Clear)
+        || (options.legacy_only && options.mode != HandoffMode::Clear)
         || !filename(source)
     {
         return Err(BulkloadRefusal::FieldDomainViolation);
@@ -313,6 +318,11 @@ pub fn handoff(
             .iter()
             .find_map(|(from, to)| planned_at.strip_prefix(from).ok().map(|rest| to.join(rest)));
         let workspace = placed.as_deref().unwrap_or(planned_at);
+        if options.legacy_only
+            && !crate::git_carry::converge::handoff::has_legacy_block(workspace, source)
+        {
+            continue;
+        }
         let identity = id(item)?;
         if seen.contains(&identity) {
             continue;

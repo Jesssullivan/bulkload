@@ -2577,6 +2577,7 @@ fn handoff_options(
             "--renew" => flag(&mut options.renew)?,
             "--readme" => flag(&mut options.readme)?,
             "--clear-carried" => flag(&mut options.clear_carried)?,
+            "--legacy-only" => flag(&mut options.legacy_only)?,
             "--item" => {
                 options.items.push(
                     value(at + 1)?

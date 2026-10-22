@@ -1082,6 +1082,27 @@ fn move_pass(run: &Move) -> Result<()> {
     // engine into the live path. A live path holding anything else is held,
     // typed, for the consolidate path (B2): nothing is written there.
     moving::private_dir(&private)?;
+    // The hand-off never modifies a tracked file (SPEC rules 7 and 8,
+    // 2026-10-21): a block an earlier pass wrote into a tracked `AGENTS.md`
+    // or `CLAUDE.md` is cleared first, restored byte for byte and recorded,
+    // so it never holds the consolidation of the file it sits in.
+    {
+        let mut args: Vec<OsString> = vec!["--clear".into(), "--legacy-only".into()];
+        if let Some((from, to)) = homes.as_ref() {
+            let mut pair = from.clone().into_os_string();
+            pair.push("=");
+            pair.push(to);
+            args.extend(["--place".into(), pair]);
+        }
+        args.extend([
+            plan.clone().into_os_string(),
+            corpus.clone().into_os_string(),
+            private.clone().into_os_string(),
+            run.source.clone().into(),
+        ]);
+        let cleared = super::estate_command("estate-handoff", &args);
+        reached(&mut ledger, &ledger_path, "hand-off-legacy", word(&cleared))?;
+    }
     let placed: Vec<estate::Item> = rows.iter().map(|row| row.item.clone()).collect();
     let sources: Vec<PathBuf> = rows.iter().map(|row| row.item.source.clone()).collect();
     let map = estate::streamed::path_map(&placed);
