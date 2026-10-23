@@ -1919,17 +1919,26 @@ pub(crate) struct OwnedOutput {
 /// since. Returns what a superseding publish needs, or `None`
 /// for any other file: that one is never replaced.
 ///
+/// `earlier` are the same session's authorities from before its source
+/// root's device number changed (`transfer::source_dev`): their rows are
+/// this store's too, and are read beside `authority`'s. Only where a row
+/// is looked for widens; the file must still match one exactly.
+///
 /// # Errors
 /// Refuses a failed `fstat` or database read.
 pub(crate) fn owned_output(
     store: &Store,
     authority: &[u8],
+    earlier: &[&[u8]],
     row: &RowSchema,
     file: &File,
 ) -> Result<Option<OwnedOutput>> {
     let identity =
         StatIdentity::from_metadata(&file.metadata().refuse_at("materialize::owned_output")?);
-    let rows = store.output_rows(authority, &row.rel_path)?;
+    let mut rows = store.output_rows(authority, &row.rel_path)?;
+    for authority in earlier {
+        rows.extend(store.output_rows(authority, &row.rel_path)?);
+    }
     let recorded = identity_bytes(&identity)?;
     Ok(rows
         .iter()

@@ -748,6 +748,7 @@ fn a_chunk_of_a_superseded_output_is_still_filled_locally() {
                 target: &target,
                 store: &store,
                 authority: b"",
+                earlier: &[],
                 displaced,
                 session: &session,
                 salvage: &salvage,
@@ -3220,6 +3221,10 @@ mod prefix;
 mod map_prefix;
 
 mod consolidate;
+
+// ---- 2026-10-23: a source reboot renumbers the source root's device ------
+mod source_dev;
+
 /// The streamed capture (SPEC rule 2 reset, B1): an excluded path (a
 /// repository's `objects`, a rebuildable directory) is never landed, its
 /// bytes never read from the source, and everything beside it lands.

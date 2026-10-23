@@ -4698,6 +4698,9 @@ struct ReceiveContext<'a> {
     store: &'a Store,
     /// The session's output authority, which keys this store's rows.
     authority: &'a [u8],
+    /// The same session's authorities from before its source root's device
+    /// number changed ([`source_dev`]): their rows are this store's too.
+    earlier: &'a [&'a [u8]],
     /// The outputs this session's superseding publishes displace.
     displaced: &'a SharedDisplaced,
     session: &'a SessionChunks,
@@ -5682,6 +5685,9 @@ struct Inbound<'a, W> {
     target: &'a mut Destination,
     store: &'a Store,
     authority: Vec<u8>,
+    /// The session's authorities from before its source root's device
+    /// number changed ([`source_dev`]).
+    aliases: source_dev::DevAliases,
     committer: &'a Committer<PublishSink>,
     session: SessionChunks,
     /// The outputs this session's superseding publishes displace (WP0(d)).
@@ -6045,6 +6051,11 @@ fn receive_session<R: Read, W: Write>(
         target_meta.ino(),
     ))
     .refuse_at("transfer::receive")?;
+    // A source reboot can renumber the source root's device (macOS APFS):
+    // the rows an earlier pass keyed under the old number are still this
+    // store's own ([`source_dev`]).
+    let aliases = source_dev::DevAliases::find(&store, &output_authority)?;
+    counters::add_len(Counter::TransferSourceDevAliases, aliases.len());
     // The receive workers (item 3) live in this scope: a session that ends,
     // by `SourceDone` or by a refusal, closes their queue, and the scope
     // joins them before anything below runs.
@@ -6077,6 +6088,7 @@ fn receive_session<R: Read, W: Write>(
             target: &mut target,
             store: &store,
             authority: output_authority,
+            aliases,
             committer: &committer,
             session: SessionChunks::with_capacity((budget / 4).clamp(1, SESSION_FILES)),
             displaced,
@@ -6885,6 +6897,16 @@ impl<W: Write> Inbound<'_, W> {
         if refused == RefusedOutput::ExchangeUnsupported && self.target.exchange_supported(row)? {
             return Ok(None);
         }
+        // Refused as another's file, and yet the file is exactly one this
+        // store's rows record at the path: refused by a pass that keyed its
+        // lookup under a renumbered source root device and missed its own
+        // rows ([`source_dev`]; estate-20261022 pass 5). It is this store's
+        // own, so it is superseded, not refused again.
+        if matches!(refused, RefusedOutput::Occupied | RefusedOutput::NotPrefix)
+            && self.owns(row, identity)?
+        {
+            return Ok(None);
+        }
         // M2r2 A-103: refused before the prefix extension existed, and a
         // file it may extend: proved once more (a failed proof is
         // remembered `NotPrefix`, which is honoured).
@@ -6893,6 +6915,57 @@ impl<W: Write> Inbound<'_, W> {
         }
         counters::bump(Counter::TransferRefusedOutputsRemembered);
         Ok(Some(refused))
+    }
+
+    /// Whether `identity`, the file at `row`'s path, is one this store's
+    /// rows record for an output it wrote there under this session's
+    /// authority or an earlier one of the same roots ([`source_dev`]).
+    fn owns(&self, row: &RowSchema, identity: &StatIdentity) -> Result<bool> {
+        let recorded = crate::transfer_store::identity_bytes(identity)?;
+        for authority in
+            std::iter::once(self.authority.as_slice()).chain(self.aliases.authorities())
+        {
+            if self
+                .store
+                .output_rows(authority, &row.rel_path)?
+                .iter()
+                .any(|(_, held)| *held == recorded)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether the file at `row`'s path, with `identity`, is the output a
+    /// row recorded for this very seat: under `key`, or under the key a pass
+    /// from before the source root's device was renumbered gave the same
+    /// seat ([`source_dev`]). Either way the seat's inode, size, times and
+    /// mode are unchanged, and so is the output.
+    fn output_reused(&self, row: &RowSchema, key: &[u8], identity: &StatIdentity) -> Result<bool> {
+        if self.store.output_matches(key, identity)? {
+            return Ok(true);
+        }
+        for earlier in self.aliases.keys(row)? {
+            if self.store.output_matches(&earlier, identity)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// [`Store::consolidated`], under `key` or the seat's key from before
+    /// the source root's device was renumbered ([`source_dev`]).
+    fn seat_consolidated(&self, row: &RowSchema, key: &[u8]) -> Result<bool> {
+        if self.store.consolidated(key)? {
+            return Ok(true);
+        }
+        for earlier in self.aliases.keys(row)? {
+            if self.store.consolidated(&earlier)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Whether the file at `row`'s path is one the prefix extension would
@@ -6943,7 +7016,7 @@ impl<W: Write> Inbound<'_, W> {
                     return Ok(Decision::Reuse);
                 }
             }
-            if self.store.output_matches(key, identity)? {
+            if self.output_reused(row, key, identity)? {
                 self.stats.reused += 1;
                 return Ok(Decision::Reuse);
             }
@@ -7032,7 +7105,7 @@ impl<W: Write> Inbound<'_, W> {
                 // its bytes are the seat's, judged by manifest, nothing
                 // written through it. One proved before is reused.
                 if linked_size(self.target.path(), &row.rel_path) == Some(row.size) {
-                    if self.store.consolidated(key)? {
+                    if self.seat_consolidated(row, key)? {
                         return Ok(self.reuse_seat(row, class, "covered", Some(row.size), plan));
                     }
                     return Ok(Decision::WantManifest);
@@ -7047,7 +7120,7 @@ impl<W: Write> Inbound<'_, W> {
             Err(refusal) => return Err(refusal),
         };
         let live_size = identity.as_ref().map(|identity| identity.size);
-        if self.store.consolidated(key)? {
+        if self.seat_consolidated(row, key)? {
             return Ok(self.reuse_seat(row, class, "covered", live_size, plan));
         }
         let Some(identity) = identity else {
@@ -7067,7 +7140,7 @@ impl<W: Write> Inbound<'_, W> {
                 Decision::Send
             });
         };
-        if self.store.output_matches(key, &identity)? {
+        if self.output_reused(row, key, &identity)? {
             return Ok(self.reuse_seat(row, class, "adopt", live_size, plan));
         }
         if let Some(refused) = self.remembered_refusal(row, key, &identity)? {
@@ -7615,6 +7688,7 @@ impl<W: Write> Inbound<'_, W> {
                     target: self.target,
                     store: self.store,
                     authority: &self.authority,
+                    earlier: &self.aliases.authorities(),
                     displaced: &self.displaced,
                     session: &self.session,
                     salvage: &self.salvage,
@@ -8087,7 +8161,13 @@ impl<W: Write> Inbound<'_, W> {
                 match verified {
                     Ok(identity) => Ok(Some((file, parent, identity))),
                     Err(BulkloadRefusal::DestinationOccupied) => {
-                        supersede = owned_output(self.store, &self.authority, &row, &file)?;
+                        supersede = owned_output(
+                            self.store,
+                            &self.authority,
+                            &self.aliases.authorities(),
+                            &row,
+                            &file,
+                        )?;
                         let root_path = self.target.path();
                         if supersede.is_none()
                             && !snapshot
@@ -9420,7 +9500,13 @@ fn plan_file(
     } else {
         match context.target.existing(row) {
             Ok(Some((file, parent))) => {
-                match owned_output(context.store, context.authority, row, &file) {
+                match owned_output(
+                    context.store,
+                    context.authority,
+                    context.earlier,
+                    row,
+                    &file,
+                ) {
                     Ok(Some(owned)) => {
                         let (verified, settled) =
                             verify_settled(context.target.path(), &file, row, manifest);
@@ -10216,6 +10302,7 @@ fn path(bytes: Vec<u8>) -> PathBuf {
 pub mod consolidate;
 mod handoff;
 pub mod map;
+pub(crate) mod source_dev;
 #[cfg(test)]
 mod tests;
 pub(crate) mod unrowed;
