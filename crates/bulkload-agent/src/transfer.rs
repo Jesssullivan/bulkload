@@ -1491,9 +1491,54 @@ fn archive_rollout(root: &Path, rel_path: &[u8], archived: &[PathBuf]) -> Option
     .then_some(target)
 }
 
+/// Why a live path that is a dangling link is held: its target named, and
+/// the target's other form (`.zst` added or removed) when that is there
+/// instead (homes-20261021: one rollout's archive holds a plain `.jsonl`
+/// where its link names the `.zst`). `None` for anything else.
+fn dangling_reason(root: &Path, rel_path: &[u8]) -> Option<String> {
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+    let live = root.join(std::ffi::OsStr::from_bytes(rel_path));
+    if !std::fs::symlink_metadata(&live)
+        .ok()?
+        .file_type()
+        .is_symlink()
+    {
+        return None;
+    }
+    if std::fs::metadata(&live).is_ok() {
+        return None;
+    }
+    let text = std::fs::read_link(&live).ok()?;
+    let target = if text.is_absolute() {
+        text
+    } else {
+        live.parent().unwrap_or(root).join(text)
+    };
+    let bytes = target.as_os_str().as_bytes();
+    let other = bytes.strip_suffix(b".zst").map_or_else(
+        || {
+            let mut with = bytes.to_vec();
+            with.extend_from_slice(b".zst");
+            with
+        },
+        <[u8]>::to_vec,
+    );
+    let other = PathBuf::from(std::ffi::OsString::from_vec(other));
+    let instead = if std::fs::symlink_metadata(&other).is_ok() {
+        format!("; {} is there instead", other.display())
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "the live path is a dangling link: {} does not exist{instead}",
+        target.display()
+    ))
+}
+
 /// A digest of the identity (device, inode, size, times) of the file at
 /// `path`, through links: what a held linked rollout is remembered against.
-fn linked_identity(path: &Path) -> Option<[u8; 32]> {
+#[must_use]
+pub fn linked_identity(path: &Path) -> Option<[u8; 32]> {
     let found = std::fs::metadata(path).ok()?;
     let identity = StatIdentity::from_metadata(&found);
     let mut hasher = blake3::Hasher::new();
@@ -7166,6 +7211,14 @@ impl<W: Write> Inbound<'_, W> {
                 {
                     return self.decide_rollout(row, key, class, &target, settings);
                 }
+                if let Some(reason) = dangling_reason(self.target.path(), &row.rel_path) {
+                    if plan {
+                        self.plan_seat(row, class.word(), "hold", None, Some(OTHER_KIND));
+                        return Ok(Decision::Skip);
+                    }
+                    self.stats.held.push((row.rel_path.clone(), reason.into()));
+                    return Err(BulkloadRefusal::HomesConsolidateUnsupported);
+                }
                 return self.hold_seat(row, class, None, OTHER_KIND, plan);
             }
             // A plan creates no directory: one the seat would be landed in
@@ -8469,12 +8522,19 @@ impl<W: Write> Inbound<'_, W> {
     }
 
     /// `--consolidate`: a rollout linked into an archive root
-    /// ([`archive_rollout`]), its source bytes `staged`: covered when the
-    /// linked file holds every one of its events
-    /// ([`crate::consolidate::rollout::coverage`]), else held with how many
-    /// it lacks. Nothing is written either way: the link and the archive
-    /// are untouched and the staged file goes. A hold is remembered in the
-    /// consolidation ledger against the linked file's identity.
+    /// ([`archive_rollout`]), its source bytes `staged`, judged by
+    /// [`crate::consolidate::rollout::coverage`] (operator rulings
+    /// 2026-10-23):
+    /// - covered (every source event in the linked file, or a Codex
+    ///   rewrite whose archived original holds every turn and call id):
+    ///   nothing written, the link kept;
+    /// - extended (the linked file's events a strict prefix of the
+    ///   source's): the source's file, whole, replaces the link at the live
+    ///   name ([`crate::consolidate::append_log::replace_link`]), never
+    ///   written through it; the archive untouched (A-106);
+    /// - else held with how many events (and ids) it lacks, remembered in
+    ///   the consolidation ledger against the linked file's identity.
+    #[allow(clippy::too_many_lines)] // Judge, then each outcome's record.
     fn judge_rollout(
         &mut self,
         staged: StagedFile,
@@ -8483,24 +8543,91 @@ impl<W: Write> Inbound<'_, W> {
         target: &Path,
         settings: &Consolidation,
     ) -> Result<()> {
+        use std::os::unix::ffi::OsStrExt as _;
         let linked = linked_identity(target);
         let judged = crate::hash::open_nofollow(target).and_then(|file| {
             crate::consolidate::rollout::coverage(staged.file(), &file, &settings.maps)
         });
-        let _ = staged.discard();
-        let judged = judged?;
-        let Some(reason) = judged.held_reason() else {
+        let judged = match judged {
+            Ok(judged) => judged,
+            Err(refusal) => {
+                let _ = staged.discard();
+                return Err(refusal);
+            }
+        };
+        if matches!(
+            judged,
+            crate::consolidate::rollout::Coverage::Extends { .. }
+        ) {
+            if self.consolidate_ledger.is_none() {
+                self.consolidate_ledger = Some(crate::consolidate::Ledger::open(&settings.ledger)?);
+            }
+            let ledger = self
+                .consolidate_ledger
+                .as_ref()
+                .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
+            let live_path = self
+                .target
+                .path()
+                .join(std::ffi::OsStr::from_bytes(&row.rel_path));
+            let live = crate::consolidate::Live {
+                dir: staged.parent(),
+                name: staged.leaf(),
+                path: &live_path,
+                rel: &row.rel_path,
+            };
+            let feed = crate::consolidate::append_log::Feed::Staged {
+                file: staged.file(),
+                name: staged.staged_name(),
+            };
+            let replaced =
+                crate::consolidate::append_log::replace_link(&live, target, feed, row.size, ledger);
+            let _ = staged.discard();
+            replaced?;
             if !racy {
                 self.store.record_consolidated(key)?;
             }
             self.stats.consolidated.push((
                 row.rel_path.clone(),
-                crate::consolidate::rollout::COVERED.to_owned(),
+                crate::consolidate::rollout::EXTENDED.to_owned(),
             ));
             self.stats.completed += 1;
             self.answered_now = Some(true);
             return Ok(());
-        };
+        }
+        let _ = staged.discard();
+        if let Some(covered) = judged.covered() {
+            if !racy {
+                self.store.record_consolidated(key)?;
+                // The proof, against the linked file as read.
+                if let Some(before) =
+                    linked.filter(|before| linked_identity(target) == Some(*before))
+                {
+                    if self.consolidate_ledger.is_none() {
+                        self.consolidate_ledger =
+                            Some(crate::consolidate::Ledger::open(&settings.ledger)?);
+                    }
+                    if let Some(ledger) = self.consolidate_ledger.as_ref() {
+                        crate::consolidate::rollout::remember_outcome(
+                            ledger,
+                            &row.rel_path,
+                            key,
+                            &before,
+                            covered,
+                        )?;
+                    }
+                }
+            }
+            self.stats
+                .consolidated
+                .push((row.rel_path.clone(), covered.to_owned()));
+            self.stats.completed += 1;
+            self.answered_now = Some(true);
+            return Ok(());
+        }
+        let reason = judged
+            .held_reason()
+            .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
         // Remembered only when the linked file is the one read.
         if let (false, Some(before)) = (racy, linked) {
             if linked_identity(target) == Some(before) {

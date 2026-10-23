@@ -444,54 +444,108 @@ fn snapshot(root: &Path) -> Vec<(String, Vec<u8>, std::time::SystemTime)> {
         .collect()
 }
 
-#[test]
-fn a_rollout_linked_into_an_archive_is_covered_by_its_events_or_held_never_written() {
+/// The rollout seats of the archive-link tests: a source and destination
+/// day directory, an archive root run as `--replace-archived-dest` with the
+/// homes `--map`, and the seat names.
+fn archive_run() -> (Consolidating, PathBuf, impl Fn(&str) -> String) {
     let run = Consolidating::new(false);
-    let (source, destination) = (run.source(), run.destination());
     let archive = run.corpus.base.join("archive");
     std::fs::create_dir_all(&archive).unwrap();
     run.set_archived(
         vec![archive.clone()],
         crate::consolidate::Maps::new([("/Users/jess".to_owned(), "/home/jess".to_owned())]),
     );
-    let events = [
-        r#"{"type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#,
-        r#"{"type":"event_msg","payload":{"type":"patch","changes":{"a":1,"b":2}}}"#,
-        r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
-    ];
-    // sting's archive: the legacy rollouts, no ordinals, sting's home.
-    let legacy = rollout("/home/jess", false, &events);
     let dir = "sessions/2026/07/22";
-    std::fs::create_dir_all(source.join(dir)).unwrap();
-    std::fs::create_dir_all(destination.join(dir)).unwrap();
-    let name = |tag: &str| format!("{dir}/rollout-2026-07-22T00-39-31-019f0000-{tag}.jsonl.zst");
-    // The four seats and the archived file each live path links to.
+    std::fs::create_dir_all(run.source().join(dir)).unwrap();
+    std::fs::create_dir_all(run.destination().join(dir)).unwrap();
+    let name =
+        move |tag: &str| format!("{dir}/rollout-2026-07-22T00-39-31-019f0000-{tag}.jsonl.zst");
+    (run, archive, name)
+}
+
+const EVENTS: [&str; 3] = [
+    r#"{"type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#,
+    r#"{"type":"event_msg","payload":{"type":"patch","changes":{"a":1,"b":2}}}"#,
+    r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+];
+
+#[test]
+#[allow(clippy::too_many_lines)] // Seven seats, each case's outcome and reason.
+fn a_rollout_linked_into_an_archive_is_covered_by_its_events_or_held_never_written() {
+    let (run, archive, name) = archive_run();
+    let (source, destination) = (run.source(), run.destination());
+    // sting's archive: the legacy rollouts, no ordinals, sting's home.
+    let legacy = rollout("/home/jess", false, &EVENTS);
     let subset = rollout(
         "/Users/jess",
         true,
         &[
-            events[0],
+            EVENTS[0],
             r#"{"type":"event_msg","payload":{"type":"patch","changes":{"b":2,"a":1}}}"#,
         ],
     );
-    let mut more = events.to_vec();
-    more.push(r#"{"type":"event_msg","payload":{"type":"user_message","message":"neo only"}}"#);
-    let lacking = rollout("/Users/jess", true, &more);
-    let cases: [(&str, Vec<u8>, &str, Vec<u8>); 4] = [
+    // neo's events, one of its own first: no prefix, no ordinals.
+    let mut ahead =
+        vec![r#"{"type":"event_msg","payload":{"type":"user_message","message":"neo only"}}"#];
+    ahead.extend(EVENTS);
+    let lacking = rollout("/Users/jess", false, &ahead);
+    // A legacy rollout with turn and call ids, and Codex's rewrite of it:
+    // ordinals, re-encoded events, a made-up id for a legacy turn.
+    let legacy_ids = rollout(
+        "/home/jess",
+        false,
+        &[
+            r#"{"type":"turn_context","payload":{"turn_id":"T1"}}"#,
+            r#"{"type":"response_item","payload":{"type":"function_call","call_id":"C1"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"mcp_tool_call_end","call_id":"C2","turn_id":"T1"}}"#,
+        ],
+    );
+    let mut rewritten = vec![
+        r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"T1"}}"#,
+        r#"{"type":"event_msg","payload":{"type":"item_completed","turn_id":"rollout-4","item":{"type":"McpToolCall","call_id":"C2"}}}"#,
+        r#"{"type":"response_item","payload":{"type":"function_call","call_id":"C1","content":null}}"#,
+    ];
+    let rewrite = rollout("/Users/jess", true, &rewritten);
+    rewritten.push(r#"{"type":"response_item","payload":{"type":"function_call","call_id":"C3"}}"#);
+    let missing = rollout("/Users/jess", true, &rewritten);
+    let cases: [(&str, Vec<u8>, &str, Vec<u8>); 6] = [
         // Covered: neo's zst rewrite holds a subset of the archive's events.
         ("zst", zst(&subset), "zst.jsonl.zst", zst(&legacy)),
         // Covered: a plain JSONL source against a zst archive file.
         ("plain", subset.clone(), "plain.jsonl.zst", zst(&legacy)),
         // Covered: a zst source against a plain archive file.
         ("tojsonl", zst(&subset), "tojsonl.jsonl", legacy.clone()),
-        // Held: neo holds one event the archive lacks.
+        // Held: neo holds events the archive lacks, and no prefix.
         ("lacks", zst(&lacking), "lacks.jsonl.zst", zst(&legacy)),
+        // Covered (ruling 2026-10-23): the archived original holds every
+        // turn and call id of Codex's rewrite.
+        (
+            "rewrite",
+            zst(&rewrite),
+            "rewrite.jsonl.zst",
+            zst(&legacy_ids),
+        ),
+        // Held: the rewrite names a call id the original lacks.
+        (
+            "missing",
+            zst(&missing),
+            "missing.jsonl.zst",
+            zst(&legacy_ids),
+        ),
     ];
     for (tag, seat, archived, held_bytes) in &cases {
         std::fs::write(source.join(name(tag)), seat).unwrap();
         std::fs::write(archive.join(archived), held_bytes).unwrap();
         std::os::unix::fs::symlink(archive.join(archived), destination.join(name(tag))).unwrap();
     }
+    // A dangling link whose target's other form is in the archive.
+    std::fs::write(source.join(name("dangling")), zst(&subset)).unwrap();
+    std::fs::write(archive.join("gone.jsonl"), &legacy).unwrap();
+    std::os::unix::fs::symlink(
+        archive.join("gone.jsonl.zst"),
+        destination.join(name("dangling")),
+    )
+    .unwrap();
     run.settle();
     settle_racy_window(&archive).unwrap();
     let before = snapshot(&archive);
@@ -502,25 +556,71 @@ fn a_rollout_linked_into_an_archive_is_covered_by_its_events_or_held_never_writt
         consolidated(&stats),
         [
             (name("plain"), covered.clone()),
+            (
+                name("rewrite"),
+                crate::consolidate::rollout::REWRITE_COVERED.to_owned()
+            ),
             (name("tojsonl"), covered.clone()),
             (name("zst"), covered),
         ]
     );
-    assert_eq!(held(&stats), [name("lacks")]);
-    let reasons: Vec<(String, String)> = stats
+    assert_eq!(
+        held(&stats),
+        [name("dangling"), name("lacks"), name("missing")]
+    );
+    let mut reasons: Vec<(String, String)> = stats
         .held
         .iter()
         .map(|(path, why)| (String::from_utf8_lossy(path).into_owned(), why.to_string()))
         .collect();
+    reasons.sort();
     assert_eq!(
         reasons,
-        [(
-            name("lacks"),
-            "source holds 1 of its 5 events the linked file lacks (the source is Codex's \
-             ordinal rewrite of a legacy rollout; the link holds the legacy one)"
-                .to_owned()
-        )]
+        [
+            (
+                name("dangling"),
+                format!(
+                    "the live path is a dangling link: {} does not exist; {} is there instead",
+                    archive.join("gone.jsonl.zst").display(),
+                    archive.join("gone.jsonl").display()
+                )
+            ),
+            (
+                name("lacks"),
+                "source holds 4 of its 5 events the linked file lacks".to_owned()
+            ),
+            (
+                name("missing"),
+                "source holds 4 of its 5 events the linked file lacks (the source is Codex's \
+                 ordinal rewrite of a legacy rollout; the archived original lacks 1 of its 4 \
+                 turn and call ids)"
+                    .to_owned()
+            ),
+        ]
     );
+    // Each covered seat's proof is ledgered against the linked file.
+    let ledger = crate::consolidate::Ledger::open(&run.state().join("consolidate")).unwrap();
+    for (tag, outcome) in [
+        ("zst", crate::consolidate::rollout::COVERED),
+        ("rewrite", crate::consolidate::rollout::REWRITE_COVERED),
+    ] {
+        let (recorded, linked): (String, Vec<u8>) = ledger
+            .connection()
+            .query_row(
+                "SELECT outcome, linked FROM rollout_link_outcome WHERE file = ?1",
+                [name(tag).as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(recorded, outcome);
+        assert_eq!(
+            Some(linked.as_slice()),
+            linked_identity(&archive.join(format!("{tag}.jsonl.zst")))
+                .as_ref()
+                .map(<[u8; 32]>::as_slice)
+        );
+    }
+    drop(ledger);
     // Nothing written: the archive is as it was, byte for byte and mtime,
     // and every live path is still the same link.
     assert_eq!(snapshot(&archive), before);
@@ -532,21 +632,80 @@ fn a_rollout_linked_into_an_archive_is_covered_by_its_events_or_held_never_writt
             .is_symlink());
         assert_eq!(std::fs::read_link(&live).unwrap(), archive.join(archived));
     }
+    assert!(
+        std::fs::symlink_metadata(destination.join(name("dangling")))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     run.no_temporaries();
     run.no_payload_in_state(&subset[..64]);
 
-    // Unchanged: the covered seats are reused and the held one held again
-    // with its reason, 0 source bytes read; nothing written still.
+    // Unchanged: the covered seats are reused and the held ones held again
+    // with their reasons, 0 source bytes read; nothing written still.
     let again = run.run();
     assert_eq!(again.source_bytes_read, 0);
-    assert_eq!(held(&again), [name("lacks")]);
     assert_eq!(
-        again
-            .held
-            .iter()
-            .map(|(_, why)| why.to_string())
-            .collect::<Vec<_>>(),
-        [reasons[0].1.clone()]
+        held(&again),
+        [name("dangling"), name("lacks"), name("missing")]
     );
+    let mut again_reasons: Vec<(String, String)> = again
+        .held
+        .iter()
+        .map(|(path, why)| (String::from_utf8_lossy(path).into_owned(), why.to_string()))
+        .collect();
+    again_reasons.sort();
+    assert_eq!(again_reasons, reasons);
+    assert_eq!(snapshot(&archive), before);
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "a trade that writes needs the open-file check (Linux only; elsewhere HOMES_CONSOLIDATE_HOLDER_UNKNOWN)"
+)]
+fn a_rollout_whose_archive_is_a_prefix_replaces_the_link_with_the_source_never_the_archive() {
+    let (run, archive, name) = archive_run();
+    let (source, destination) = (run.source(), run.destination());
+    let legacy = zst(&rollout("/home/jess", false, &EVENTS));
+    let mut more = EVENTS.to_vec();
+    more.push(r#"{"type":"event_msg","payload":{"type":"user_message","message":"neo only"}}"#);
+    // Ruling 2026-10-23: the linked archive's events are a strict prefix
+    // of neo's (ordinals and host paths aside).
+    let neo = zst(&rollout("/Users/jess", true, &more));
+    std::fs::write(source.join(name("ahead")), &neo).unwrap();
+    std::fs::write(archive.join("ahead.jsonl.zst"), &legacy).unwrap();
+    let live = destination.join(name("ahead"));
+    std::os::unix::fs::symlink(archive.join("ahead.jsonl.zst"), &live).unwrap();
+    run.settle();
+    settle_racy_window(&archive).unwrap();
+    let before = snapshot(&archive);
+
+    let stats = run.run();
+    assert!(held(&stats).is_empty(), "{:?}", stats.held);
+    assert_eq!(
+        consolidated(&stats),
+        [(
+            name("ahead"),
+            crate::consolidate::rollout::EXTENDED.to_owned()
+        )]
+    );
+    // The link, only, is replaced: a regular file holding neo's bytes; the
+    // archive as it was, byte for byte and mtime.
+    let meta = std::fs::symlink_metadata(&live).unwrap();
+    assert!(meta.file_type().is_file());
+    assert_eq!(std::fs::read(&live).unwrap(), neo);
+    assert_eq!(snapshot(&archive), before);
+    assert_eq!(
+        std::fs::read(archive.join("ahead.jsonl.zst")).unwrap(),
+        legacy
+    );
+    run.no_temporaries();
+
+    // A rerun reads nothing and changes nothing.
+    let again = run.run();
+    assert_eq!(again.source_bytes_read, 0);
+    assert!(held(&again).is_empty());
+    assert_eq!(std::fs::read(&live).unwrap(), neo);
     assert_eq!(snapshot(&archive), before);
 }

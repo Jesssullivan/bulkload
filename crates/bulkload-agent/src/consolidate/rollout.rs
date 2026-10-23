@@ -52,14 +52,26 @@ const ORDINAL: &str = "ordinal";
 pub enum Coverage {
     /// Every one of the source's `events` is in the linked file.
     Covered { events: u64 },
+    /// The linked file's events, in order, are the source's first
+    /// `linked_events` of its `events` and nothing else: a strict prefix
+    /// (operator ruling 2026-10-23, "Yes, take neo's full file": the
+    /// source's file replaces the link).
+    Extends { linked_events: u64, events: u64 },
+    /// The source is Codex's ordinal rewrite of the legacy file the link
+    /// holds, and every one of its `ids` turn and call ids is in that file
+    /// (operator ruling 2026-10-23, "Archive original covers it").
+    RewriteCovered { events: u64, ids: u64 },
     /// The linked file lacks `lacking` of the source's `events`.
     /// `ordinal_rewrite`: every source line carries an ordinal and no
-    /// linked line read does (Codex's rollout migration rewrote the source
-    /// from a legacy file such as the linked one).
+    /// linked line does (Codex's rollout migration rewrote the source from
+    /// a legacy file such as the linked one); then `missing_ids` is how
+    /// many of the source's turn and call ids the linked file lacks, of
+    /// how many.
     Lacks {
         lacking: u64,
         events: u64,
         ordinal_rewrite: bool,
+        missing_ids: Option<(u64, u64)>,
     },
     /// A side is over [`super::append_log::SIZE_LIMIT`] decompressed (the
     /// source), or holds a line over it.
@@ -68,23 +80,51 @@ pub enum Coverage {
 
 /// The reason a covered seat is recorded with.
 pub const COVERED: &str = "covered: source events within the linked file, ordinal-normalized";
+/// The reason a Codex rewrite covered by its archived original is recorded
+/// with (operator ruling 2026-10-23, "Archive original covers it").
+pub const REWRITE_COVERED: &str =
+    "covered: archived original holds every turn and call id of Codex's rewrite";
+/// The outcome of a seat whose linked archive file is a strict prefix of
+/// it (operator ruling 2026-10-23, "Yes, take neo's full file").
+pub const EXTENDED: &str =
+    "extended: source superset of the linked archive file; link replaced by a regular file";
 
 impl Coverage {
-    /// Why a seat that is not covered is held, for the closure.
+    /// The outcome a covered seat is recorded with; `None` for any other.
+    #[must_use]
+    pub const fn covered(&self) -> Option<&'static str> {
+        match self {
+            Self::Covered { .. } => Some(COVERED),
+            Self::RewriteCovered { .. } => Some(REWRITE_COVERED),
+            _ => None,
+        }
+    }
+
+    /// Why a seat that is neither covered nor extended is held, for the
+    /// closure.
     #[must_use]
     pub fn held_reason(&self) -> Option<String> {
         match *self {
-            Self::Covered { .. } => None,
+            Self::Covered { .. } | Self::Extends { .. } | Self::RewriteCovered { .. } => None,
             Self::Lacks {
                 lacking,
                 events,
                 ordinal_rewrite,
+                missing_ids,
             } => Some(format!(
                 "source holds {lacking} of its {events} events the linked file lacks{}",
-                if ordinal_rewrite {
-                    " (the source is Codex's ordinal rewrite of a legacy rollout; the link holds the legacy one)"
-                } else {
-                    ""
+                match (ordinal_rewrite, missing_ids) {
+                    (true, Some((_, 0))) => " (the source is Codex's ordinal rewrite of a legacy \
+                                            rollout; it holds no turn or call id to check)"
+                        .to_owned(),
+                    (true, Some((missing, ids))) => format!(
+                        " (the source is Codex's ordinal rewrite of a legacy rollout; the archived \
+                         original lacks {missing} of its {ids} turn and call ids)"
+                    ),
+                    (true, None) => " (the source is Codex's ordinal rewrite of a legacy rollout; \
+                                     the link holds the legacy one)"
+                        .to_owned(),
+                    (false, _) => String::new(),
                 }
             )),
             Self::OverLimit => Some(format!(
@@ -274,15 +314,79 @@ fn feed(hasher: &mut blake3::Hasher, value: &Value) {
     }
 }
 
-/// Whether the file `linked` holds every event of the file `source` (see
-/// the module): both read from offset 0, neither written.
+/// Whether a line carries a top-level `"ordinal"` near its start, as
+/// Codex writes it (after `"timestamp"`), by its bytes.
+fn has_ordinal(line: &[u8]) -> bool {
+    line.get(..96)
+        .unwrap_or(line)
+        .windows(b"\"ordinal\":".len())
+        .any(|window| window == b"\"ordinal\":")
+}
+
+/// Every `"turn_id"` and `"call_id"` key's string value in `line`, by its
+/// bytes, each tagged `t:` or `c:`. A key inside an escaped string never
+/// matches (its quotes are escaped). Codex's migration names a legacy turn
+/// that had no id `rollout-<n>`; such a made-up id is no legacy file's and
+/// is left out.
+fn ids(line: &[u8], found: &mut dyn FnMut(Vec<u8>)) {
+    const KEYS: [(&[u8], &[u8]); 2] = [(b"\"turn_id\":\"", b"t:"), (b"\"call_id\":\"", b"c:")];
+    let mut at = 0;
+    while let Some(rest) = line.get(at..) {
+        let Some(quote) = rest.iter().position(|byte| *byte == b'"') else {
+            break;
+        };
+        let here = rest.get(quote..).unwrap_or_default();
+        at += quote + 1;
+        for (key, tag) in KEYS {
+            let Some(value) = here.strip_prefix(key) else {
+                continue;
+            };
+            let mut end = None;
+            let mut escaped = false;
+            for (index, byte) in value.iter().enumerate() {
+                match byte {
+                    b'\\' if !escaped => escaped = true,
+                    b'"' if !escaped => {
+                        end = Some(index);
+                        break;
+                    }
+                    _ => escaped = false,
+                }
+            }
+            if let Some(id) = end.and_then(|end| value.get(..end)) {
+                let made_up = id
+                    .strip_prefix(b"rollout-")
+                    .is_some_and(|n| !n.is_empty() && n.iter().all(u8::is_ascii_digit));
+                if !(tag == b"t:" && made_up) {
+                    let mut tagged = tag.to_vec();
+                    tagged.extend_from_slice(id);
+                    found(tagged);
+                }
+                at += key.len() + end.unwrap_or(0);
+            }
+        }
+    }
+}
+
+/// What the file `linked` holds of the events of the file `source` (see
+/// the module): both read from offset 0, neither written. In order of
+/// precedence:
+/// - [`Coverage::Covered`]: every source event is in the linked file;
+/// - [`Coverage::Extends`]: the linked file's events are a strict prefix
+///   of the source's, in order;
+/// - [`Coverage::RewriteCovered`]: the source is Codex's ordinal rewrite
+///   of the legacy linked file, which holds every one of its turn and
+///   call ids;
+/// - [`Coverage::Lacks`] otherwise.
 ///
 /// # Errors
 /// The I/O refusal of a read, or a zstd stream that does not decode.
 pub fn coverage(source: &File, linked: &File, maps: &Maps) -> Result<Coverage> {
     let limit = super::append_log::SIZE_LIMIT;
     let mut wanted: HashMap<[u8; 32], u64> = HashMap::new();
+    let mut order: Vec<[u8; 32]> = Vec::new();
     let mut stamps: HashSet<Vec<u8>> = HashSet::new();
+    let mut source_ids: HashSet<Vec<u8>> = HashSet::new();
     let mut untimed = false;
     let (mut events, mut ordinals, mut total) = (0_u64, 0_u64, 0_u64);
     let mut line = Vec::new();
@@ -305,10 +409,22 @@ pub fn coverage(source: &File, linked: &File, maps: &Maps) -> Result<Coverage> {
             }
             stamps.extend(found.timestamps);
             *wanted.entry(found.identity).or_default() += 1;
+            order.push(found.identity);
+            ids(&line, &mut |id| {
+                source_ids.insert(id);
+            });
         }
+    }
+    let all_ids = source_ids.len() as u64;
+    // Only a rewrite is judged by its ids.
+    let rewrite = events > 0 && ordinals == events;
+    if !rewrite {
+        source_ids.clear();
     }
     let mut lacking = events;
     let mut linked_ordinal = false;
+    // The linked file's events so far are the source's first `prefix`.
+    let mut prefix: Option<usize> = Some(0);
     let mut lines = reader(linked)?;
     while lacking > 0 && next_line(&mut *lines, &mut line, limit, &mut over)? {
         if over {
@@ -317,7 +433,15 @@ pub fn coverage(source: &File, linked: &File, maps: &Maps) -> Result<Coverage> {
         if line.is_empty() {
             continue;
         }
-        if !untimed {
+        linked_ordinal |= has_ordinal(&line);
+        if !source_ids.is_empty() {
+            ids(&line, &mut |id| {
+                source_ids.remove(&id);
+            });
+        }
+        // Past the prefix, a line whose timestamp no source event holds is
+        // no source event.
+        if prefix.is_none() && !untimed {
             let stamp = leading_timestamp(&line).and_then(|stamp| std::str::from_utf8(stamp).ok());
             if stamp.is_some_and(|stamp| !stamps.contains(maps.string(stamp).as_bytes())) {
                 continue;
@@ -325,6 +449,7 @@ pub fn coverage(source: &File, linked: &File, maps: &Maps) -> Result<Coverage> {
         }
         let found = event(&line, maps);
         linked_ordinal |= found.ordinal;
+        prefix = prefix.and_then(|at| (order.get(at) == Some(&found.identity)).then_some(at + 1));
         if let Some(count) = wanted.get_mut(&found.identity) {
             if *count > 0 {
                 *count -= 1;
@@ -335,10 +460,24 @@ pub fn coverage(source: &File, linked: &File, maps: &Maps) -> Result<Coverage> {
     if lacking == 0 {
         return Ok(Coverage::Covered { events });
     }
+    if let Some(at) = prefix {
+        return Ok(Coverage::Extends {
+            linked_events: at as u64,
+            events,
+        });
+    }
+    let ordinal_rewrite = rewrite && !linked_ordinal;
+    if ordinal_rewrite && source_ids.is_empty() && all_ids > 0 {
+        return Ok(Coverage::RewriteCovered {
+            events,
+            ids: all_ids,
+        });
+    }
     Ok(Coverage::Lacks {
         lacking,
         events,
-        ordinal_rewrite: events > 0 && ordinals == events && !linked_ordinal,
+        ordinal_rewrite,
+        missing_ids: ordinal_rewrite.then_some((source_ids.len() as u64, all_ids)),
     })
 }
 
@@ -409,6 +548,78 @@ pub fn held_before(
     .map_err(|_| BulkloadRefusal::SqliteStateChanged)
 }
 
+/// The ledger's record of each linked rollout covered, with the linked
+/// file's identity it was judged against: the proof a later step (the
+/// source-side retire) checks still holds.
+const OUTCOME_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS rollout_link_outcome(
+    file BLOB NOT NULL,
+    seat_key BLOB NOT NULL,
+    outcome TEXT NOT NULL,
+    linked BLOB NOT NULL,
+    at_ns INTEGER NOT NULL,
+    PRIMARY KEY(file, seat_key)
+);";
+
+/// Record that the seat `seat_key` at `rel` was judged `outcome` against
+/// the linked file whose identity digest is `linked`.
+///
+/// # Errors
+/// The `SQLite` refusal.
+pub fn remember_outcome(
+    ledger: &super::Ledger,
+    rel: &[u8],
+    seat_key: &[u8],
+    linked: &[u8; 32],
+    outcome: &str,
+) -> Result<()> {
+    let conn = ledger.connection();
+    conn.execute_batch(OUTCOME_SCHEMA)
+        .map_err(|_| BulkloadRefusal::SqliteStateChanged)?;
+    let at_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_nanos()).unwrap_or(i64::MAX)
+        });
+    conn.execute(
+        "INSERT INTO rollout_link_outcome VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(file, seat_key) DO UPDATE SET
+             outcome = excluded.outcome, linked = excluded.linked, at_ns = excluded.at_ns",
+        rusqlite::params![rel, seat_key, outcome, &linked[..], at_ns],
+    )
+    .map(|_| ())
+    .map_err(|_| BulkloadRefusal::SqliteStateChanged)
+}
+
+/// The outcome the seat `seat_key` at `rel` was judged and the linked
+/// file's identity digest it was judged against, when recorded.
+///
+/// # Errors
+/// The `SQLite` refusal.
+pub fn outcome(
+    ledger: &super::Ledger,
+    rel: &[u8],
+    seat_key: &[u8],
+) -> Result<Option<(String, [u8; 32])>> {
+    use rusqlite::OptionalExtension as _;
+    let conn = ledger.connection();
+    conn.execute_batch(OUTCOME_SCHEMA)
+        .map_err(|_| BulkloadRefusal::SqliteStateChanged)?;
+    let found = conn
+        .query_row(
+            "SELECT outcome, linked FROM rollout_link_outcome WHERE file = ?1 AND seat_key = ?2",
+            rusqlite::params![rel, seat_key],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()
+        .map_err(|_| BulkloadRefusal::SqliteStateChanged)?;
+    Ok(found.and_then(|(outcome, linked)| {
+        <[u8; 32]>::try_from(linked.as_slice())
+            .ok()
+            .map(|linked| (outcome, linked))
+    }))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
@@ -449,7 +660,8 @@ mod tests {
             Coverage::Lacks {
                 lacking: 1,
                 events: 3,
-                ordinal_rewrite: true
+                ordinal_rewrite: true,
+                missing_ids: Some((0, 0))
             }
         );
     }
@@ -474,7 +686,8 @@ mod tests {
             Coverage::Lacks {
                 lacking: 1,
                 events: 2,
-                ordinal_rewrite: false
+                ordinal_rewrite: false,
+                missing_ids: None
             }
         );
     }
@@ -488,12 +701,34 @@ mod tests {
         ]
         .concat();
         let maps = Maps::default();
+        // The link's events are the source's first four, in order.
         assert_eq!(
             coverage(&file(&zst(&source)), &file(&zst(LEGACY)), &maps).unwrap(),
+            Coverage::Extends {
+                linked_events: 4,
+                events: 6
+            }
+        );
+        // Out of order, or with a line of its own, it is no prefix.
+        let reordered = [&source[LEGACY.len()..], LEGACY].concat();
+        let mut other = LEGACY.to_vec();
+        other.extend_from_slice(b"{\"timestamp\":\"t8\",\"type\":\"sting\"}\n");
+        assert_eq!(
+            coverage(&file(&zst(&source)), &file(&other), &maps).unwrap(),
             Coverage::Lacks {
                 lacking: 2,
                 events: 6,
-                ordinal_rewrite: false
+                ordinal_rewrite: false,
+                missing_ids: None
+            }
+        );
+        assert_eq!(
+            coverage(&file(&reordered), &file(LEGACY), &maps).unwrap(),
+            Coverage::Lacks {
+                lacking: 2,
+                events: 6,
+                ordinal_rewrite: false,
+                missing_ids: None
             }
         );
         let linked = [LEGACY, b"not json \xff\n"].concat();
@@ -509,7 +744,8 @@ mod tests {
             Coverage::Lacks {
                 lacking: 1,
                 events: 1,
-                ordinal_rewrite: true
+                ordinal_rewrite: true,
+                missing_ids: Some((0, 0))
             }
         );
         assert!(lacks.held_reason().unwrap().starts_with(
@@ -525,5 +761,60 @@ mod tests {
         );
         assert_eq!(leading_timestamp(b"{\"timestamp\":\"a\\\"b\"}"), None);
         assert_eq!(leading_timestamp(b"{\"type\":\"x\"}"), None);
+    }
+
+    #[test]
+    fn a_rewrite_is_covered_by_its_ids_and_held_with_the_count_it_lacks() {
+        // The legacy file: real timestamps, legacy event shapes.
+        let legacy = b"{\"timestamp\":\"t0\",\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"T1\"}}\n\
+{\"timestamp\":\"t1\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"call_id\":\"C1\"}}\n\
+{\"timestamp\":\"t2\",\"type\":\"event_msg\",\"payload\":{\"type\":\"mcp_tool_call_end\",\"call_id\":\"C2\",\"turn_id\":\"T1\"}}\n";
+        // Codex's rewrite: ordinals, one flattened timestamp, re-encoded
+        // events, and a made-up id for a legacy turn.
+        let rewrite = b"{\"timestamp\":\"t0\",\"ordinal\":0,\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"T1\"}}\n\
+{\"timestamp\":\"t0\",\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"turn_id\":\"rollout-4\",\"item\":{\"type\":\"McpToolCall\",\"call_id\":\"C2\"}}}\n\
+{\"timestamp\":\"t0\",\"ordinal\":2,\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"call_id\":\"C1\",\"note\":\"x \\\"call_id\\\":\\\"C9\\\" y\"}}\n";
+        let maps = Maps::default();
+        let judged = coverage(&file(&zst(rewrite)), &file(&zst(legacy)), &maps).unwrap();
+        assert_eq!(judged, Coverage::RewriteCovered { events: 3, ids: 3 });
+        assert_eq!(judged.covered(), Some(REWRITE_COVERED));
+        // One call id the archived original lacks: held, counted.
+        let mut more = rewrite.to_vec();
+        more.extend_from_slice(b"{\"timestamp\":\"t0\",\"ordinal\":3,\"type\":\"response_item\",\"payload\":{\"call_id\":\"C3\"}}\n");
+        let held = coverage(&file(&more), &file(legacy), &maps).unwrap();
+        assert_eq!(
+            held,
+            Coverage::Lacks {
+                lacking: 4,
+                events: 4,
+                ordinal_rewrite: true,
+                missing_ids: Some((1, 4))
+            }
+        );
+        assert!(held
+            .held_reason()
+            .unwrap()
+            .ends_with("the archived original lacks 1 of its 4 turn and call ids)"));
+        // A link that carries ordinals is no legacy original: no id rule.
+        let mut ordinal_link = rewrite.to_vec();
+        ordinal_link.extend_from_slice(b"{\"timestamp\":\"t9\",\"ordinal\":0,\"type\":\"x\"}\n");
+        assert!(matches!(
+            coverage(&file(&more), &file(&ordinal_link), &maps).unwrap(),
+            Coverage::Lacks {
+                ordinal_rewrite: false,
+                missing_ids: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ids_are_read_from_keys_never_from_escaped_strings() {
+        let mut found = Vec::new();
+        ids(
+            b"{\"turn_id\":\"T\",\"x\":\"\\\"call_id\\\":\\\"no\\\"\",\"call_id\":\"C\",\"turn_id\":\"rollout-12\"}",
+            &mut |id| found.push(id),
+        );
+        assert_eq!(found, [b"t:T".to_vec(), b"c:C".to_vec()]);
     }
 }
