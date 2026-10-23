@@ -163,6 +163,16 @@ pub struct Inputs {
     pub omitted: Option<Vec<Omitted>>,
 }
 
+/// One open row (2026-10-22): what kind of row it is, what it names (a
+/// ref name, a worktree path, an item id) and why it is open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenRow {
+    /// `ref`, `dest-only`, `sibling`, `refused` or `behind`.
+    pub kind: &'static str,
+    pub row: Vec<u8>,
+    pub reason: String,
+}
+
 /// The ref classes that are open rows.
 ///
 /// The landing holds commits the destination's ref does not
@@ -182,24 +192,86 @@ impl Inputs {
     /// consolidating (a merge, a cherry-pick, a commit, an apply, a
     /// disposal), never only by deleting a copy; a destination commit or a
     /// seat edited since landing is consolidation, never an open row.
+    ///
+    /// The count of [`Inputs::open_rows`], so every counted row is one the
+    /// rows name (2026-10-22: `--check` lists each one).
     #[must_use]
     pub fn open(&self) -> u64 {
-        let refs = self
-            .refs
-            .iter()
-            .filter(|row| OPEN_CLASSES.contains(&row.class.as_str()))
-            .count();
-        let dest_only = self
+        u64::try_from(self.open_rows().len()).unwrap_or(u64::MAX)
+    }
+
+    /// Every open row [`Inputs::open`] counts, uncapped, each with its kind
+    /// and the reason it is open (2026-10-22: a block lists at most
+    /// [`REF_NAMES`] names per class, so `--check` and `--dry-run` print
+    /// these to attribute every counted row).
+    #[must_use]
+    pub fn open_rows(&self) -> Vec<OpenRow> {
+        let mut rows = Vec::new();
+        for row in &self.refs {
+            let reason = match row.class.as_str() {
+                "diverged" => "diverged: each side holds commits the other lacks",
+                "source-ahead" => "source-ahead: the landing holds commits this ref lacks",
+                _ => continue,
+            };
+            rows.push(OpenRow {
+                kind: "ref",
+                row: row.name.as_bytes().to_vec(),
+                reason: reason.to_owned(),
+            });
+        }
+        for row in self
             .dest_only
             .iter()
             .filter(|row| !row.consolidated || row.dirty)
-            .count();
-        let sibling = usize::from(self.sibling.as_ref().is_some_and(|sibling| {
+        {
+            let mut reasons = Vec::new();
+            if !row.consolidated {
+                reasons.push("its HEAD is in no other branch");
+            }
+            if row.dirty {
+                reasons.push("uncommitted changes");
+            }
+            rows.push(OpenRow {
+                kind: "dest-only",
+                row: row.path.clone(),
+                reason: reasons.join("; "),
+            });
+        }
+        if let Some(sibling) = self.sibling.as_ref().filter(|sibling| {
             matches!(sibling.state, SiblingState::Head { .. })
                 && (!sibling.consolidated || sibling.dirty)
-        }));
-        let behind = usize::from(self.current.is_some_and(|current| current != self.capture));
-        u64::try_from(refs + dest_only + sibling + self.refused.len() + behind).unwrap_or(u64::MAX)
+        }) {
+            let mut reasons = Vec::new();
+            if !sibling.consolidated {
+                reasons.push("not reconciled: this landing does not hold its HEAD");
+            }
+            if sibling.dirty {
+                reasons.push("uncommitted changes");
+            }
+            rows.push(OpenRow {
+                kind: "sibling",
+                row: sibling.path.clone(),
+                reason: reasons.join("; "),
+            });
+        }
+        for (item, code) in &self.refused {
+            rows.push(OpenRow {
+                kind: "refused",
+                row: item.as_bytes().to_vec(),
+                reason: format!("its last outcome is the refusal {code}"),
+            });
+        }
+        if let Some(current) = self.current.filter(|current| *current != self.capture) {
+            rows.push(OpenRow {
+                kind: "behind",
+                row: self.item.as_bytes().to_vec(),
+                reason: format!(
+                    "a newer capture {}… is not applied",
+                    hex(current.get(..6).unwrap_or_default())
+                ),
+            });
+        }
+        rows
     }
 
     /// The identity of the landing this block is rendered for: what its
@@ -248,6 +320,26 @@ pub fn owner_of(bytes: &[u8]) -> Option<&[u8]> {
     (bytes.get(at..at + tag.len()) == Some(tag.as_slice()))
         .then(|| bytes.get(at + tag.len()..at + tag.len() + 16))
         .flatten()
+}
+
+/// The path a block's "This landing" row names (as [`shown`] printed it),
+/// if the block has one.
+#[must_use]
+pub fn landing_of(block: &[u8]) -> Option<&[u8]> {
+    const ROW: &[u8] = b"\n| This landing | `";
+    let at = block.windows(ROW.len()).position(|w| w == ROW)? + ROW.len();
+    let rest = block.get(at..)?;
+    let end = rest.windows(3).position(|w| w == b"` |")?;
+    rest.get(..end)
+}
+
+/// Whether a block says it landed its checkout from source `source`.
+#[must_use]
+pub fn names_source(block: &[u8], source: &str) -> bool {
+    let line = format!("\n> bulkload landed this checkout from source `{source}`.");
+    block
+        .windows(line.len())
+        .any(|window| window == line.as_bytes())
 }
 
 /// Bytes as a block prints them: UTF-8 as it is, anything else escaped.
@@ -922,6 +1014,116 @@ mod tests {
         assert_eq!(marker(other.as_bytes()), Marker::Malformed);
         let tight = &block[..block.len() - 1];
         assert_eq!(marker(tight), Marker::Malformed);
+    }
+
+    // 2026-10-22 (GF g55 lane 0): `--check` counted 30 open rows while the
+    // block listed 30 names and "and 6 more". The rows are uncapped, one
+    // per counted row, each attributable; the block keeps its cap.
+    #[test]
+    fn open_rows_are_uncapped_and_their_count_is_open() {
+        let mut inputs = sample();
+        // One class past the block's cap, and one more class.
+        inputs.refs = (0..REF_NAMES + 6)
+            .map(|n| RefDiff {
+                class: if n < REF_NAMES + 4 {
+                    "diverged"
+                } else {
+                    "source-ahead"
+                }
+                .to_owned(),
+                name: format!("refs/heads/r{n:03}"),
+            })
+            .chain([RefDiff {
+                class: "dest-ahead".to_owned(),
+                name: "refs/heads/ahead".to_owned(),
+            }])
+            .collect();
+        inputs.dest_only = (0..REF_NAMES + 2)
+            .map(|n| DestOnly {
+                path: format!("/estate/gf/wt-{n:03}").into_bytes(),
+                consolidated: n % 3 != 0,
+                dirty: n % 5 == 0,
+            })
+            .collect();
+        inputs.sibling = Some(Sibling {
+            path: b"/live/gf".to_vec(),
+            state: SiblingState::Head {
+                branch: None,
+                oid: "c".repeat(40),
+            },
+            consolidated: true,
+            dirty: true,
+        });
+        inputs.refused = vec![("d".repeat(64), "GIT_DESTINATION_MODIFIED".to_owned())];
+        inputs.current = Some([2; 32]);
+        let rows = inputs.open_rows();
+        assert_eq!(u64::try_from(rows.len()).unwrap(), inputs.open());
+        let refs: Vec<&OpenRow> = rows.iter().filter(|row| row.kind == "ref").collect();
+        assert_eq!(refs.len(), REF_NAMES + 6, "dest-ahead is never open");
+        for n in 0..REF_NAMES + 6 {
+            let name = format!("refs/heads/r{n:03}");
+            assert_eq!(
+                refs.iter().filter(|row| row.row == name.as_bytes()).count(),
+                1,
+                "{name}"
+            );
+        }
+        let dest_only: Vec<&OpenRow> = rows.iter().filter(|row| row.kind == "dest-only").collect();
+        let expected = (0..REF_NAMES + 2)
+            .filter(|n| n % 3 == 0 || n % 5 == 0)
+            .count();
+        assert_eq!(dest_only.len(), expected);
+        assert!(dest_only.iter().any(|row| row.row == b"/estate/gf/wt-000"
+            && row.reason == "its HEAD is in no other branch; uncommitted changes"));
+        assert!(dest_only
+            .iter()
+            .any(|row| row.row == b"/estate/gf/wt-005" && row.reason == "uncommitted changes"));
+        assert!(rows
+            .iter()
+            .any(|row| row.kind == "sibling" && row.reason == "uncommitted changes"));
+        assert!(rows.iter().any(|row| row.kind == "refused"
+            && row.row == "d".repeat(64).as_bytes()
+            && row.reason.contains("GIT_DESTINATION_MODIFIED")));
+        assert!(rows
+            .iter()
+            .any(|row| row.kind == "behind" && row.row == inputs.item.as_bytes()));
+        // The block still caps its names.
+        let text = String::from_utf8(render(&inputs, false)).unwrap();
+        assert!(text.contains("and 4 more"), "{text}");
+        assert!(
+            text.contains(&format!("- Open rows: {}", rows.len())),
+            "{text}"
+        );
+    }
+
+    // The identities of two blocks a deleted move state left on sting
+    // (2026-10-22, GF g55 lane 0): a landing's `for=` is a function of the
+    // destination host, the path its block names as this landing and the
+    // SOURCE label, so an orphaned block can be proved this host's own
+    // from its text alone, also after its workspace moved.
+    #[test]
+    fn an_orphaned_blocks_identity_is_derivable_from_its_text() {
+        assert_eq!(
+            owner(
+                "sting",
+                b"/srv/fast-local/jess/git/GloriousFlywheel.neo-20261016",
+                "neo-inplace-20261016"
+            ),
+            "5424308c007efc12"
+        );
+        assert_eq!(
+            owner(
+                "sting",
+                b"/srv/fast-local/jess/git/GloriousFlywheel/.worktrees/g41-h3-admission",
+                "neo-inplace-20261016"
+            ),
+            "919c28cda68e71b4"
+        );
+        let block = render(&sample(), false);
+        assert_eq!(landing_of(&block), Some(sample().workspace.as_slice()));
+        assert!(names_source(&block, "neo"));
+        assert!(!names_source(&block, "ne"));
+        assert!(!names_source(&block, "neo-inplace"));
     }
 
     #[test]

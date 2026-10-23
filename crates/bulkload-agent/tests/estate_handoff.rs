@@ -2881,3 +2881,253 @@ fn h50_keep_going_makes_a_workspace_refusal_its_row() {
         kept.stdout
     );
 }
+
+/// `estate-handoff --clear --orphaned --workspace PATH... SOURCE`.
+fn orphaned(workspaces: &[&Path], extra: &[&str]) -> Ran {
+    let mut list: Vec<OsString> = vec![
+        "estate-handoff".into(),
+        "--clear".into(),
+        "--orphaned".into(),
+    ];
+    list.extend(extra.iter().map(OsString::from));
+    for workspace in workspaces {
+        list.push("--workspace".into());
+        list.push(workspace.as_os_str().to_owned());
+    }
+    list.push(SOURCE.into());
+    agent(&list)
+}
+
+/// H58 (2026-10-22, GF g55 lane 0): the plan, corpus and state a block
+/// was rendered from are deleted (a move state removed under an operator
+/// ruling), so `--check` and `--clear` cannot read the plan whose items
+/// they iterate. `--clear --orphaned` clears each named workspace's block
+/// with no plan: the files and `git status` return byte for byte to what
+/// they were before the render, the record goes as `--clear` removes it,
+/// nothing else under the destination moves, and a rerun is a no-op. A
+/// workspace that moved since its block was rendered is found by the
+/// landing the block names.
+#[test]
+fn h58_an_orphaned_block_is_cleared_with_no_plan() {
+    let world = World::new();
+    let snapshot = |worktrees: &[PathBuf]| -> Vec<(Vec<u8>, Vec<u8>, String)> {
+        worktrees
+            .iter()
+            .map(|w| {
+                (
+                    fs::read(w.join("AGENTS.md")).unwrap(),
+                    fs::read(w.join("CLAUDE.md")).unwrap(),
+                    status(w),
+                )
+            })
+            .collect()
+    };
+    let before = snapshot(&[world.dst(), world.dst_wt()]);
+    assert!(world.handoff(&[]).ok);
+    // The linked worktree moves after its block was rendered.
+    let moved = world.root.join("dst/wt-moved");
+    git(
+        &world.dst(),
+        &[
+            "worktree",
+            "move",
+            world.dst_wt().to_str().unwrap(),
+            moved.to_str().unwrap(),
+        ],
+    );
+    // Its record is lost too: the block itself proves it this host's, for
+    // the landing it names.
+    fs::remove_file(
+        world
+            .dst()
+            .join(".git/worktrees/wt/bulkload/v1/neo/handoff.landed"),
+    )
+    .unwrap();
+    fs::remove_dir_all(world.root.join("carry")).unwrap();
+    fs::remove_dir_all(world.state()).unwrap();
+    let check = world.handoff(&["--check"]);
+    assert!(!check.ok, "{}", check.stdout);
+    assert!(check.stderr.contains("IO (errno 2)"), "{}", check.stderr);
+    // A relative workspace refuses before anything is read.
+    let relative = orphaned(&[Path::new("dst/main")], &[]);
+    assert!(!relative.ok);
+    assert!(
+        relative.stderr.contains("PATH_NOT_ABSOLUTE"),
+        "{}",
+        relative.stderr
+    );
+    // `--orphaned` takes `--clear` and workspaces only.
+    let mixed = orphaned(&[&world.dst()], &["--legacy-only"]);
+    assert!(!mixed.ok);
+    assert!(
+        mixed.stderr.contains("FIELD_DOMAIN_VIOLATION"),
+        "{}",
+        mixed.stderr
+    );
+    let frozen = frozen_but_targets(&world.root.join("dst"), &[world.dst(), moved.clone()]);
+    let cleared = orphaned(&[&world.dst(), &moved], &[]);
+    assert!(cleared.ok, "{}\n{}", cleared.stdout, cleared.stderr);
+    for (worktree, kind) in [(&world.dst(), "prefixed"), (&moved, "unrecorded")] {
+        let line = row(&cleared.stdout, worktree);
+        assert!(line.contains("\"mode\":\"clear-orphaned\""), "{line}");
+        assert!(line.contains("\"outcome\":\"cleared\""), "{line}");
+        assert_eq!(
+            line.contains("\"item\":null"),
+            kind == "unrecorded",
+            "the record's item, when there is one: {line}"
+        );
+        for name in ["AGENTS.md", "CLAUDE.md"] {
+            assert!(
+                line.contains(&format!(
+                    "{{\"path\":\"{name}\",\"kind\":\"{kind}\",\"action\":\"cleared\"}}"
+                )),
+                "{line}"
+            );
+        }
+    }
+    assert!(
+        cleared
+            .stdout
+            .contains("\"kind\":\"summary\",\"mode\":\"clear-orphaned\",\"workspaces\":2"),
+        "{}",
+        cleared.stdout
+    );
+    // Nothing but the targets and the ledgers moved (before `git status`
+    // below refreshes the index).
+    assert_eq!(
+        frozen_but_targets(&world.root.join("dst"), &[world.dst(), moved.clone()]),
+        frozen
+    );
+    assert_eq!(snapshot(&[world.dst(), moved.clone()]), before);
+    for ledger in [
+        world.dst().join(".git/bulkload/v1/neo"),
+        world.dst().join(".git/worktrees/wt/bulkload/v1/neo"),
+    ] {
+        assert!(
+            !ledger.join("handoff.landed").exists(),
+            "{}",
+            ledger.display()
+        );
+        assert!(
+            !ledger.join("handoff.intent").exists(),
+            "{}",
+            ledger.display()
+        );
+    }
+    let all = freeze_all(&world.root.join("dst"));
+    let again = orphaned(&[&world.dst(), &moved], &[]);
+    assert!(again.ok, "{}", again.stderr);
+    assert!(row(&again.stdout, &world.dst()).contains("\"outcome\":\"unchanged\""));
+    assert_eq!(freeze_all(&world.root.join("dst")), all);
+}
+
+/// H59 (2026-10-22): an orphaned clear refuses, typed and with nothing
+/// written, a block of SOURCE whose markers are malformed, and a target
+/// that is a symbolic link out of the worktree; text another source's
+/// block holds is never touched; `--keep-going` makes each refusal its
+/// own row.
+#[test]
+fn h59_an_orphaned_clear_refuses_malformed_markers_and_links() {
+    let world = World::new();
+    assert!(world.handoff(&[]).ok);
+    fs::remove_dir_all(world.root.join("carry")).unwrap();
+    // The main worktree's AGENTS.md block is cut: its END line is gone.
+    let agents = world.dst().join("AGENTS.md");
+    let bytes = fs::read(&agents).unwrap();
+    let block = block_of(&agents);
+    let end = block.len() - 40;
+    let mut cut = bytes[..end].to_vec();
+    cut.extend_from_slice(&bytes[block.len()..]);
+    fs::write(&agents, &cut).unwrap();
+    // The linked worktree's CLAUDE.md is a link out of it.
+    let claude = world.dst_wt().join("CLAUDE.md");
+    fs::remove_file(&claude).unwrap();
+    std::os::unix::fs::symlink("../elsewhere.md", &claude).unwrap();
+    let frozen = freeze_all(&world.root.join("dst"));
+    let ran = orphaned(&[&world.dst(), &world.dst_wt()], &[]);
+    assert!(!ran.ok);
+    assert!(
+        row(&ran.stdout, &world.dst()).contains("\"refusal\":\"HANDOFF_BLOCK_MODIFIED\""),
+        "{}",
+        ran.stdout
+    );
+    assert!(
+        row(&ran.stdout, &world.dst_wt()).contains("\"refusal\":\"HANDOFF_TARGET_UNSUPPORTED\""),
+        "{}",
+        ran.stdout
+    );
+    assert_eq!(freeze_all(&world.root.join("dst")), frozen);
+    assert_eq!(fs::read(&agents).unwrap(), cut);
+    let kept = orphaned(&[&world.dst(), &world.dst_wt()], &["--keep-going"]);
+    assert!(kept.ok, "{}\n{}", kept.stdout, kept.stderr);
+    assert!(kept.stdout.contains("\"refused\":2"), "{}", kept.stdout);
+    assert_eq!(freeze_all(&world.root.join("dst")), frozen);
+}
+
+/// H60 (2026-10-22, GF g55 lane 0): `--check` counted 30 open rows while
+/// the block listed 30 ref names "and N more". `--check` and `--dry-run`
+/// print one `open-row` line per open row after the workspace line,
+/// uncapped, each with its class, its ref and its reason, and the
+/// workspace line's `open` is their number; the block keeps its cap.
+#[test]
+fn h60_every_open_row_is_listed_uncapped() {
+    const BRANCHES: usize = 36;
+    let world = World::new();
+    let names: Vec<String> = (0..BRANCHES).map(|n| format!("b{n:02}")).collect();
+    let c0 = git(&world.src(), &["rev-parse", "HEAD"]);
+    fs::write(world.src().join("a.txt"), b"alpha 2\n").unwrap();
+    git(&world.src(), &["commit", "--quiet", "-am", "c1"]);
+    for name in &names {
+        git(&world.src(), &["branch", name]);
+    }
+    settle();
+    world.capture();
+    let applied = world.apply();
+    assert!(applied.ok, "{}\n{}", applied.stdout, applied.stderr);
+    // The destination's branches fall back to c0: the landing is ahead.
+    for name in &names {
+        git(&world.dst(), &["branch", "-f", name, c0.trim()]);
+    }
+    settle();
+    for mode in ["--check", "--dry-run"] {
+        let ran = world.handoff(&[mode]);
+        assert!(ran.ok, "{mode}: {}\n{}", ran.stdout, ran.stderr);
+        let line = row(&ran.stdout, &world.dst());
+        let open: usize = line
+            .split("\"open\":")
+            .nth(1)
+            .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|digits| digits.parse().ok())
+            .unwrap_or_else(|| panic!("{line}"));
+        let needle = format!("\"workspace\":\"{}\"", world.dst().display());
+        let rows: Vec<&str> = ran
+            .stdout
+            .lines()
+            .filter(|line| line.contains("\"kind\":\"open-row\"") && line.contains(&needle))
+            .collect();
+        assert_eq!(rows.len(), open, "{mode}: {}", ran.stdout);
+        assert!(open >= BRANCHES, "{mode}: {line}");
+        for name in &names {
+            let ref_row = format!("\"row\":\"refs/heads/{name}\"");
+            let found: Vec<&&str> = rows.iter().filter(|row| row.contains(&ref_row)).collect();
+            assert_eq!(found.len(), 1, "{mode} {name}: {}", ran.stdout);
+            assert!(found[0].contains("\"class\":\"ref\""), "{}", found[0]);
+            assert!(
+                found[0].contains("\"reason\":\"source-ahead: "),
+                "{}",
+                found[0]
+            );
+            assert!(found[0].contains("\"mode\":\""), "{}", found[0]);
+        }
+        if mode == "--dry-run" {
+            let refs = rows
+                .iter()
+                .filter(|row| row.contains("\"class\":\"ref\""))
+                .count();
+            assert!(
+                line.contains(&format!("and {} more", refs - 30)),
+                "the block keeps its cap: {line}"
+            );
+        }
+    }
+}

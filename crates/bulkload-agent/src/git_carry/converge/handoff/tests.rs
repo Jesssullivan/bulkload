@@ -676,3 +676,226 @@ proptest! {
         prop_assert_eq!(fs::read_dir(&worktree).unwrap().count(), 1);
     }
 }
+
+// ---- `--clear --orphaned` (2026-10-22) ---------------------------------------------
+
+const ORPHAN_SOURCE: &str = "neo-inplace";
+
+/// A block of source `source` rendered on `host` for the landing at
+/// `workspace`.
+fn block_for_landing(host: &str, workspace: &Path, source: &str) -> Vec<u8> {
+    let mut inputs = render::sample();
+    inputs.dest_host = host.to_owned();
+    inputs.workspace = workspace.as_os_str().as_bytes().to_vec();
+    inputs.source = source.to_owned();
+    render::render(&inputs, false)
+}
+
+#[test]
+fn source_blocks_finds_the_sources_blocks_in_the_head_chain_only() {
+    let at = Path::new("/estate/main");
+    let ours = block_for_landing("sting", at, ORPHAN_SOURCE);
+    let other = block_for_landing("sting", at, "neo");
+    let body = b"# Agents\n";
+    // Another source's block above ours, the body below: ours alone.
+    let bytes = cat(&[&other, &ours, body]);
+    assert_eq!(
+        source_blocks(&bytes, ORPHAN_SOURCE).unwrap(),
+        vec![other.len()..other.len() + ours.len()]
+    );
+    assert_eq!(source_blocks(&bytes, "neo").unwrap(), vec![0..other.len()]);
+    // A block below text is not in the chain.
+    let later = cat(&[body, &ours]);
+    assert!(source_blocks(&later, ORPHAN_SOURCE).unwrap().is_empty());
+    // A source's block cut (a BEGIN with no END) refuses; another
+    // source's cut block above nothing of ours is no block of ours.
+    let cut = &ours[..ours.len() - 40];
+    assert_eq!(
+        source_blocks(cut, ORPHAN_SOURCE),
+        Err(BulkloadRefusal::HandoffBlockModified)
+    );
+    assert!(source_blocks(&other[..other.len() - 40], ORPHAN_SOURCE)
+        .unwrap()
+        .is_empty());
+    // A block holding another block's markers (nested) refuses.
+    let text = String::from_utf8(ours.clone()).unwrap();
+    let nested = text.replacen(
+        "\n**Do this first**",
+        &format!("\n{}\n**Do this first**", String::from_utf8(other).unwrap()),
+        1,
+    );
+    assert!(matches!(
+        render::marker(nested.as_bytes()),
+        render::Marker::Block(_)
+    ));
+    assert_eq!(
+        source_blocks(nested.as_bytes(), ORPHAN_SOURCE),
+        Err(BulkloadRefusal::HandoffBlockModified)
+    );
+}
+
+/// A checkout (`git init`) to clear in, canonical.
+fn checkout() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fs::canonicalize(dir.path()).unwrap().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git_run(&repo, &["init", "--quiet", "--template=", "-b", "main"]);
+    (dir, repo)
+}
+
+/// An orphaned clear with no plan and no record: each block of the source
+/// this host rendered (also for the path the workspace had before it
+/// moved) is removed byte for byte, text outside it untouched, a carried
+/// block kept; a file left empty is kept (only a record proves bulkload
+/// created it); the clear is recorded (no intent left) and a rerun is a
+/// no-op.
+#[test]
+fn an_orphaned_clear_removes_this_hosts_blocks_byte_for_byte() {
+    let (_dir, repo) = checkout();
+    let host = host();
+    let ours = block_for_landing(&host, &repo, ORPHAN_SOURCE);
+    let moved = block_for_landing(&host, Path::new("/srv/old/name"), ORPHAN_SOURCE);
+    let neo = block_for_landing(&host, &repo, "neo");
+    let carried = block_for_landing("another-host", &repo, ORPHAN_SOURCE);
+    let agents_body = b"# Agents\n\nRepository rules.\n\n<!-- a trailing note -->\n";
+    fs::write(repo.join("AGENTS.md"), cat(&[&neo, &ours, agents_body])).unwrap();
+    fs::write(repo.join("CLAUDE.md"), cat(&[&moved, b"See AGENTS.md.\n"])).unwrap();
+    fs::write(repo.join(README), cat(&[&carried, b"# Readme\n"])).unwrap();
+    fs::write(repo.join(LOCAL), &ours).unwrap();
+    let row = clear_orphaned(&repo, ORPHAN_SOURCE).unwrap();
+    assert_eq!(row.outcome, "cleared");
+    assert_eq!(
+        fs::read(repo.join("AGENTS.md")).unwrap(),
+        cat(&[&neo, agents_body]),
+        "another source's block and the body stay byte for byte"
+    );
+    assert_eq!(
+        fs::read(repo.join("CLAUDE.md")).unwrap(),
+        b"See AGENTS.md.\n"
+    );
+    assert_eq!(
+        fs::read(repo.join(README)).unwrap(),
+        cat(&[&carried, b"# Readme\n"]),
+        "a block another host rendered is carried content"
+    );
+    assert_eq!(fs::read(repo.join(LOCAL)).unwrap(), b"");
+    let actions: Vec<(String, &str, &str)> = row
+        .files
+        .iter()
+        .map(|file| {
+            (
+                String::from_utf8(file.path.clone()).unwrap(),
+                file.kind,
+                file.action,
+            )
+        })
+        .collect();
+    assert_eq!(
+        actions,
+        vec![
+            ("AGENTS.md".to_owned(), "unrecorded", "cleared"),
+            (
+                "CLAUDE.local.md".to_owned(),
+                "unrecorded",
+                "cleared-empty-kept"
+            ),
+            ("CLAUDE.md".to_owned(), "unrecorded", "cleared"),
+            ("README.md".to_owned(), "unrecorded", "carried-kept"),
+        ]
+    );
+    let dir = landed::ledger_dir(&repo.join(".git"), ORPHAN_SOURCE);
+    assert!(!dir.join(HANDOFF_INTENT).exists());
+    assert!(!dir.join(HANDOFF_LANDED).exists());
+    let names: Vec<_> = fs::read_dir(&repo)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.as_bytes().starts_with(TEMP_PREFIX.as_bytes()))
+        .collect();
+    assert!(names.is_empty(), "{names:?}");
+    let again = clear_orphaned(&repo, ORPHAN_SOURCE).unwrap();
+    assert_eq!(again.outcome, "unchanged");
+    assert_eq!(
+        fs::read(repo.join("AGENTS.md")).unwrap(),
+        cat(&[&neo, agents_body])
+    );
+}
+
+/// With its record: the recorded block is cleared (also unsealed bytes
+/// would not be needed), a file the record names as created is removed,
+/// and the record goes as `--clear` removes it.
+#[test]
+fn an_orphaned_clear_follows_the_record_for_a_created_file() {
+    let (_dir, repo) = checkout();
+    let ours = block_for_landing(&host(), &repo, ORPHAN_SOURCE);
+    fs::write(repo.join(LOCAL), &ours).unwrap();
+    let dir = landed::ensure_dir(&repo.join(".git"), ORPHAN_SOURCE).unwrap();
+    let mut record = record(&ours);
+    record.files[0].path = LOCAL.as_bytes().to_vec();
+    record.files[0].kind = FileKind::Created;
+    landed::write(&dir.join(HANDOFF_LANDED), &record).unwrap();
+    let row = clear_orphaned(&repo, ORPHAN_SOURCE).unwrap();
+    assert_eq!(row.outcome, "cleared");
+    assert_eq!(row.item.as_deref(), Some("i"));
+    assert_eq!(row.files.len(), 1);
+    assert_eq!(
+        (row.files[0].kind, row.files[0].action),
+        ("created", "cleared")
+    );
+    assert!(!repo.join(LOCAL).exists(), "bulkload created it: removed");
+    assert!(!dir.join(HANDOFF_LANDED).exists());
+    assert!(!dir.join(HANDOFF_INTENT).exists());
+}
+
+/// Refusals, each with nothing written: a relative path, a symbolic link
+/// out of the worktree, a malformed or an edited block of the source.
+#[test]
+fn an_orphaned_clear_refuses_typed_and_writes_nothing() {
+    assert_eq!(
+        clear_orphaned(Path::new("relative/repo"), ORPHAN_SOURCE),
+        Err(BulkloadRefusal::PathNotAbsolute)
+    );
+    let (_dir, repo) = checkout();
+    let ours = block_for_landing(&host(), &repo, ORPHAN_SOURCE);
+    let agents = cat(&[&ours, LANDED]);
+    fs::write(repo.join("AGENTS.md"), &agents).unwrap();
+    // A malformed block of the source in a later target: nothing written,
+    // AGENTS.md's good block included.
+    let cut = cat(&[&ours[..ours.len() - 30], b"\nbody\n"]);
+    fs::write(repo.join("CLAUDE.md"), &cut).unwrap();
+    assert_eq!(
+        clear_orphaned(&repo, ORPHAN_SOURCE),
+        Err(BulkloadRefusal::HandoffBlockModified)
+    );
+    assert_eq!(fs::read(repo.join("AGENTS.md")).unwrap(), agents);
+    assert_eq!(fs::read(repo.join("CLAUDE.md")).unwrap(), cut);
+    // An edit inside a block no record names.
+    let edited = String::from_utf8(ours)
+        .unwrap()
+        .replacen("converge", "converg3", 1);
+    fs::write(repo.join("CLAUDE.md"), edited.as_bytes()).unwrap();
+    assert_eq!(
+        clear_orphaned(&repo, ORPHAN_SOURCE),
+        Err(BulkloadRefusal::HandoffBlockModified)
+    );
+    assert_eq!(fs::read(repo.join("AGENTS.md")).unwrap(), agents);
+    // A target that is a link out of the worktree.
+    fs::remove_file(repo.join("CLAUDE.md")).unwrap();
+    std::os::unix::fs::symlink("../elsewhere.md", repo.join("CLAUDE.md")).unwrap();
+    assert_eq!(
+        clear_orphaned(&repo, ORPHAN_SOURCE),
+        Err(BulkloadRefusal::HandoffTargetUnsupported)
+    );
+    assert_eq!(fs::read(repo.join("AGENTS.md")).unwrap(), agents);
+    // A link to the other target is never followed: covered by its scan.
+    fs::remove_file(repo.join("CLAUDE.md")).unwrap();
+    std::os::unix::fs::symlink("AGENTS.md", repo.join("CLAUDE.md")).unwrap();
+    assert_eq!(
+        clear_orphaned(&repo, ORPHAN_SOURCE).unwrap().outcome,
+        "cleared"
+    );
+    assert_eq!(fs::read(repo.join("AGENTS.md")).unwrap(), LANDED);
+    assert!(fs::symlink_metadata(repo.join("CLAUDE.md"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}

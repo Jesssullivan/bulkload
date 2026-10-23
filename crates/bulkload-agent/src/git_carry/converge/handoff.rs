@@ -50,8 +50,8 @@ use super::{head_of, lstat, sides, Meta, Side};
 use crate::{BulkloadRefusal, Result};
 
 pub use render::{
-    rfc3339, Build, CaptureFacts, DestOnly, FamilyRow, Inputs, Landing, Omitted, RefDiff, Sibling,
-    SiblingState, MAX_BLOCK, TOKEN,
+    rfc3339, Build, CaptureFacts, DestOnly, FamilyRow, Inputs, Landing, Omitted, OpenRow, RefDiff,
+    Sibling, SiblingState, MAX_BLOCK, TOKEN,
 };
 
 /// The schema of every `estate-handoff` line.
@@ -286,8 +286,8 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(bytes).as_bytes()
 }
 
-fn len64(bytes: &[u8]) -> u64 {
-    u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+fn len64<T>(items: &[T]) -> u64 {
+    u64::try_from(items.len()).unwrap_or(u64::MAX)
 }
 
 // ---- the converge overlay ------------------------------------------------------
@@ -1566,6 +1566,11 @@ pub struct Row {
     /// the carried capture reaches): information, never a refusal
     /// (OI-1003-Q191).
     pub source_history: Option<bool>,
+    /// `--check` and `--dry-run`: every open row `open` counts, uncapped
+    /// (2026-10-22); `open` is their number.
+    pub open_rows: Vec<OpenRow>,
+    /// `--clear --orphaned`: the item the cleared record named, if any.
+    pub item: Option<String>,
 }
 
 /// One worktree of the family, read as metadata.
@@ -2800,11 +2805,13 @@ fn render_workspace(
         });
     }
     if request.mode == Mode::DryRun {
+        let open_rows = facts.open_rows();
         return Ok(Row {
             outcome: "planned",
             files: rows,
             inputs: Some(inputs),
-            open: Some(open),
+            open: Some(len64(&open_rows)),
+            open_rows,
             block: Some(block),
             ..Row::default()
         });
@@ -3160,6 +3167,324 @@ fn clear(worktree: &Path, dir: &Path, source: &str, ours: &str, carried: bool) -
     })
 }
 
+// ---- clearing an orphaned block ---------------------------------------------------
+
+/// The blocks naming source `source` in the chain at the head of `bytes`,
+/// found by their own BEGIN and END markers ([`render::marker`]).
+///
+/// A render writes its block at byte 0 of what the file held, so the
+/// blocks of several renders stack from byte 0, each a well-formed block
+/// that ends with its END line and one empty line, and removing one's
+/// bytes returns the file to what it held before that block was written.
+/// A block naming another source is stepped over and kept.
+///
+/// # Errors
+/// `HANDOFF_BLOCK_MODIFIED` when a block that names `source` cannot be
+/// delimited: malformed markers (a BEGIN with no END line for its id, no
+/// empty line after it) or markers nested inside it (a second BEGIN or END
+/// line within its bytes).
+fn source_blocks(bytes: &[u8], source: &str) -> Result<Vec<std::ops::Range<usize>>> {
+    let count =
+        |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).filter(|w| *w == needle).count();
+    let mut found = Vec::new();
+    let mut at = 0;
+    loop {
+        let rest = bytes.get(at..).unwrap_or_default();
+        match render::marker(rest) {
+            render::Marker::None => break,
+            render::Marker::Malformed => {
+                // Nothing below a block that cannot be delimited can be found.
+                let window = rest.get(..MAX_BLOCK.min(rest.len())).unwrap_or_default();
+                if render::names_source(window, source) {
+                    return Err(BulkloadRefusal::HandoffBlockModified);
+                }
+                break;
+            }
+            render::Marker::Block(len) => {
+                let block = rest.get(..len).unwrap_or_default();
+                if render::names_source(block, source) {
+                    if count(block, render::BEGIN) != 1 || count(block, render::END) != 1 {
+                        return Err(BulkloadRefusal::HandoffBlockModified);
+                    }
+                    found.push(at..at + len);
+                }
+                at += len;
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// One target an orphaned clear rewrites.
+struct OrphanClearing {
+    name: &'static str,
+    read: Whole,
+    /// The bytes of the block(s) removed, contiguous from byte 0, when the
+    /// removal is that (the intent's old block, accepted by converge while
+    /// the intent is pending).
+    old_block: Option<Vec<u8>>,
+    after: Vec<u8>,
+    /// The file is removed: the record names it as created and nothing is
+    /// left of it.
+    gone: bool,
+    kind: &'static str,
+}
+
+/// `estate-handoff --clear --orphaned` (2026-10-22): one workspace.
+///
+/// Clear the hand-off blocks of source `source` in `worktree` when the
+/// plan, corpus and state they were rendered from are gone, with no plan
+/// or move state read.
+///
+/// Each target ([`ALL_NAMES`]) is read whole; each block in the chain at
+/// its head that names `source` ([`source_blocks`]) is removed, byte for
+/// byte, when it is this host's own: the record's block (`handoff.landed`,
+/// by length and blake3), or, with no record or another block, one sealed
+/// as estate-handoff rendered it whose `for=` is this host's identity for
+/// `source` and the landing the block names (its "This landing" path, so a
+/// block of a workspace that moved since is found), the given path or its
+/// canonical form. A block naming `source` that is not this host's (one
+/// carried with the source's bytes), and a block the target's landed blob
+/// itself starts with (a round trip), are content and kept
+/// (`carried-kept`, OI-1003-Q185). Nothing outside the removed blocks is
+/// touched. A file the record names as created and left empty is removed;
+/// any other file left empty is kept (`cleared-empty-kept`): only a
+/// record proves bulkload created it.
+///
+/// The edit is recorded as `--clear` records it: under the repository's
+/// destination lock, `handoff.intent` durable before the first target is
+/// written, each target through a temporary, fsync and `RENAME_EXCHANGE`
+/// with the displaced file checked, then `handoff.landed` and the intent
+/// removed. A pending intent is settled first, as `--clear` does; a
+/// crashed orphaned clear is finished by the next one.
+///
+/// # Errors
+/// `PATH_NOT_ABSOLUTE` for a relative `worktree`; `HANDOFF_NOT_LANDED`
+/// when it is not a Git checkout; `HANDOFF_TARGET_UNSUPPORTED` when it, or
+/// a target, is a symbolic link (other than one target to another in the
+/// worktree, which is never followed); `HANDOFF_BLOCK_MODIFIED` for a
+/// block of `source` that is malformed, nested or edited inside;
+/// `GIT_CONVERGE_INTERRUPTED` while a converge is pending; all with
+/// nothing written. A writer that raced an exchange is put back and the
+/// run refuses `HANDOFF_BLOCK_MODIFIED`, its intent kept.
+#[allow(clippy::too_many_lines)]
+pub fn clear_orphaned(worktree: &Path, source: &str) -> Result<Row> {
+    const SITE: &str = "git_carry::converge::handoff::clear_orphaned";
+    if !worktree.is_absolute() {
+        return Err(BulkloadRefusal::PathNotAbsolute);
+    }
+    match lstat(worktree)? {
+        None => return Err(BulkloadRefusal::HandoffNotLanded),
+        Some(meta) if !meta.is_dir() => return Err(BulkloadRefusal::HandoffTargetUnsupported),
+        Some(_) => {}
+    }
+    let git_dir = landed::worktree_git_dir(worktree)?
+        .filter(|dir| dir.is_dir())
+        .ok_or(BulkloadRefusal::HandoffNotLanded)?;
+    let dir = landed::ledger_dir(&git_dir, source);
+    let common = landed::common_dir(&git_dir)?;
+    let _lock = landed::lock(&common, source)?;
+    if landed::exists(&dir.join(landed::WORKSPACE_INTENT))? {
+        return Err(BulkloadRefusal::GitConvergeInterrupted);
+    }
+    let shown_at = worktree.as_os_str().as_bytes();
+    let ours = render::owner(&host(), shown_at, source);
+    let intent_path = dir.join(HANDOFF_INTENT);
+    let record_path = dir.join(HANDOFF_LANDED);
+    // A pending intent: a render's, or a clear of carried blocks, is
+    // settled as `--clear` settles it; a plain clear (this verb's own, or
+    // `--clear`'s) is swept, and the scan below finishes it: it removes
+    // every block of `source` that clear would.
+    let pending = match landed::read::<HandoffIntent>(&intent_path)? {
+        Some(intent)
+            if intent.op == Op::Render || intent.carried || !intent.stripped.is_empty() =>
+        {
+            settle(worktree, &dir, source, &ours)?;
+            landed::exists(&intent_path)?
+        }
+        Some(intent) => {
+            let record = landed::read::<HandoffLanded>(&record_path)?;
+            sweep(worktree, Some(&intent), record.as_ref())?;
+            true
+        }
+        None => false,
+    };
+    let record = landed::read::<HandoffLanded>(&record_path)?;
+    let instance = landed_of(&dir)?;
+    let mut landed = Landed {
+        source,
+        instance: instance.as_deref().unwrap_or_default(),
+        sides: None,
+        stripped: stripped_of(&dir)?,
+    };
+    let host = host();
+    let canonical_at = canonical(worktree);
+    let paths: [&[u8]; 2] = [shown_at, canonical_at.as_os_str().as_bytes()];
+    let mut work: Vec<OrphanClearing> = Vec::new();
+    let mut rows = Vec::new();
+    for name in ALL_NAMES {
+        let path = worktree.join(name);
+        let Some(meta) = lstat(&path)? else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            // A link to another target is covered by that target's own
+            // scan, and never followed.
+            let link = fs::read_link(&path)
+                .refuse_at(SITE)?
+                .into_os_string()
+                .into_vec();
+            if covered_link(name, &link) {
+                continue;
+            }
+            return Err(BulkloadRefusal::HandoffTargetUnsupported);
+        }
+        if !meta.is_file() {
+            continue;
+        }
+        let read = read_whole(&path, name)?;
+        let entry = record.as_ref().and_then(|record| {
+            record.files.iter().find(|file| {
+                file.path == name.as_bytes() && !matches!(file.kind, FileKind::ViaSymlink(_))
+            })
+        });
+        let kind = entry.map_or("unrecorded", |file| file.kind.name());
+        let mut cuts: Vec<std::ops::Range<usize>> = Vec::new();
+        for range in source_blocks(&read.bytes, source)? {
+            let block = read.bytes.get(range.clone()).unwrap_or_default();
+            let recorded = entry
+                .is_some_and(|file| file.block_len == len64(block) && file.block == digest(block));
+            if !recorded {
+                if !render::sealed(block) {
+                    return Err(BulkloadRefusal::HandoffBlockModified);
+                }
+                let mine = render::owner_of(block).is_some_and(|owner| {
+                    render::landing_of(block)
+                        .into_iter()
+                        .chain(paths)
+                        .any(|at| render::owner(&host, at, source).as_bytes() == owner)
+                });
+                if !mine {
+                    rows.push(FileRow {
+                        path: name.as_bytes().to_vec(),
+                        kind,
+                        action: "carried-kept",
+                    });
+                    continue;
+                }
+            }
+            // A block the landed blob itself starts with (with what is
+            // above it) came back with the source's bytes: content.
+            let head = read.bytes.get(..range.end).unwrap_or_default();
+            if landed_compare(worktree, &mut landed, name, head, true, false)?.is_some() {
+                rows.push(FileRow {
+                    path: name.as_bytes().to_vec(),
+                    kind,
+                    action: "carried-kept",
+                });
+                continue;
+            }
+            cuts.push(range);
+        }
+        let Some(first) = cuts.first() else {
+            continue;
+        };
+        let contiguous = first.start == 0
+            && cuts
+                .windows(2)
+                .all(|pair| pair.first().map(|a| a.end) == pair.get(1).map(|b| b.start));
+        let old_block = contiguous
+            .then(|| cuts.last().and_then(|last| read.bytes.get(..last.end)))
+            .flatten()
+            .map(<[u8]>::to_vec);
+        let mut after = Vec::with_capacity(read.bytes.len());
+        let mut at = 0;
+        for cut in &cuts {
+            after.extend_from_slice(read.bytes.get(at..cut.start).unwrap_or_default());
+            at = cut.end;
+        }
+        after.extend_from_slice(read.bytes.get(at..).unwrap_or_default());
+        let gone = after.is_empty() && entry.is_some_and(|file| file.kind == FileKind::Created);
+        work.push(OrphanClearing {
+            name,
+            read,
+            old_block,
+            after,
+            gone,
+            kind,
+        });
+    }
+    if work.is_empty() && record.is_none() && !pending {
+        rows.sort_by(|a, b| a.path.cmp(&b.path));
+        return Ok(Row {
+            outcome: "unchanged",
+            files: rows,
+            ..Row::default()
+        });
+    }
+    let tag = tag();
+    let steps: Vec<Step> = work
+        .iter()
+        .map(|clearing| Step {
+            path: clearing.name.as_bytes().to_vec(),
+            old_block: clearing.old_block.clone(),
+            new_block: None,
+            before: Some(digest(&clearing.read.bytes)),
+            after: (!clearing.gone).then(|| digest(&clearing.after)),
+        })
+        .collect();
+    let intent = HandoffIntent {
+        op: Op::Clear,
+        tag: tag.clone(),
+        steps,
+        next: None,
+        stripped: Vec::new(),
+        carried: false,
+    };
+    if !intent.steps.is_empty() {
+        landed::ensure_dir(&git_dir, source)?;
+        landed::write(&intent_path, &intent)?;
+    }
+    for (n, clearing) in work.iter().enumerate() {
+        let temp = temp_name(&tag, n);
+        let outcome = if clearing.gone {
+            remove(worktree, clearing.name, &clearing.read, &temp)
+        } else {
+            exchange(
+                worktree,
+                clearing.name,
+                &clearing.read,
+                &clearing.after,
+                &temp,
+                Op::Clear,
+            )
+        };
+        if let Err(refusal) = outcome {
+            // The intent stays: the next run finishes the clear.
+            sweep(worktree, Some(&intent), record.as_ref())?;
+            return Err(refusal);
+        }
+        rows.push(FileRow {
+            path: clearing.name.as_bytes().to_vec(),
+            kind: clearing.kind,
+            action: if clearing.after.is_empty() && !clearing.gone {
+                "cleared-empty-kept"
+            } else {
+                "cleared"
+            },
+        });
+    }
+    landed::remove(&record_path)?;
+    landed::remove(&intent_path)?;
+    rows.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(Row {
+        outcome: "cleared",
+        files: rows,
+        item: record.map(|record| record.item),
+        ..Row::default()
+    })
+}
+
 /// The lines of the blob of `name` at `rev` (`""`: the index) that hold
 /// the token (none when there is no such blob).
 fn token_lines(worktree: &Path, rev: &str, name: &str) -> Result<BTreeSet<Vec<u8>>> {
@@ -3424,7 +3749,8 @@ fn check(
         carried,
         as_of,
     )?;
-    let open = facts.open();
+    // Every open row, uncapped (2026-10-22): `open` is their number.
+    let open_rows = facts.open_rows();
     // Commit detection (OI-1003-Q191): staged, a line holding the token in
     // a target's index blob that its HEAD blob lacks and the source's
     // history never added (a block the source committed is in HEAD
@@ -3472,7 +3798,8 @@ fn check(
         state: Some(state),
         files: rows,
         inputs: Some(inputs),
-        open: Some(open),
+        open: Some(len64(&open_rows)),
+        open_rows,
         refusal: (staged || committed).then_some(BulkloadRefusal::HandoffMarkerCommitted),
         source_history: Some(source_history),
         ..Row::default()
