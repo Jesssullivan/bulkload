@@ -447,10 +447,12 @@ SUBCOMMANDS:
                 plus worktrees of planned repositories no item plans and, with
                 --scan, Git directories under DIR in no planned family
                 (dest-only). One bulkload.estate-diff.v1 JSON line per row
-    estate-handoff [--check | --clear [--clear-carried] | --dry-run] [--item ID]...
+    estate-handoff [--check | --clear [--clear-carried | --legacy-only] | --dry-run] [--item ID]...
                 [--workspace PATH]... [--sibling LANDED_PREFIX=LIVE_PREFIX]...
+                [--place SOURCE_PREFIX=LIVE_PREFIX]...
                 [--readme] [--renew] [--as-of NS] [--keep-going]
                 (PLAN CORPUS PRIVATE_STATE | --move-state MOVE_STATE) SOURCE
+    estate-handoff --clear --orphaned --workspace PATH [--workspace PATH]... [--keep-going] SOURCE
                 TIN-6569, OI-1003-Q183: write a dated hand-off block at byte 0 of
                 AGENTS.md and CLAUDE.md in each landed workspace (absolute paths,
                 capture and landing facts, estate-diff's ref classes, the commands
@@ -494,7 +496,26 @@ SUBCOMMANDS:
                 exits 0 unless the run itself refuses. A planned workspace
                 under another planned checkout's rebuildable root (SPEC rule
                 5; a SwiftPM .build/checkouts clone) is a rebuildable row:
-                no block is rendered into it
+                no block is rendered into it. --check and --dry-run print,
+                after each workspace line, one open-row line per open row
+                its open field counts, uncapped (class ref, dest-only, sibling,
+                refused or behind; the row's ref, path or item; the reason).
+                --clear --orphaned clears SOURCE's blocks in each absolute
+                --workspace PATH whose plan, corpus and state are gone,
+                reading none of them: each block naming SOURCE in the chain
+                at a target's byte 0 is found by its own BEGIN and END
+                lines and removed byte for byte when it is this host's (the
+                record's block, or one sealed as rendered whose for= is this
+                host's for SOURCE and the landing it names, so a moved
+                workspace's block is found); text outside it is never
+                touched, and a block carried with the source's bytes is kept
+                (carried-kept). Recorded as --clear records it (the
+                intent, the exchange, the record removed); a file the record
+                names as created and left empty is removed, any other kept
+                (cleared-empty-kept). A malformed, nested or edited block of
+                SOURCE refuses HANDOFF_BLOCK_MODIFIED, a symlinked target
+                HANDOFF_TARGET_UNSUPPORTED, a relative path
+                PATH_NOT_ABSOLUTE, all with nothing written
     estate-carry-files [--dry-run] [--beside SUFFIX] [--item ID]... [--bind ID=DEST_STATE]...
                 [--bind-only] [--recarry]
                 [--host HOST --source-state-root DIR [--remote-executable PATH] [--ssh-config FILE]]
@@ -2178,6 +2199,22 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
         }
         "estate-handoff" => {
             let (options, move_state, rest) = handoff_options(args)?;
+            // `--clear --orphaned --workspace PATH... SOURCE` (2026-10-22):
+            // the blocks of a deleted move state, cleared with no plan read.
+            if options.orphaned {
+                let source = match (&move_state, rest) {
+                    (None, [source]) => source
+                        .to_str()
+                        .ok_or(BulkloadRefusal::FieldDomainViolation)?,
+                    _ => return Err(BulkloadRefusal::RequiredFieldMissing),
+                };
+                let mut output = std::io::stdout().lock();
+                let outcome = estate::handoff_orphaned(source, &options, &mut |line| {
+                    writeln!(output, "{line}").refuse_at("main::estate_command")
+                });
+                output.flush().refuse_at("main::estate_command")?;
+                return outcome.map(drop);
+            }
             // `--move-state MOVE_STATE SOURCE` (2026-10-22): a streamed
             // pass's PLAN, CORPUS and PRIVATE_STATE, as its block names them.
             let (plan, corpus, state, source) = match &move_state {
@@ -2590,6 +2627,7 @@ fn handoff_options(
             "--clear-carried" => flag(&mut options.clear_carried)?,
             "--legacy-only" => flag(&mut options.legacy_only)?,
             "--keep-going" => flag(&mut options.keep_going)?,
+            "--orphaned" => flag(&mut options.orphaned)?,
             "--move-state" if move_state.is_none() => {
                 move_state = Some(PathBuf::from(value(at + 1)?));
                 at += 1;

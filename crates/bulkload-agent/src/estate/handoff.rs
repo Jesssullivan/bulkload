@@ -77,6 +77,11 @@ pub struct HandoffOptions {
     /// run's; the run refuses only for itself (a malformed option or plan,
     /// the lock).
     pub keep_going: bool,
+    /// `--orphaned` (with `--clear` and `--workspace` only, 2026-10-22):
+    /// clear the blocks of SOURCE in the named workspaces when the plan,
+    /// corpus and state they were rendered from are gone; no plan or move
+    /// state is read ([`handoff_orphaned`]).
+    pub orphaned: bool,
 }
 
 /// `estate-move`'s hand-off inputs under `MOVE_STATE`.
@@ -157,6 +162,7 @@ fn validate(options: &HandoffOptions, source: &str) -> Result<()> {
     if (options.renew && matches!(options.mode, HandoffMode::Check | HandoffMode::Clear))
         || (options.clear_carried && options.mode != HandoffMode::Clear)
         || (options.legacy_only && options.mode != HandoffMode::Clear)
+        || options.orphaned
         || !filename(source)
     {
         return Err(BulkloadRefusal::FieldDomainViolation);
@@ -238,11 +244,11 @@ fn planned(plan: &Plan, corpus: &Path, state: &Path) -> Result<Vec<Planned>> {
     Ok(items)
 }
 
-fn line_of(item: &str, workspace: &Path, mode: &str, result: &Result<Row>) -> String {
+fn line_of(item: Option<&str>, workspace: &Path, mode: &str, result: &Result<Row>) -> String {
     use std::fmt::Write as _;
     let mut text = format!(
         "{{\"schema\":\"{SCHEMA}\",\"kind\":\"workspace\",\"item\":{},\"workspace\":{},\"mode\":\"{mode}\"",
-        json_string(item),
+        item.map_or_else(|| "null".to_owned(), json_string),
         json_string(&shown(workspace.as_os_str().as_bytes())),
     );
     let null = || "null".to_owned();
@@ -292,6 +298,29 @@ fn line_of(item: &str, workspace: &Path, mode: &str, result: &Result<Row>) -> St
     }
     text.push('}');
     text
+}
+
+/// One line per open row of a `--check` or `--dry-run` row, after its
+/// workspace line (2026-10-22): uncapped, so every row its `open` counts
+/// is attributed (`kind` `open-row`; `class` is the row's kind).
+fn open_row_lines(
+    item: &str,
+    workspace: &Path,
+    mode: &str,
+    row: &Row,
+    line: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    for open in &row.open_rows {
+        line(&format!(
+            "{{\"schema\":\"{SCHEMA}\",\"kind\":\"open-row\",\"item\":{},\"workspace\":{},\"mode\":\"{mode}\",\"class\":\"{}\",\"row\":{},\"reason\":{}}}",
+            json_string(item),
+            json_string(&shown(workspace.as_os_str().as_bytes())),
+            open.kind,
+            json_string(&shown(&open.row)),
+            json_string(&open.reason),
+        ))?;
+    }
+    Ok(())
 }
 
 /// Hand off PLAN's landed workspaces (design 3): one line per workspace,
@@ -441,7 +470,10 @@ pub fn handoff(
                 first.get_or_insert_with(|| refusal.clone());
             }
         }
-        line(&line_of(&identity, workspace, mode_name, &result))?;
+        line(&line_of(Some(&identity), workspace, mode_name, &result))?;
+        if let Ok(row) = &result {
+            open_row_lines(&identity, workspace, mode_name, row, line)?;
+        }
     }
     line(&format!(
         "{{\"schema\":\"{SCHEMA}\",\"kind\":\"summary\",\"mode\":\"{mode_name}\",\"workspaces\":{},\"written\":{},\"unchanged\":{},\"cleared\":{},\"planned\":{},\"checked\":{},\"refused\":{},\"rebuildable\":{},\"open\":{open_total}}}",
@@ -455,6 +487,77 @@ pub fn handoff(
         summary.rebuildable,
     ))?;
     // `--keep-going`: each workspace's refusal is its row, printed above.
+    if options.keep_going {
+        return Ok(summary);
+    }
+    first.map_or(Ok(summary), Err)
+}
+
+/// `estate-handoff --clear --orphaned --workspace PATH... SOURCE`
+/// (2026-10-22): clear SOURCE's blocks in each named workspace when the
+/// plan, corpus and state they were rendered from are gone (a move state
+/// deleted under an operator ruling), reading no plan, corpus or state:
+/// one line per workspace (`mode` `clear-orphaned`; `item` the cleared
+/// record's, or null), then the summary line. Each workspace is cleared by
+/// [`handoff::clear_orphaned`], recorded as `--clear` records it.
+///
+/// # Errors
+/// `FIELD_DOMAIN_VIOLATION` for an option `--orphaned` does not take (it
+/// takes `--clear`, one `--workspace` or more and `--keep-going` only) or
+/// a SOURCE that is not a file name; `PATH_NOT_ABSOLUTE` for a relative
+/// workspace; `REQUIRED_FIELD_MISSING` with no workspace. After every
+/// line: the first workspace's refusal, unless `--keep-going`.
+pub fn handoff_orphaned(
+    source: &str,
+    options: &HandoffOptions,
+    line: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<HandoffSummary> {
+    let others = HandoffOptions {
+        mode: options.mode,
+        workspaces: options.workspaces.clone(),
+        keep_going: options.keep_going,
+        orphaned: options.orphaned,
+        ..HandoffOptions::default()
+    };
+    if !options.orphaned
+        || options.mode != HandoffMode::Clear
+        || *options != others
+        || !filename(source)
+    {
+        return Err(BulkloadRefusal::FieldDomainViolation);
+    }
+    if options.workspaces.is_empty() {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
+    }
+    if options.workspaces.iter().any(|path| !path.is_absolute()) {
+        return Err(BulkloadRefusal::PathNotAbsolute);
+    }
+    const MODE: &str = "clear-orphaned";
+    let mut summary = HandoffSummary::default();
+    let mut first: Option<BulkloadRefusal> = None;
+    let mut seen: Vec<&Path> = Vec::new();
+    for workspace in &options.workspaces {
+        if seen.contains(&workspace.as_path()) {
+            continue;
+        }
+        seen.push(workspace);
+        let result = handoff::clear_orphaned(workspace, source);
+        summary.workspaces += 1;
+        match &result {
+            Ok(row) if row.outcome == "cleared" => summary.cleared += 1,
+            Ok(_) => summary.unchanged += 1,
+            Err(refusal) => {
+                summary.refused += 1;
+                first.get_or_insert_with(|| refusal.clone());
+            }
+        }
+        let item = result.as_ref().ok().and_then(|row| row.item.clone());
+        line(&line_of(item.as_deref(), workspace, MODE, &result))?;
+    }
+    line(&format!(
+        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"summary\",\"mode\":\"{MODE}\",\"workspaces\":{},\"written\":0,\"unchanged\":{},\"cleared\":{},\"planned\":0,\"checked\":0,\"refused\":{},\"rebuildable\":0,\"open\":0}}",
+        summary.workspaces, summary.unchanged, summary.cleared, summary.refused,
+    ))?;
     if options.keep_going {
         return Ok(summary);
     }
