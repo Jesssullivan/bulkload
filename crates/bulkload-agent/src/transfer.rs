@@ -349,7 +349,7 @@ pub struct TransferStats {
     pub consolidated: Vec<(Vec<u8>, String)>,
     /// `--consolidate`: seats held `HOMES_CONSOLIDATE_UNSUPPORTED`, nothing
     /// written, with why. Each is also in [`Self::refusals`].
-    pub held: Vec<(Vec<u8>, &'static str)>,
+    pub held: Vec<(Vec<u8>, std::borrow::Cow<'static, str>)>,
     /// `--plan-only`: every seat's planned action.
     pub planned: Vec<PlannedSeat>,
     /// `--consolidate`: `SQLite` stores and their `-wal`, `-shm` and
@@ -1465,6 +1465,46 @@ fn archive_target(root: &Path, rel_path: &[u8], archived: &[PathBuf]) -> Option<
     .then_some(target)
 }
 
+/// The archived file a Codex rollout's live path links to
+/// (`*.jsonl.zst` under one of [`Consolidation::archived`]), canonical;
+/// `None` for anything else. Such a seat is judged by its events
+/// ([`crate::consolidate::rollout`]): covered, or held; the link and the
+/// archive are never written (A-106, TIN-5268).
+fn archive_rollout(root: &Path, rel_path: &[u8], archived: &[PathBuf]) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    if archived.is_empty() || !rel_path.ends_with(b".jsonl.zst") {
+        return None;
+    }
+    let live = root.join(std::ffi::OsStr::from_bytes(rel_path));
+    if !std::fs::symlink_metadata(&live)
+        .ok()?
+        .file_type()
+        .is_symlink()
+    {
+        return None;
+    }
+    let target = std::fs::canonicalize(&live).ok()?;
+    (target.is_file()
+        && archived
+            .iter()
+            .any(|root| std::fs::canonicalize(root).is_ok_and(|root| target.starts_with(root))))
+    .then_some(target)
+}
+
+/// A digest of the identity (device, inode, size, times) of the file at
+/// `path`, through links: what a held linked rollout is remembered against.
+fn linked_identity(path: &Path) -> Option<[u8; 32]> {
+    let found = std::fs::metadata(path).ok()?;
+    let identity = StatIdentity::from_metadata(&found);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&identity.dev.to_le_bytes());
+    hasher.update(&identity.ino.to_le_bytes());
+    hasher.update(&identity.size.to_le_bytes());
+    hasher.update(&identity.mtime_ns.to_le_bytes());
+    hasher.update(&identity.ctime_ns.to_le_bytes());
+    Some(*hasher.finalize().as_bytes())
+}
+
 /// The size of the regular file a live path that is a symlink resolves
 /// to, or `None` (no link, dangling, or a link to another kind).
 fn linked_size(root: &Path, rel_path: &[u8]) -> Option<u64> {
@@ -1605,6 +1645,13 @@ const KEY_FOLD_RACED: &str =
 /// A transcript whose live path links into an archive root: unioned with
 /// the archived file and regularized (the archive copy stays).
 const ARCHIVE_LINK: &str = "archive link: unioned with its target and regularized";
+/// A Codex rollout whose live path links into an archive root: judged by
+/// its events when its bytes arrive, covered or held, nothing written.
+const ROLLOUT_LINK: &str =
+    "rollout linked into an archive root: covered when the link holds every source event, else held";
+/// Why a linked rollout held before is held again with nothing read, when
+/// the ledger has no reason for it.
+const ROLLOUT_HELD_BEFORE: &str = "held before, and unchanged since";
 
 /// One seat's planned action under `--plan-only`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7110,6 +7157,15 @@ impl<W: Write> Inbound<'_, W> {
                     }
                     return Ok(Decision::WantManifest);
                 }
+                // A rollout linked into an archive root: judged by its
+                // events once its bytes arrive. One covered before is
+                // reused; one held before against the same linked file is
+                // held again, nothing read.
+                if let Some(target) =
+                    archive_rollout(self.target.path(), &row.rel_path, &settings.archived)
+                {
+                    return self.decide_rollout(row, key, class, &target, settings);
+                }
                 return self.hold_seat(row, class, None, OTHER_KIND, plan);
             }
             // A plan creates no directory: one the seat would be landed in
@@ -7480,6 +7536,49 @@ impl<W: Write> Inbound<'_, W> {
         Decision::Reuse
     }
 
+    /// A rollout linked into an archive root ([`archive_rollout`]) at its
+    /// decision: reused when covered before, held again when held before
+    /// against the same linked file (nothing read), else its manifest is
+    /// asked for and its bytes judged when they arrive
+    /// ([`Self::judge_rollout`]).
+    fn decide_rollout(
+        &mut self,
+        row: &RowSchema,
+        key: &[u8],
+        class: crate::consolidate::Class,
+        target: &Path,
+        settings: &Consolidation,
+    ) -> Result<Decision> {
+        let plan = settings.plan_only;
+        if self.seat_consolidated(row, key)? {
+            return Ok(self.reuse_seat(row, class, "covered", None, plan));
+        }
+        if let Some(linked) = linked_identity(target) {
+            if self.consolidate_ledger.is_none() {
+                self.consolidate_ledger = Some(crate::consolidate::Ledger::open(&settings.ledger)?);
+            }
+            let ledger = self
+                .consolidate_ledger
+                .as_ref()
+                .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
+            if let Some(reason) =
+                crate::consolidate::rollout::held_before(ledger, &row.rel_path, key, &linked)?
+            {
+                if plan {
+                    self.plan_seat(row, class.word(), "hold", None, Some(ROLLOUT_HELD_BEFORE));
+                    return Ok(Decision::Skip);
+                }
+                self.stats.held.push((row.rel_path.clone(), reason.into()));
+                return Err(BulkloadRefusal::HomesConsolidateUnsupported);
+            }
+        }
+        if plan {
+            self.plan_seat(row, class.word(), "consolidate", None, Some(ROLLOUT_LINK));
+            return Ok(Decision::Skip);
+        }
+        Ok(Decision::WantManifest)
+    }
+
     /// A seat held `HOMES_CONSOLIDATE_UNSUPPORTED` at its decision, nothing
     /// read (or, planning, reported held).
     fn hold_seat(
@@ -7494,7 +7593,7 @@ impl<W: Write> Inbound<'_, W> {
             self.plan_seat(row, class.word(), "hold", live_size, Some(reason));
             return Ok(Decision::Skip);
         }
-        self.stats.held.push((row.rel_path.clone(), reason));
+        self.stats.held.push((row.rel_path.clone(), reason.into()));
         Err(BulkloadRefusal::HomesConsolidateUnsupported)
     }
 
@@ -8303,8 +8402,11 @@ impl<W: Write> Inbound<'_, W> {
     ) -> Result<()> {
         let class = crate::consolidate::Class::of(&row.rel_path, false);
         let archived = archive_target(self.target.path(), &row.rel_path, &settings.archived);
+        let rollout = archive_rollout(self.target.path(), &row.rel_path, &settings.archived);
         let staged = match staged {
-            Some(staged) if archived.is_some() && !settings.plan_only => Some(staged),
+            Some(staged) if (archived.is_some() || rollout.is_some()) && !settings.plan_only => {
+                Some(staged)
+            }
             other => {
                 if let Some(other) = other {
                     let _ = other.discard();
@@ -8317,6 +8419,15 @@ impl<W: Write> Inbound<'_, W> {
                 let _ = staged.discard();
             }
             return self.linked_covered(row, key, racy, settings.plan_only);
+        }
+        if let Some(target) = rollout {
+            if settings.plan_only {
+                self.plan_seat(row, class.word(), "consolidate", None, Some(ROLLOUT_LINK));
+                self.answered_now = Some(false);
+                return Ok(());
+            }
+            let staged = staged.ok_or(BulkloadRefusal::ProtocolStateViolation)?;
+            return self.judge_rollout(staged, row, (key, racy), &target, settings);
         }
         let (action, reason) = if archived.is_some() {
             ("consolidate", ARCHIVE_LINK)
@@ -8332,7 +8443,9 @@ impl<W: Write> Inbound<'_, W> {
             let staged = staged.ok_or(BulkloadRefusal::ProtocolStateViolation)?;
             return self.consolidate_log(staged, row, key, racy);
         }
-        self.stats.held.push((row.rel_path.clone(), OTHER_KIND));
+        self.stats
+            .held
+            .push((row.rel_path.clone(), OTHER_KIND.into()));
         Err(BulkloadRefusal::HomesConsolidateUnsupported)
     }
 
@@ -8355,6 +8468,61 @@ impl<W: Write> Inbound<'_, W> {
         self.covered(row, key, racy)
     }
 
+    /// `--consolidate`: a rollout linked into an archive root
+    /// ([`archive_rollout`]), its source bytes `staged`: covered when the
+    /// linked file holds every one of its events
+    /// ([`crate::consolidate::rollout::coverage`]), else held with how many
+    /// it lacks. Nothing is written either way: the link and the archive
+    /// are untouched and the staged file goes. A hold is remembered in the
+    /// consolidation ledger against the linked file's identity.
+    fn judge_rollout(
+        &mut self,
+        staged: StagedFile,
+        row: &RowSchema,
+        (key, racy): (&[u8], bool),
+        target: &Path,
+        settings: &Consolidation,
+    ) -> Result<()> {
+        let linked = linked_identity(target);
+        let judged = crate::hash::open_nofollow(target).and_then(|file| {
+            crate::consolidate::rollout::coverage(staged.file(), &file, &settings.maps)
+        });
+        let _ = staged.discard();
+        let judged = judged?;
+        let Some(reason) = judged.held_reason() else {
+            if !racy {
+                self.store.record_consolidated(key)?;
+            }
+            self.stats.consolidated.push((
+                row.rel_path.clone(),
+                crate::consolidate::rollout::COVERED.to_owned(),
+            ));
+            self.stats.completed += 1;
+            self.answered_now = Some(true);
+            return Ok(());
+        };
+        // Remembered only when the linked file is the one read.
+        if let (false, Some(before)) = (racy, linked) {
+            if linked_identity(target) == Some(before) {
+                if self.consolidate_ledger.is_none() {
+                    self.consolidate_ledger =
+                        Some(crate::consolidate::Ledger::open(&settings.ledger)?);
+                }
+                if let Some(ledger) = self.consolidate_ledger.as_ref() {
+                    crate::consolidate::rollout::remember_held(
+                        ledger,
+                        &row.rel_path,
+                        key,
+                        &before,
+                        &reason,
+                    )?;
+                }
+            }
+        }
+        self.stats.held.push((row.rel_path.clone(), reason.into()));
+        Err(BulkloadRefusal::HomesConsolidateUnsupported)
+    }
+
     /// `--consolidate`: an append log, staged in the live file's directory
     /// (`staged`, never wholly in memory), merged into the live file by
     /// streaming ([`crate::consolidate::append_log::union_stream`], or
@@ -8369,6 +8537,15 @@ impl<W: Write> Inbound<'_, W> {
         key: &[u8],
         racy: bool,
     ) -> Result<()> {
+        // A rollout linked into an archive root is judged, never unioned:
+        // nothing is written through its link.
+        if let Some(settings) = self.consolidate.clone() {
+            if let Some(target) =
+                archive_rollout(self.target.path(), &row.rel_path, &settings.archived)
+            {
+                return self.judge_rollout(staged, row, (key, racy), &target, &settings);
+            }
+        }
         let ran = self.run_log_union(&staged, row);
         let _ = staged.discard();
         let (outcome, before) = ran?;
@@ -8435,7 +8612,7 @@ impl<W: Write> Inbound<'_, W> {
     ) -> Result<()> {
         match outcome.action {
             crate::consolidate::Action::Held(reason) => {
-                self.stats.held.push((row.rel_path.clone(), reason));
+                self.stats.held.push((row.rel_path.clone(), reason.into()));
                 self.remember_refusal(key, before, racy, RefusedOutput::ConsolidateHeld);
                 Err(BulkloadRefusal::HomesConsolidateUnsupported)
             }
@@ -8469,7 +8646,7 @@ impl<W: Write> Inbound<'_, W> {
         let (outcome, before) = self.run_union(bytes, parent, row, class)?;
         match outcome.action {
             crate::consolidate::Action::Held(reason) => {
-                self.stats.held.push((row.rel_path.clone(), reason));
+                self.stats.held.push((row.rel_path.clone(), reason.into()));
                 self.remember_refusal(key, before, racy, RefusedOutput::ConsolidateHeld);
                 Err(BulkloadRefusal::HomesConsolidateUnsupported)
             }
@@ -8674,7 +8851,7 @@ impl<W: Write> Inbound<'_, W> {
                     Class::AppendLog => APPEND_LOG_PENDING,
                     _ => "opaque: the bytes differ",
                 };
-                self.stats.held.push((row.rel_path.clone(), reason));
+                self.stats.held.push((row.rel_path.clone(), reason.into()));
                 self.remember_refusal(&key, settled, racy, RefusedOutput::ConsolidateHeld);
                 Err(BulkloadRefusal::HomesConsolidateUnsupported)
             }
@@ -8743,7 +8920,7 @@ impl<W: Write> Inbound<'_, W> {
             }
             Plan::Covered => self.covered(&row, &key, racy),
             Plan::Held { identity, reason } => {
-                self.stats.held.push((row.rel_path.clone(), reason));
+                self.stats.held.push((row.rel_path.clone(), reason.into()));
                 self.remember_refusal(&key, identity, racy, RefusedOutput::ConsolidateHeld);
                 Err(BulkloadRefusal::HomesConsolidateUnsupported)
             }
@@ -9701,6 +9878,14 @@ fn plan_consolidating(
             if archive_target(context.target.path(), &row.rel_path, &settings.archived).is_some() {
                 if plan {
                     return dry("consolidate", None, Some(ARCHIVE_LINK));
+                }
+                return Consolidating::StageLog;
+            }
+            // A rollout linked into an archive root: staged as an append
+            // log is, then judged by its events; nothing is written.
+            if archive_rollout(context.target.path(), &row.rel_path, &settings.archived).is_some() {
+                if plan {
+                    return dry("consolidate", None, Some(ROLLOUT_LINK));
                 }
                 return Consolidating::StageLog;
             }

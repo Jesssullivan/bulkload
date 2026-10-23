@@ -2090,7 +2090,8 @@ fn archive_links_follow_a106_and_destination_links_stay() {
     assert_eq!(fs::read(&gz).unwrap(), b"\x1f\x8b old");
     assert_eq!(fs::read(&odd).unwrap(), b"an odd name\n");
     // The archive links to rollouts no index names: both stay links, the
-    // archive untouched; the equal one is covered, the other held.
+    // archive untouched; the equal one is covered, the other held, judged
+    // by its events (its one line is not in the linked file).
     for (rel, archived) in [
         (same_rel, &b"zst frames, the same on both\n"[..]),
         (diff_rel, &b"zst frames, sting's\n"[..]),
@@ -2114,7 +2115,7 @@ fn archive_links_follow_a106_and_destination_links_stay() {
     );
     assert!(
         moved.stderr.contains(&format!(
-            "held {diff_rel}: HOMES_CONSOLIDATE_UNSUPPORTED reason=\"the live path is a link or another kind\""
+            "held {diff_rel}: HOMES_CONSOLIDATE_UNSUPPORTED reason=\"source holds 1 of its 1 events the linked file lacks\""
         )),
         "{}",
         moved.stderr

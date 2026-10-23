@@ -189,7 +189,7 @@ pub fn fold(
     match (action(result), result) {
         (Some(crate::consolidate::Action::Held(code)), _) => {
             for path in paths {
-                stats.held.push((path.clone(), code));
+                stats.held.push((path.clone(), code.into()));
                 stats.refusals.push((path.clone(), code.to_owned()));
             }
         }
