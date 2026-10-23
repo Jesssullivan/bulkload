@@ -3108,8 +3108,8 @@ fn h60_every_open_row_is_listed_uncapped() {
         assert_eq!(rows.len(), open, "{mode}: {}", ran.stdout);
         assert!(open >= BRANCHES, "{mode}: {line}");
         for name in &names {
-            let named = format!("\"row\":\"refs/heads/{name}\"");
-            let found: Vec<&&str> = rows.iter().filter(|row| row.contains(&named)).collect();
+            let ref_row = format!("\"row\":\"refs/heads/{name}\"");
+            let found: Vec<&&str> = rows.iter().filter(|row| row.contains(&ref_row)).collect();
             assert_eq!(found.len(), 1, "{mode} {name}: {}", ran.stdout);
             assert!(found[0].contains("\"class\":\"ref\""), "{}", found[0]);
             assert!(
