@@ -761,6 +761,47 @@ pub fn union_link(
     size: u64,
     ledger: &Ledger,
 ) -> Result<Outcome> {
+    link_union(live, target, (feed, size), ledger, None)
+}
+
+/// The source's bytes, whole, as a regular file at a live name that is a
+/// link to an archived file: the link replaced, the archive untouched.
+///
+/// Operator ruling 2026-10-23 ("Yes, take neo's full file"): a Codex
+/// rollout whose linked archive file's events are a strict prefix of the
+/// source's ([`super::rollout::Coverage::Extends`]). The caller has
+/// judged that; this is [`union_link`]'s trade with the source's bytes as
+/// the output (staged, then exchanged for the link only while the link and
+/// its target are as read; never written through the link, never into the
+/// archive, A-106). Ledgered `replace-link` once durable.
+///
+/// # Errors
+/// [`union_link`]'s.
+pub fn replace_link(
+    live: &Live<'_>,
+    target: &Path,
+    feed: Feed<'_>,
+    size: u64,
+    ledger: &Ledger,
+) -> Result<Outcome> {
+    link_union(live, target, (feed, size), ledger, Some(Decided::Extended))
+}
+
+/// [`union_link`], or with `forced` in place of the streamed comparison
+/// ([`replace_link`]).
+#[allow(clippy::too_many_lines)] // One trade: checks, output, exchange, ledger.
+fn link_union(
+    live: &Live<'_>,
+    target: &Path,
+    (feed, size): (Feed<'_>, u64),
+    ledger: &Ledger,
+    forced: Option<Decided>,
+) -> Result<Outcome> {
+    let label = if forced.is_some() {
+        "replace-link"
+    } else {
+        "regularize"
+    };
     let name = io::c_name(live.name).refuse_at(SITE)?;
     let link = sys::fstatat_nofollow(live.dir, &name).refuse_at(SITE)?;
     let text = std::fs::read_link(live.path).refuse_at(SITE)?;
@@ -775,8 +816,10 @@ pub fn union_link(
     let read_target =
         |buffer: &mut [u8], at: u64| sys::pread_full(&held, buffer, at).refuse_at(SITE);
     let source = |buffer: &mut [u8], at: u64| feed.read_at(buffer, at);
-    let Some(decided) = decide(&read_target, stat.size, &source, size, by_uuid(live.rel))? else {
-        return Err(BulkloadRefusal::HomesConsolidateRaced);
+    let decided = match forced {
+        Some(decided) => decided,
+        None => decide(&read_target, stat.size, &source, size, by_uuid(live.rel))?
+            .ok_or(BulkloadRefusal::HomesConsolidateRaced)?,
     };
     free(&held)?;
     // The regular file the live name is to hold: the target's own bytes
@@ -849,7 +892,7 @@ pub fn union_link(
     record(
         ledger,
         live.rel,
-        "regularize",
+        label,
         [
             (&read_target, stat.size),
             (&source, size),
