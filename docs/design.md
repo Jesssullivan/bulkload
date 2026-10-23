@@ -1114,6 +1114,45 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
     starts with the removed blocks, a user's later edit included. A
     converge that lands a new blob of the target lands what the source
     has, carried block included.
+  - **Orphaned blocks** (2026-10-22, GF g55 lane 0). When the plan,
+    corpus and state a block was rendered from are gone (a move state
+    deleted under an operator ruling), `--check` and `--clear` cannot run:
+    they iterate the plan's items. `estate-handoff --clear --orphaned
+    --workspace PATH [--workspace PATH]... [--keep-going] SOURCE` reads no
+    plan, corpus or state. In each absolute workspace it reads every target
+    whole and finds each block naming SOURCE ("landed this checkout from
+    source `SOURCE`") in the chain at byte 0 by its own BEGIN and END
+    lines (blocks stack from byte 0, each written at byte 0 of what the
+    file held, so removing one's bytes, its trailing empty line included,
+    returns the file to what it held before that block was written). A
+    block is removed when it is this host's: the record's block by length
+    and blake3, or a block sealed as rendered whose `for=` is this host's
+    identity for SOURCE and the landing the block names (its "This
+    landing" path, so a workspace that moved since is still found), the
+    given path or its canonical form. A block naming SOURCE that another
+    host rendered, and one the target's landed blob itself starts with,
+    are content and kept (`carried-kept`). Text outside the removed bytes
+    is never touched. A file the record names as created and left empty is
+    removed; any other empty file is kept (`cleared-empty-kept`), since
+    only a record proves bulkload created it. The edit is recorded as
+    `--clear` records it: the repository's destination lock,
+    `handoff.intent` durable first, each target by temporary, fsync and
+    `RENAME_EXCHANGE` with the displaced file checked, then
+    `handoff.landed` and the intent removed. It refuses, with nothing
+    written, `HANDOFF_BLOCK_MODIFIED` for a block of SOURCE whose markers
+    are malformed or nested or that is edited inside,
+    `HANDOFF_TARGET_UNSUPPORTED` for a target that is a symbolic link
+    (one target linked to another in the worktree is never followed, and
+    is covered by its target's scan), `PATH_NOT_ABSOLUTE` for a relative
+    workspace. Lines carry `"mode":"clear-orphaned"` and the cleared
+    record's item, or `null`.
+  - **Open rows, uncapped** (2026-10-22). A block lists at most 30 names
+    per class ("and N more"); `--check` and `--dry-run` print, after
+    each workspace line, one `"kind":"open-row"` line per open row with
+    its `class` (`ref`, `dest-only`, `sibling`, `refused`, `behind`), its
+    `row` (the ref name, the worktree path or the item) and its `reason`.
+    The workspace line's `open` is the number of these lines
+    (`Inputs::open` is `open_rows().len()`).
   - **Commit detection** (`--check`, read-only; OI-1003-Q191): a token
     line is one holding the `BULKLOAD-HANDOFF-DO-NOT-COMMIT` token that the
     source's history (the commits the carried capture, `refs/carry/`,
