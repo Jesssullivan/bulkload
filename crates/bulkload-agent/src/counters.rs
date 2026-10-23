@@ -265,6 +265,10 @@ counters! {
     // record of an earlier refusal of the same seat against the same file
     // at the path: the source reads nothing for them (#187 review, R25).
     TransferRefusedOutputsRemembered => "transfer_refused_outputs_remembered",
+    // Earlier authorities of a session's roots the destination holds rows
+    // under, differing only in the source root's device number (a macOS
+    // reboot renumbers it): their rows are read as the session's own.
+    TransferSourceDevAliases => "transfer_source_dev_aliases",
     // Entries the destination asked for by manifest first (`WantManifest`),
     // and seats new to the destination that the delta lever streamed
     // (`Send`) while its store held output hints, whether or not any of

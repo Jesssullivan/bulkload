@@ -1348,6 +1348,62 @@ impl Store {
         Ok(found)
     }
 
+    /// The distinct authorities this store's output rows, ownership rows
+    /// and consolidation records are keyed under ([`row_key`],
+    /// [`sqlite_key`], [`owner_key`]), each once. Every such key starts
+    /// with the encoding of its authority, so the keys under one authority
+    /// are contiguous: this is one seek per distinct authority, never a
+    /// read of the rows themselves. A key that does not decode is stepped
+    /// over.
+    ///
+    /// It lets a session find the rows an earlier pass keyed under a source
+    /// root whose device number has changed since (a macOS reboot
+    /// renumbers an APFS volume's `st_dev`; `transfer::source_dev`).
+    ///
+    /// # Errors
+    /// Refuses database failures.
+    pub(crate) fn output_authorities(&self) -> Result<Vec<Vec<u8>>> {
+        let mut found: Vec<Vec<u8>> = Vec::new();
+        if !self.rows_trusted {
+            return Ok(found);
+        }
+        for table in ["outputs", "owned_outputs", "consolidated"] {
+            let mut statement = self
+                .conn
+                .prepare_cached(&format!(
+                    "SELECT key FROM {table} WHERE key >= ?1 ORDER BY key LIMIT 1"
+                ))
+                .map_err(sqlite_error)?;
+            let mut from: Vec<u8> = Vec::new();
+            loop {
+                let key: Option<Vec<u8>> = statement
+                    .query_row([&from], |row| row.get(0))
+                    .optional()
+                    .map_err(sqlite_error)?;
+                let Some(key) = key else {
+                    break;
+                };
+                let Ok((authority, rest)) = postcard::take_from_bytes::<&[u8]>(&key) else {
+                    // The least key after this one.
+                    from = key;
+                    from.push(0);
+                    continue;
+                };
+                if !found.iter().any(|known| known.as_slice() == authority) {
+                    found.push(authority.to_vec());
+                }
+                let Some(end) = key
+                    .get(..key.len().saturating_sub(rest.len()))
+                    .and_then(prefix_end)
+                else {
+                    break;
+                };
+                from = end;
+            }
+        }
+        Ok(found)
+    }
+
     /// The superseding publishes recorded for names directly inside the
     /// destination directory `dir` and not yet settled (WP0(d), #187). A
     /// record this engine cannot decode exactly is refused, never skipped:
@@ -3015,6 +3071,57 @@ mod tests {
                 "{refusal}"
             );
         }
+    }
+
+    /// `transfer::source_dev`: the authorities a store's rows are keyed
+    /// under are listed once each, from its output rows, its ownership rows
+    /// and its consolidation records, and a key that does not decode is
+    /// stepped over.
+    #[test]
+    fn output_authorities_lists_each_authority_once() -> Result<()> {
+        let root = TestRoot::new()?;
+        let state = root.0.join("state");
+        let record = |authority: &[u8], rel_path: &[u8], ino, racy| -> Result<OutputRecord> {
+            Ok(OutputRecord {
+                key: row_key(authority, &seat_row(rel_path, ino))?,
+                rel_path: rel_path.to_vec(),
+                identity: StatIdentity {
+                    dev: 1,
+                    ino,
+                    size: 9,
+                    mtime_ns: 1_000,
+                    ctime_ns: 2_000,
+                },
+                racy,
+                extended: None,
+                hints: Vec::new(),
+            })
+        };
+        let publisher = Store::open(&state)?.into_publisher(PublisherSide::Destination)?;
+        publisher.commit_outputs(
+            &[
+                record(b"a", b"dir/one", 1, false)?,
+                record(b"a", b"dir/two", 2, false)?,
+                record(b"ab", b"dir/one", 3, false)?,
+                record(b"b", b"one", 4, false)?,
+                record(b"c", b"racy", 5, true)?,
+            ],
+            &[],
+        )?;
+        let store = Store::open(&state)?;
+        assert_eq!(store.output_authorities()?.len(), 4);
+        store.record_consolidated(&row_key(b"d", &seat_row(b"log", 6))?)?;
+        store
+            .conn
+            .execute("INSERT INTO outputs VALUES (x'ff', x'00')", [])
+            .map_err(sqlite_error)?;
+        let mut found = store.output_authorities()?;
+        found.sort();
+        assert_eq!(
+            found,
+            [&b"a"[..], b"ab", b"b", b"c", b"d"].map(<[u8]>::to_vec)
+        );
+        Ok(())
     }
 
     /// WP0(d), #187: a superseding publish's intent takes its output's rows

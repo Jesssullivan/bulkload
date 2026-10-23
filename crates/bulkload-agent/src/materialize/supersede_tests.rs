@@ -125,7 +125,7 @@ impl Fixture {
     /// What `owned_output` says of the file at the leaf for `row`.
     fn owned(&self, authority: &[u8], row: &RowSchema) -> Option<OwnedOutput> {
         let file = File::open(self.leaf()).unwrap();
-        owned_output(&self.store(), authority, row, &file).unwrap()
+        owned_output(&self.store(), authority, &[], row, &file).unwrap()
     }
 
     /// Queue `NEW` as a superseding publish of the output and commit its
@@ -272,9 +272,11 @@ fn a_file_this_store_does_not_own_is_never_one_to_supersede() {
     let file = File::open(fixture.destination().join("other")).unwrap();
     let mut other = row;
     other.rel_path = b"other".to_vec();
-    assert!(owned_output(&fixture.store(), AUTHORITY, &other, &file)
-        .unwrap()
-        .is_none());
+    assert!(
+        owned_output(&fixture.store(), AUTHORITY, &[], &other, &file)
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// A publish queued against this store's own output finds another file at

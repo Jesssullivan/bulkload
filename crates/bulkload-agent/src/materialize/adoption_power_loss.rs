@@ -460,6 +460,7 @@ fn a_batched_group_names_no_output_before_its_data_is_durable() {
     let owned = owned_output(
         &store,
         SUPERSEDE_AUTHORITY,
+        &[],
         changed,
         &File::open(destination.join(superseded)).unwrap(),
     )
