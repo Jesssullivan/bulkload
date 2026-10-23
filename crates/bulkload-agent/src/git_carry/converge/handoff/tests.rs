@@ -869,7 +869,7 @@ fn an_orphaned_clear_refuses_typed_and_writes_nothing() {
     assert_eq!(fs::read(repo.join("AGENTS.md")).unwrap(), agents);
     assert_eq!(fs::read(repo.join("CLAUDE.md")).unwrap(), cut);
     // An edit inside a block no record names.
-    let edited = String::from_utf8(ours.clone())
+    let edited = String::from_utf8(ours)
         .unwrap()
         .replacen("converge", "converg3", 1);
     fs::write(repo.join("CLAUDE.md"), edited.as_bytes()).unwrap();

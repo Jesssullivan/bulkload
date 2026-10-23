@@ -3230,9 +3230,11 @@ struct OrphanClearing {
     kind: &'static str,
 }
 
-/// `estate-handoff --clear --orphaned` (2026-10-22): clear the hand-off
-/// blocks of source `source` in `worktree` when the plan, corpus and state
-/// they were rendered from are gone, with no plan or move state read.
+/// `estate-handoff --clear --orphaned` (2026-10-22): one workspace.
+///
+/// Clear the hand-off blocks of source `source` in `worktree` when the
+/// plan, corpus and state they were rendered from are gone, with no plan
+/// or move state read.
 ///
 /// Each target ([`ALL_NAMES`]) is read whole; each block in the chain at
 /// its head that names `source` ([`source_blocks`]) is removed, byte for

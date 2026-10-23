@@ -493,8 +493,9 @@ pub fn handoff(
     first.map_or(Ok(summary), Err)
 }
 
-/// `estate-handoff --clear --orphaned --workspace PATH... SOURCE`
-/// (2026-10-22): clear SOURCE's blocks in each named workspace when the
+/// `estate-handoff --clear --orphaned --workspace PATH... SOURCE`.
+///
+/// 2026-10-22: clear SOURCE's blocks in each named workspace when the
 /// plan, corpus and state they were rendered from are gone (a move state
 /// deleted under an operator ruling), reading no plan, corpus or state:
 /// one line per workspace (`mode` `clear-orphaned`; `item` the cleared
@@ -512,6 +513,7 @@ pub fn handoff_orphaned(
     options: &HandoffOptions,
     line: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<HandoffSummary> {
+    const MODE: &str = "clear-orphaned";
     let others = HandoffOptions {
         mode: options.mode,
         workspaces: options.workspaces.clone(),
@@ -532,7 +534,6 @@ pub fn handoff_orphaned(
     if options.workspaces.iter().any(|path| !path.is_absolute()) {
         return Err(BulkloadRefusal::PathNotAbsolute);
     }
-    const MODE: &str = "clear-orphaned";
     let mut summary = HandoffSummary::default();
     let mut first: Option<BulkloadRefusal> = None;
     let mut seen: Vec<&Path> = Vec::new();

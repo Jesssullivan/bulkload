@@ -3069,8 +3069,8 @@ fn h59_an_orphaned_clear_refuses_malformed_markers_and_links() {
 /// workspace line's `open` is their number; the block keeps its cap.
 #[test]
 fn h60_every_open_row_is_listed_uncapped() {
-    let world = World::new();
     const BRANCHES: usize = 36;
+    let world = World::new();
     let names: Vec<String> = (0..BRANCHES).map(|n| format!("b{n:02}")).collect();
     let c0 = git(&world.src(), &["rev-parse", "HEAD"]);
     fs::write(world.src().join("a.txt"), b"alpha 2\n").unwrap();
