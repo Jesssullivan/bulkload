@@ -1041,10 +1041,13 @@ fn a_sessions_skipped_seats_become_stores_state_first_with_their_clock() {
     assert_eq!(
         stats.held,
         [
-            (b".codex/logs_2.sqlite".to_vec(), "SQLITE_SCHEMA_MISMATCH"),
+            (
+                b".codex/logs_2.sqlite".to_vec(),
+                std::borrow::Cow::Borrowed("SQLITE_SCHEMA_MISMATCH")
+            ),
             (
                 b".codex/logs_2.sqlite-wal".to_vec(),
-                "SQLITE_SCHEMA_MISMATCH"
+                std::borrow::Cow::Borrowed("SQLITE_SCHEMA_MISMATCH")
             ),
         ]
     );

@@ -463,7 +463,11 @@ pub fn held_path(state: &Path, item: &str) -> PathBuf {
 // The held seats of a session that ran to its end, with why (2026-10-22):
 // the closure lists them on the item they belong to. A session that held
 // nothing leaves no sidecar (an earlier one is removed).
-fn write_held(state: &Path, item: &str, held: &[(Vec<u8>, &'static str)]) -> Result<()> {
+fn write_held(
+    state: &Path,
+    item: &str,
+    held: &[(Vec<u8>, std::borrow::Cow<'static, str>)],
+) -> Result<()> {
     const SITE: &str = "transfer_outcome::write_held";
     let path = held_path(state, item);
     if held.is_empty() {
@@ -476,7 +480,7 @@ fn write_held(state: &Path, item: &str, held: &[(Vec<u8>, &'static str)]) -> Res
     }
     let rows: Vec<(&[u8], &str)> = held
         .iter()
-        .map(|(path, why)| (path.as_slice(), *why))
+        .map(|(path, why)| (path.as_slice(), why.as_ref()))
         .collect();
     let bytes = postcard::to_allocvec(&rows).map_err(|_| BulkloadRefusal::FrameCodec)?;
     crate::estate::write_bytes(&path, &bytes)

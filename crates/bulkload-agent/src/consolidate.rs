@@ -8,6 +8,9 @@
 //! Each file [`Class`] has its own [`Union`]:
 //! - append logs: [`append_log`], the #294 lane's JSONL union;
 //! - structured config: [`config`], JSON and TOML merged key by key;
+//! - a Codex rollout whose live path links into an archive root:
+//!   [`rollout`], covered when the linked file holds every source event,
+//!   else held, nothing written;
 //! - Codex `SQLite`: the row union ([`crate::sqlite_union`]), over its own
 //!   serve session per store, never this file path;
 //! - anything else: [`opaque`], equal bytes adopted and differing bytes
@@ -27,6 +30,7 @@ pub mod config;
 pub mod json;
 pub mod ledger;
 pub mod merge3;
+pub mod rollout;
 pub mod toml;
 pub mod value;
 

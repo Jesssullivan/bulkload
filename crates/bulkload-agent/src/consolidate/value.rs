@@ -93,7 +93,7 @@ impl Value {
 
 /// An integer token's value: decimal with an optional sign, or `0x`, `0o`,
 /// `0b`; `_` separators ignored.
-fn integer(token: &str) -> Option<i128> {
+pub(super) fn integer(token: &str) -> Option<i128> {
     let digits: String = token.chars().filter(|c| *c != '_').collect();
     let (negative, body) = match digits.as_bytes().first() {
         Some(b'-') => (true, digits.get(1..)?),
