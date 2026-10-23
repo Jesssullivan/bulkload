@@ -112,6 +112,9 @@ pub mod outcome;
 pub mod provider_sqlite;
 pub mod refuse;
 pub mod reseat;
+// `pull-retire-source` (operator ruling 2026-10-23): a pull's source
+// files the destination provably holds, removed on the source only.
+pub mod retire;
 pub mod space;
 pub mod sqlite_union;
 // The move verbs' guard on their state directories (SPEC rule 2, reset

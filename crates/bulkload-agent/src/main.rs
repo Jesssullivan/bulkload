@@ -128,6 +128,30 @@ SUBCOMMANDS:
                 stdout, read-only, with uploadpack.allowAnySHA1InWant on its
                 command line only, so the destination fetches the ids the
                 capture pinned
+    pull-retire-source DEST_STATE [--ledger DIR] [--dry-run]
+                [--remote-executable PATH] [--ssh-config FILE]
+                Remove a pull's source files the destination provably holds
+                (operator ruling 2026-10-23: sting the only copy). Reads
+                DEST_STATE's closure records, store and the consolidation
+                ledger --ledger DIR, read only, never while a pass holds the
+                state (MOVE_STATE_BUSY). A candidate's recorded outcome is
+                adopt, extend, covered (equal bytes, by BLAKE3 now), the
+                rollout rulings' extended (by BLAKE3 now) or a rollout
+                covered by events or ids (by the ledger's proof against the
+                linked file, which must be unchanged). Never a SQLite store
+                or sidecar, never a directory. The source end (retire-source
+                over pull's ssh builder, or here for a local source)
+                re-checks each file: beneath the root through no link, a
+                regular file of a recorded identity, held open by no process
+                (Linux /proc, Darwin lsof; unknown skips), its BLAKE3 the
+                destination's when that is the proof, its identity again
+                just before unlinkat. Anything else is skipped, typed, and
+                left. One receipt line per file is appended to
+                DEST_STATE/retire-source.receipts; stdout lists each file
+                and a summary. --dry-run removes nothing
+    retire-source
+                The source end of pull-retire-source: one framed question on
+                stdin, each file's verdict framed on stdout
     negotiate   The source end of estate-move --plan-only's B2 preview: one
                 framed question on stdin (refs ancestry and fetch bytes, or a
                 worktree's status, files and merge base), its answer framed
@@ -950,6 +974,7 @@ COUNTERS:
 /// `serve`.
 const SOURCE_SIDE_VERBS: &[&str] = &[
     "serve",
+    "retire-source",
     "upload-pack",
     "estate-capture",
     "estate-move-source",
@@ -1091,6 +1116,7 @@ fn main() -> ExitCode {
         Some("upload-pack") => upload_pack_command(&args.collect::<Vec<_>>()),
         Some("relay-upload-pack") => relay_upload_pack_command(&args.collect::<Vec<_>>()),
         Some("negotiate") => negotiate_command(&args.collect::<Vec<_>>()),
+        Some(name @ ("pull-retire-source" | "retire-source")) => retire(name, args),
         Some("help" | "--help" | "-h") => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -1323,6 +1349,157 @@ fn negotiate_command(args: &[std::ffi::OsString]) -> Result<()> {
         .write_all(&bulkload_agent::git_carry::preview::frame(&answer)?)
         .refuse_at("main::negotiate_command")?;
     output.flush().refuse_at("main::negotiate_command")
+}
+
+// `pull-retire-source` and its source end `retire-source`.
+fn retire(name: &str, args: impl Iterator<Item = std::ffi::OsString>) -> Result<()> {
+    let args: Vec<std::ffi::OsString> = args.collect();
+    if name == "retire-source" {
+        retire_source_command(&args)
+    } else {
+        pull_retire_source_command(&args)
+    }
+}
+
+// `retire-source`: the source end of `pull-retire-source` (operator ruling
+// 2026-10-23). One framed question on stdin, the verdicts framed on stdout.
+fn retire_source_command(args: &[std::ffi::OsString]) -> Result<()> {
+    if !args.is_empty() {
+        return Err(BulkloadRefusal::FieldDomainViolation);
+    }
+    let ask: bulkload_agent::retire::Ask =
+        bulkload_agent::retire::unframe(&mut std::io::stdin().lock())?;
+    let done = bulkload_agent::retire::answer(&ask);
+    let mut output = std::io::stdout().lock();
+    output
+        .write_all(&bulkload_agent::retire::frame(&done)?)
+        .refuse_at("main::retire_source_command")?;
+    output.flush().refuse_at("main::retire_source_command")
+}
+
+// `pull-retire-source DEST_STATE [--ledger DIR] [--dry-run]
+// [--remote-executable PATH] [--ssh-config FILE]` (operator ruling
+// 2026-10-23): the destination's plan, the source end's verdicts, the
+// receipts and the summary.
+fn pull_retire_source_command(args: &[std::ffi::OsString]) -> Result<()> {
+    use bulkload_agent::retire;
+    let mut state: Option<&Path> = None;
+    let mut ledger: Option<&Path> = None;
+    let (mut remote, mut config) = (None, None);
+    let mut dry_run = false;
+    let mut at = 0;
+    while let Some(arg) = args.get(at) {
+        let value = |index: usize| {
+            args.get(index)
+                .map(Path::new)
+                .ok_or(BulkloadRefusal::RequiredFieldMissing)
+        };
+        match arg.to_str() {
+            Some("--dry-run") => dry_run = true,
+            Some("--ledger") => {
+                ledger = Some(value(at + 1)?);
+                at += 1;
+            }
+            Some("--remote-executable") => {
+                remote = Some(value(at + 1)?.as_os_str());
+                at += 1;
+            }
+            Some("--ssh-config") => {
+                config = Some(value(at + 1)?.as_os_str());
+                at += 1;
+            }
+            _ if state.is_none() => state = Some(Path::new(arg)),
+            _ => return Err(BulkloadRefusal::FieldDomainViolation),
+        }
+        at += 1;
+    }
+    let state = state.ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+    let plan = retire::plan(state, ledger, dry_run)?;
+    let mut done = plan.skipped.clone();
+    if !plan.ask.files.is_empty() {
+        if plan.host == "-" {
+            done.extend(retire::answer(&plan.ask));
+        } else {
+            let mut pull: Vec<std::ffi::OsString> = vec![plan.host.clone().into()];
+            pull.extend(std::iter::repeat_n(std::ffi::OsString::new(), 4));
+            if remote.is_some() || config.is_some() {
+                pull.push(
+                    remote.map_or_else(|| "bulkload-agent".into(), std::ffi::OsStr::to_owned),
+                );
+            }
+            if let Some(config) = config {
+                pull.push(config.to_owned());
+            }
+            let framed = retire::frame(&plan.ask)?;
+            let answered: Vec<retire::Done> =
+                pull_command(Remote::Retire, &pull, |input, output| {
+                    output
+                        .write_all(&framed)
+                        .refuse_at("main::pull_retire_source")?;
+                    output.flush().refuse_at("main::pull_retire_source")?;
+                    retire::unframe(input)
+                })?
+                .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
+            done.extend(answered);
+        }
+    }
+    retire::write_receipts(state, &done)?;
+    report_retired(state, &plan, dry_run, &done)
+}
+
+// `pull-retire-source`'s stdout: each file's verdict, the summary, and a
+// line per skip reason.
+fn report_retired(
+    state: &Path,
+    plan: &bulkload_agent::retire::Plan,
+    dry_run: bool,
+    done: &[bulkload_agent::retire::Done],
+) -> Result<()> {
+    use bulkload_agent::retire::Verdict;
+    let mut skipped: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+    let (mut removed, mut would) = (0_u64, 0_u64);
+    let mut output = std::io::stdout().lock();
+    for one in done {
+        let word = match &one.verdict {
+            Verdict::Removed => {
+                removed += 1;
+                "removed"
+            }
+            Verdict::WouldRemove => {
+                would += 1;
+                "would-remove"
+            }
+            Verdict::Skipped(why) => {
+                *skipped.entry(why.as_str()).or_default() += 1;
+                "skipped"
+            }
+        };
+        let _ = writeln!(
+            output,
+            "retire-source {word} {} proof={}{}",
+            one.rel.escape_ascii(),
+            one.proof.as_deref().unwrap_or("-"),
+            match &one.verdict {
+                Verdict::Skipped(why) => format!(" reason=\"{why}\""),
+                _ => String::new(),
+            }
+        );
+    }
+    let _ = writeln!(
+        output,
+        "retire-source summary dry_run={dry_run} host={} candidates={} removed={removed} would_remove={would} skipped={} receipts={}",
+        plan.host,
+        plan.ask.files.len(),
+        done.len() as u64 - removed - would,
+        state.join("retire-source.receipts").display()
+    );
+    for (why, count) in skipped {
+        let _ = writeln!(
+            output,
+            "retire-source skipped_reason count={count} reason=\"{why}\""
+        );
+    }
+    output.flush().refuse_at("main::pull_retire_source")
 }
 
 /// The plan's negotiation with the source (`negotiate`): over `pull`'s ssh
@@ -3365,6 +3542,9 @@ enum Remote<'a> {
     /// `negotiate`, the source end of the plan's B2 preview: one framed
     /// question on stdin, one framed answer on stdout, reads only.
     Negotiate,
+    /// `retire-source`, the source end of `pull-retire-source`: one framed
+    /// question on stdin, the verdicts framed on stdout.
+    Retire,
 }
 
 // The one ssh session builder (the S2 registry pins this child): a pull's
@@ -3380,7 +3560,9 @@ fn pull_command<T>(
 ) -> Result<Option<T>> {
     let kind = match mode {
         Remote::Serve(kind) => kind,
-        Remote::UploadPack(_) | Remote::Negotiate => bulkload_agent::transfer::RootKind::Tree,
+        Remote::UploadPack(_) | Remote::Negotiate | Remote::Retire => {
+            bulkload_agent::transfer::RootKind::Tree
+        }
     };
     let host = args.first().ok_or(BulkloadRefusal::RequiredFieldMissing)?;
     let remote = match args.get(5) {
@@ -3420,6 +3602,10 @@ fn pull_command<T>(
             ssh.arg("negotiate");
             false
         }
+        Remote::Retire => {
+            ssh.arg("retire-source");
+            false
+        }
         // The repository, quoted for the remote shell ssh hands it to.
         Remote::UploadPack(repo) => {
             if repo.contains('\'') || !repo.starts_with('/') {
@@ -3429,7 +3615,7 @@ fn pull_command<T>(
             true
         }
     };
-    if !relay && !matches!(mode, Remote::Negotiate) {
+    if !relay && !matches!(mode, Remote::Negotiate | Remote::Retire) {
         // The flags this verb hands its source half (`--sqlite-rows`,
         // `--sqlite-carry-wall`): fixed literals and parsed integers.
         for flag in bulkload_agent::transfer::serve_flags() {
