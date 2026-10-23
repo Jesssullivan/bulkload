@@ -2992,6 +2992,12 @@ fn h58_an_orphaned_block_is_cleared_with_no_plan() {
         "{}",
         cleared.stdout
     );
+    // Nothing but the targets and the ledgers moved (before `git status`
+    // below refreshes the index).
+    assert_eq!(
+        frozen_but_targets(&world.root.join("dst"), &[world.dst(), moved.clone()]),
+        frozen
+    );
     assert_eq!(snapshot(&[world.dst(), moved.clone()]), before);
     for ledger in [
         world.dst().join(".git/bulkload/v1/neo"),
@@ -3008,10 +3014,6 @@ fn h58_an_orphaned_block_is_cleared_with_no_plan() {
             ledger.display()
         );
     }
-    assert_eq!(
-        frozen_but_targets(&world.root.join("dst"), &[world.dst(), moved.clone()]),
-        frozen
-    );
     let all = freeze_all(&world.root.join("dst"));
     let again = orphaned(&[&world.dst(), &moved], &[]);
     assert!(again.ok, "{}", again.stderr);

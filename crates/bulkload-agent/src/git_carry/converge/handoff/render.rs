@@ -1022,9 +1022,10 @@ mod tests {
     #[test]
     fn open_rows_are_uncapped_and_their_count_is_open() {
         let mut inputs = sample();
+        // One class past the block's cap, and one more class.
         inputs.refs = (0..REF_NAMES + 6)
             .map(|n| RefDiff {
-                class: if n % 2 == 0 {
+                class: if n < REF_NAMES + 4 {
                     "diverged"
                 } else {
                     "source-ahead"
@@ -1088,7 +1089,7 @@ mod tests {
             .any(|row| row.kind == "behind" && row.row == inputs.item.as_bytes()));
         // The block still caps its names.
         let text = String::from_utf8(render(&inputs, false)).unwrap();
-        assert!(text.contains("and 6 more"), "{text}");
+        assert!(text.contains("and 4 more"), "{text}");
         assert!(
             text.contains(&format!("- Open rows: {}", rows.len())),
             "{text}"
