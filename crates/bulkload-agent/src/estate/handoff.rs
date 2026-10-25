@@ -48,6 +48,9 @@ pub enum HandoffMode {
 )]
 pub struct HandoffOptions {
     pub mode: HandoffMode,
+    /// `--dispositions LEDGER`: honor exact item-instance accept reviews.
+    /// Policies, re-carry and abandon decisions leave the hand-off open.
+    pub dispositions: Option<PathBuf>,
     /// `--renew`: put back a block a person removed by hand.
     pub renew: bool,
     /// `--readme`: also an existing `README.md` (never created).
@@ -244,6 +247,66 @@ fn planned(plan: &Plan, corpus: &Path, state: &Path) -> Result<Vec<Planned>> {
     Ok(items)
 }
 
+/// SPEC Done 2: an accepted refusal is accounted, without hiding a later
+/// refusal or a decision that still requires work. The closure ledger owns
+/// plan, source and refusal-instance binding, shared with `closure-dispose`.
+fn reviewed_refusals(
+    items: &mut [Planned],
+    paths: (&Path, &Path, &Path),
+    source: &str,
+    path: &Path,
+    line: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    use crate::disposition::{Decision, Ledger, Scope};
+    let (plan, corpus, state) = paths;
+    let reviews = Ledger::read(path, plan, source)?;
+    let estate = super::ledger(plan, corpus, source, &[state.to_path_buf()])?;
+    for entry in &estate.entries {
+        if !matches!(
+            crate::closure::classify(entry),
+            crate::closure::Disposition::RefusedPendingReview(_)
+        ) {
+            continue;
+        }
+        let Some(Ok(record)) = &entry.record else {
+            continue;
+        };
+        let crate::outcome::Outcome::Refused(refusal) = &record.outcome else {
+            continue;
+        };
+        let instance = crate::closure::instance(entry);
+        let Some(review) = reviews.review(&entry.item, &instance, refusal.code()) else {
+            continue;
+        };
+        if review.decision() != Decision::Accept || !matches!(review.scope(), Scope::Item { .. }) {
+            continue;
+        }
+        let Some(item) = items.iter_mut().find(|item| item.id == entry.item) else {
+            continue;
+        };
+        // Planning and closure read without locks. A changed record or
+        // capture cannot inherit an acceptance from the earlier read.
+        if item.refused.as_deref() != Some(refusal.code())
+            || item.current.map(|digest| hex(&digest)) != entry.capture
+            || crate::outcome::read_record(&state.join(format!("{}.outcome", entry.item))).as_ref()
+                != Ok(record)
+        {
+            continue;
+        }
+        item.refused = None;
+        item.records = facts_digest(item.current.as_ref(), item.omitted.as_ref(), None)?;
+        line(&format!(
+            "{{\"schema\":\"{SCHEMA}\",\"kind\":\"reviewed-refusal\",\"item\":{},\"instance\":{},\"refusal\":{},\"decision\":\"accept\",\"reviewer\":{},\"date\":{}}}",
+            json_string(&entry.item),
+            json_string(&instance),
+            json_string(refusal.code()),
+            json_string(review.reviewer()),
+            json_string(review.date()),
+        ))?;
+    }
+    Ok(())
+}
+
 fn line_of(item: Option<&str>, workspace: &Path, mode: &str, result: &Result<Row>) -> String {
     use std::fmt::Write as _;
     let mut text = format!(
@@ -363,7 +426,27 @@ pub fn handoff(
     let (plan, corpus, state) = (&canonical(plan), &canonical(corpus), &canonical(state));
     let contents: Plan = read(plan)?;
     let plan_digest = hash_file(plan)?;
-    let items = planned(&contents, corpus, state)?;
+    let place = |planned_at: &Path| -> PathBuf {
+        options
+            .places
+            .iter()
+            .find_map(|(from, to)| planned_at.strip_prefix(from).ok().map(|rest| to.join(rest)))
+            .unwrap_or_else(|| planned_at.to_path_buf())
+    };
+    let mut items = planned(&contents, corpus, state)?;
+    // Match Git's live family census against placed paths. The original
+    // plan item still owns its identity, capture and disposition binding.
+    for item in &contents.items {
+        if let Some(workspace) = item.workspace.as_deref() {
+            let identity = id(item)?;
+            if let Some(planned) = items.iter_mut().find(|planned| planned.id == identity) {
+                planned.workspace = Some(canonical(&place(workspace)));
+            }
+        }
+    }
+    if let Some(path) = &options.dispositions {
+        reviewed_refusals(&mut items, (plan, corpus, state), source, path, line)?;
+    }
     let siblings: Vec<(PathBuf, PathBuf)> = options
         .siblings
         .iter()
@@ -390,13 +473,6 @@ pub fn handoff(
         siblings: &siblings,
         as_of: options.as_of,
         h_step: false,
-    };
-    let place = |planned_at: &Path| -> PathBuf {
-        options
-            .places
-            .iter()
-            .find_map(|(from, to)| planned_at.strip_prefix(from).ok().map(|rest| to.join(rest)))
-            .unwrap_or_else(|| planned_at.to_path_buf())
     };
     let checkouts: Vec<PathBuf> = contents
         .items

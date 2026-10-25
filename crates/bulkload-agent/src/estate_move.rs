@@ -1053,6 +1053,30 @@ fn move_pass(run: &Move) -> Result<()> {
     // 2. Decide every item against the destination now. Under --plan-only
     // the decisions are shown, never recorded.
     let items = estate::inspect(&plan)?;
+    // SPEC Done 2: closure reads outcomes by the original plan identity.
+    // A home map changes an item's placement, never its outcome identity.
+    let planned_items: std::collections::BTreeMap<_, _> = items
+        .iter()
+        .map(|item| estate::item_id(item).map(|identity| (identity, item)))
+        .collect::<Result<_>>()?;
+    let record_outcome = |row: &moving::Row,
+                          outcome: &'static str,
+                          refusal: Option<&BulkloadRefusal>,
+                          reason: Option<String>|
+     -> Result<()> {
+        let item = planned_items
+            .get(&row.id)
+            .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+        estate::streamed::record_outcome(&private, item, outcome, refusal, reason)
+    };
+    let journal = |row: &moving::Row, snapshot: &estate::streamed::ItemSnapshot| {
+        let mut planned = snapshot.clone();
+        planned.item = (*planned_items
+            .get(&row.id)
+            .ok_or(BulkloadRefusal::RequiredFieldMissing)?)
+        .clone();
+        estate::streamed::journal(&private, &planned, &run.source)
+    };
     // The default home map (2026-10-21): what the source half left at its
     // own path is placed under this host's home, or held typed.
     let homes = home_map(run, &carry);
@@ -1150,6 +1174,7 @@ fn move_pass(run: &Move) -> Result<()> {
     });
     // Which items land: a held one is recorded and left untouched.
     let mut landing = Vec::new();
+    let mut first_fetch_active = std::collections::BTreeSet::new();
     for row in order {
         // An item that maps nowhere is held (phase 4), never landed at the
         // source's raw path.
@@ -1179,8 +1204,31 @@ fn move_pass(run: &Move) -> Result<()> {
         // Ours to land again: a landing of this item, never a
         // consolidation of the destination's own repository.
         let consolidated = estate::streamed::converged_path(&private, &row.id).is_file();
-        let ours =
+        let completed_ours =
             !consolidated && estate::streamed::landed_before(&private, &row.id, &run.source)?;
+        let eligible = first_fetch_eligible(row, &rows);
+        let interrupted = if eligible && !consolidated && !completed_ours {
+            if let Some(target) = first_fetch_target(run, row, &snapshot) {
+                match bulkload_agent::first_fetch::prove(&private, &target) {
+                    Ok(proved) => proved,
+                    Err(refusal) => {
+                        record_outcome(row, "refused", Some(&refusal), None)?;
+                        out(&format!(
+                            "estate-move item={} outcome=held code={} live={place:?}",
+                            row.id,
+                            refusal.code()
+                        ))?;
+                        first_refusal.get_or_insert(refusal);
+                        continue;
+                    }
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let ours = completed_ours || interrupted;
         let clear = matches!(
             moving::presence(place),
             moving::Presence::Absent | moving::Presence::Empty
@@ -1193,13 +1241,7 @@ fn move_pass(run: &Move) -> Result<()> {
                 if let Err(refusal) =
                     bulkload_agent::git_carry::parents::make_home_parents(home, place)
                 {
-                    estate::streamed::record_outcome(
-                        &private,
-                        &row.item,
-                        "refused",
-                        Some(&refusal),
-                        None,
-                    )?;
+                    record_outcome(row, "refused", Some(&refusal), None)?;
                     out(&format!(
                         "estate-move item={} outcome=held code={} live={place:?}",
                         row.id,
@@ -1218,9 +1260,8 @@ fn move_pass(run: &Move) -> Result<()> {
                 .unwrap_or(false);
         if !(clear || ours || related) {
             let refusal = BulkloadRefusal::GitDestinationOccupied;
-            estate::streamed::record_outcome(
-                &private,
-                &row.item,
+            record_outcome(
+                row,
                 "refused",
                 Some(&refusal),
                 Some("held: the live path holds another, unrelated repository or tree".to_owned()),
@@ -1232,6 +1273,21 @@ fn move_pass(run: &Move) -> Result<()> {
             ))?;
             first_refusal.get_or_insert(refusal);
             continue;
+        }
+        if eligible && (clear || interrupted) {
+            if let Some(target) = first_fetch_target(run, row, &snapshot) {
+                if let Err(refusal) = bulkload_agent::first_fetch::begin(&private, &target) {
+                    record_outcome(row, "refused", Some(&refusal), None)?;
+                    out(&format!(
+                        "estate-move item={} outcome=held code={} live={place:?}",
+                        row.id,
+                        refusal.code()
+                    ))?;
+                    first_refusal.get_or_insert(refusal);
+                    continue;
+                }
+                first_fetch_active.insert(row.id.clone());
+            }
         }
         landing.push((row, snapshot, related));
     }
@@ -1368,7 +1424,7 @@ fn move_pass(run: &Move) -> Result<()> {
                             Some(BulkloadRefusal::HomesConsolidateUnsupported),
                         )
                     } else {
-                        estate::streamed::journal(&private, snapshot, &run.source)?;
+                        journal(row, snapshot)?;
                         if row.item.workspace.is_some() {
                             // The workspace ledger the hand-off and later passes
                             // read (B2).
@@ -1383,9 +1439,8 @@ fn move_pass(run: &Move) -> Result<()> {
                         }
                         ("workspace-restored", None)
                     };
-                    estate::streamed::record_outcome(
-                        &private,
-                        &row.item,
+                    record_outcome(
+                        row,
                         outcome,
                         refusal.as_ref(),
                         if done.branches_held.is_some() {
@@ -1422,13 +1477,7 @@ fn move_pass(run: &Move) -> Result<()> {
                     }
                 }
                 Err(refusal) => {
-                    estate::streamed::record_outcome(
-                        &private,
-                        &row.item,
-                        "refused",
-                        Some(&refusal),
-                        None,
-                    )?;
+                    record_outcome(row, "refused", Some(&refusal), None)?;
                     out(&format!(
                         "estate-move item={} outcome=refused code={} live={place:?}",
                         row.id,
@@ -1439,8 +1488,19 @@ fn move_pass(run: &Move) -> Result<()> {
             }
             continue;
         }
-        let mut landing = fetched
-            .and_then(|fetched| estate::streamed::land(&current, &private, &map, &reach, fetched));
+        let prove_first_fetch = |snapshot: &estate::streamed::ItemSnapshot| -> Result<()> {
+            if first_fetch_active.contains(&row.id) {
+                let target = required_first_fetch_target(run, row, snapshot)?;
+                if !bulkload_agent::first_fetch::prove(&private, &target)? {
+                    return Err(BulkloadRefusal::GitDestinationOccupied);
+                }
+            }
+            Ok(())
+        };
+        let mut landing = fetched.and_then(|fetched| {
+            prove_first_fetch(&current)?;
+            estate::streamed::land_with_identity(&current, &private, &map, &reach, fetched, &row.id)
+        });
         for _ in 0..JIT_ROUNDS {
             if landing.as_ref().err() != Some(&BulkloadRefusal::CaptureDrifted) {
                 break;
@@ -1451,13 +1511,16 @@ fn move_pass(run: &Move) -> Result<()> {
             ))?;
             landing = recapture(&current).and_then(|(fresh, fetched)| {
                 current = fresh;
-                estate::streamed::land(&current, &private, &map, &reach, fetched)
+                prove_first_fetch(&current)?;
+                estate::streamed::land_with_identity(
+                    &current, &private, &map, &reach, fetched, &row.id,
+                )
             });
         }
         let snapshot = &current;
         match landing {
             Ok(done) => {
-                estate::streamed::journal(&private, snapshot, &run.source)?;
+                journal(row, snapshot)?;
                 if row.item.workspace.is_some() {
                     // The workspace ledger the hand-off and later passes
                     // read (B2).
@@ -1475,7 +1538,11 @@ fn move_pass(run: &Move) -> Result<()> {
                 } else {
                     "refs-imported"
                 };
-                estate::streamed::record_outcome(&private, &row.item, outcome, None, None)?;
+                record_outcome(row, outcome, None, None)?;
+                if first_fetch_active.contains(&row.id) {
+                    let target = required_first_fetch_target(run, row, snapshot)?;
+                    bulkload_agent::first_fetch::finish(&private, &target)?;
+                }
                 out(&format!(
                     "estate-move item={} outcome={outcome} object_batches={} object_batches_skipped={} object_bytes={} fetch_ms={fetch_ms} topped_up={} missing_at_source={} unreachable_not_carried={} dest_lacking_own={} index={} land_ms={} live={place:?}",
                     row.id,
@@ -1492,13 +1559,7 @@ fn move_pass(run: &Move) -> Result<()> {
                 landed.push(row.id.clone());
             }
             Err(refusal) => {
-                estate::streamed::record_outcome(
-                    &private,
-                    &row.item,
-                    "refused",
-                    Some(&refusal),
-                    None,
-                )?;
+                record_outcome(row, "refused", Some(&refusal), None)?;
                 out(&format!(
                     "estate-move item={} outcome=refused code={} live={place:?}",
                     row.id,
@@ -1561,13 +1622,7 @@ fn move_pass(run: &Move) -> Result<()> {
         } else {
             continue;
         };
-        estate::streamed::record_outcome(
-            &private,
-            &row.item,
-            "refused",
-            Some(&refusal),
-            Some(why),
-        )?;
+        record_outcome(row, "refused", Some(&refusal), Some(why))?;
         out(&format!(
             "estate-move item={} outcome=held code={} capture_code={}",
             row.id,
@@ -1921,6 +1976,7 @@ fn first_decision(
     row: &moving::Row,
     snapshot: Option<&estate::streamed::ItemSnapshot>,
     refusals: &std::collections::BTreeMap<String, String>,
+    map: &[(Vec<u8>, Vec<u8>)],
 ) -> (&'static str, Option<String>) {
     let held = |code: &str| ("held", Some(code.to_owned()));
     if row.decision.reason == UNMAPPED {
@@ -1939,6 +1995,9 @@ fn first_decision(
     let Some(snapshot) = snapshot else {
         return held(BulkloadRefusal::CaptureAbsent.code());
     };
+    if let Err(refusal) = estate::streamed::shallow_decision(snapshot, map) {
+        return held(refusal.code());
+    }
     let place = row.item.workspace.as_ref().unwrap_or(&row.item.repository);
     match moving::presence(place) {
         moving::Presence::Absent | moving::Presence::Empty => ("create", None),
@@ -1957,6 +2016,47 @@ fn owns_store(item: &estate::Item) -> bool {
     item.workspace
         .as_ref()
         .is_none_or(|workspace| *workspace == item.repository)
+}
+
+// A new ordinary main can retain custody while its first fetch is partial.
+// Completed repositories and other administration layouts keep their own rules.
+fn first_fetch_target<'a>(
+    run: &'a Move,
+    row: &'a moving::Row,
+    snapshot: &'a estate::streamed::ItemSnapshot,
+) -> Option<bulkload_agent::first_fetch::Target<'a>> {
+    let live = row.item.workspace.as_deref()?;
+    if live != row.item.repository || snapshot.separate_admin.is_some() {
+        return None;
+    }
+    Some(bulkload_agent::first_fetch::Target {
+        item: &row.id,
+        source_label: &run.source,
+        source_host: run.host.to_str()?,
+        source_path: &row.item.source,
+        live_path: live,
+        expected_shallow: &snapshot.shallow,
+    })
+}
+
+// A claimed root cannot change administration layout during a JIT capture.
+fn required_first_fetch_target<'a>(
+    run: &'a Move,
+    row: &'a moving::Row,
+    snapshot: &'a estate::streamed::ItemSnapshot,
+) -> Result<bulkload_agent::first_fetch::Target<'a>> {
+    first_fetch_target(run, row, snapshot).ok_or(BulkloadRefusal::GitAuthorityChanged)
+}
+
+// Nested repositories can publish administration into each other's roots
+// during the parallel fetch. They retain their existing admission rules.
+fn first_fetch_eligible(row: &moving::Row, rows: &[moving::Row]) -> bool {
+    rows.iter().all(|other| {
+        let shared = other.item.repository == row.item.repository;
+        let nested = other.item.source.starts_with(&row.item.source);
+        let enclosing = row.item.source.starts_with(&other.item.source);
+        shared || (!nested && !enclosing)
+    })
 }
 
 /// `--plan-only` (2026-10-21): every item's B2 decision, from the B1
@@ -1986,15 +2086,44 @@ fn preview(
         homes_plan(run, home, plan)?;
     }
     let scratch = run.state.join("scratch");
-    let snapshots = rows
+    let mut snapshots = rows
         .iter()
         .map(|row| estate::streamed::recorded(carry, &row.id))
         .collect::<Result<Vec<_>>>()?;
+    for (row, snapshot) in rows.iter().zip(&mut snapshots) {
+        if let Some(snapshot) = snapshot {
+            snapshot.item = row.item.clone();
+        }
+    }
+    let placed: Vec<_> = rows.iter().map(|row| row.item.clone()).collect();
+    let map = estate::streamed::path_map(&placed);
+    let private = run.state.join("private");
     let mut b2: Vec<B2> = rows
         .iter()
         .zip(&snapshots)
         .map(|(row, snapshot)| {
-            let (action, code) = first_decision(row, snapshot.as_ref(), refusals);
+            let (mut action, mut code) = first_decision(row, snapshot.as_ref(), refusals, &map);
+            if action == "held"
+                && code.as_deref() == Some(BulkloadRefusal::GitDestinationOccupied.code())
+                && !refusals.contains_key(&row.id)
+                && first_fetch_eligible(row, rows)
+            {
+                if let Some(snapshot) = snapshot {
+                    if let Some(target) = first_fetch_target(run, row, snapshot) {
+                        match bulkload_agent::first_fetch::prove(&private, &target) {
+                            Ok(true) => match estate::streamed::shallow_decision(snapshot, &map) {
+                                Ok(_) => {
+                                    action = "create";
+                                    code = None;
+                                }
+                                Err(refusal) => code = Some(refusal.code().to_owned()),
+                            },
+                            Ok(false) => {}
+                            Err(refusal) => code = Some(refusal.code().to_owned()),
+                        }
+                    }
+                }
+            }
             B2 {
                 action,
                 code,
@@ -3253,5 +3382,55 @@ mod tests {
         assert_eq!(remap_item(&cache, None, false), None);
         // This host's plan is this host's paths already.
         assert_eq!(remap_item(&nowhere, Some(&homes), true).unwrap(), nowhere);
+    }
+
+    #[test]
+    fn an_active_first_fetch_holds_a_recaptured_separate_admin() {
+        let args: Vec<OsString> = [
+            "--label",
+            "neo-test",
+            "--source",
+            "neo",
+            "-",
+            "/source-state",
+            "/move-state",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        let run = Move::parse(&args).unwrap();
+        let item = item("/source/repo", "/live/repo", "/live/repo");
+        let row = moving::Row {
+            id: estate::item_id(&item).unwrap(),
+            item: item.clone(),
+            decision: moving::Decision {
+                action: moving::Action::Land,
+                reason: "fixture".to_owned(),
+                presence: moving::Presence::Absent,
+                capture: moving::Capture::Held,
+                decided_ns: 0,
+                attempted: false,
+            },
+            kept: false,
+        };
+        let mut snapshot = estate::streamed::ItemSnapshot {
+            item,
+            snapshot: bulkload_agent::git_carry::stream::Snapshot::default(),
+            excluded: Vec::new(),
+            host_files: Vec::new(),
+            started_ns: 0,
+            history: bulkload_agent::git_carry::stream::History::default(),
+            index: None,
+            head_branch: None,
+            head: String::new(),
+            separate_admin: None,
+            shallow: Vec::new(),
+        };
+        assert!(required_first_fetch_target(&run, &row, &snapshot).is_ok());
+        snapshot.separate_admin = Some(PathBuf::from("/source/separate-admin"));
+        assert!(matches!(
+            required_first_fetch_target(&run, &row, &snapshot),
+            Err(BulkloadRefusal::GitAuthorityChanged)
+        ));
     }
 }

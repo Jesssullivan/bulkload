@@ -237,6 +237,9 @@ counters! {
     StoreWalTemplates => "store_wal_templates",
     // Destination publication events.
     FilesMaterialized => "files_materialized",
+    // New or changed file payload whose publication and record committed.
+    // Equal adoptions and empty bookkeeping commits do not count.
+    DestPayloadCommitted => "dest_payload_committed",
     DirectoriesFinished => "directories_finished",
     // Of those, directories completed in the session's last output group
     // commit instead of a completion commit of their own (OI-1003-Q154

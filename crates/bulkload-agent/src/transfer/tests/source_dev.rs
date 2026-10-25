@@ -263,3 +263,46 @@ fn rows_of_another_source_root_are_never_taken_for_its_own() {
         ours
     );
 }
+
+/// Repeated source reboots retain all earlier device aliases. A changed
+/// file supersedes its own output, a stable file is never re-read and a
+/// warm pass after each reboot reads nothing (SPEC rules 6 and 8).
+#[test]
+fn successive_source_reboots_keep_reuse_and_supersede_ownership() {
+    let corpus = Corpus::new();
+    let source = corpus.base.join("source");
+    std::fs::write(source.join("stable"), noise(911, 310_000)).unwrap();
+    std::fs::write(source.join("changing"), noise(912, 320_000)).unwrap();
+    assert!(corpus.run().unwrap().refusals.is_empty());
+    let state = corpus.base.join("destination-state");
+    for reboot in 1_u64..=3 {
+        keyed_before(&state, &|authority| {
+            authority.2 = authority.2.wrapping_add(2 * reboot);
+        });
+        let changed = noise(
+            912 + reboot,
+            320_000 + usize::try_from(reboot).unwrap() * 1000,
+        );
+        std::fs::write(source.join("changing"), &changed).unwrap();
+        let resumed = corpus.run().unwrap();
+        assert!(resumed.refusals.is_empty(), "{:?}", resumed.refusals);
+        assert_eq!(resumed.reused, 1, "the stable file survives every reboot");
+        assert_eq!(resumed.completed, 1);
+        assert!(resumed.source_bytes_read <= changed.len() as u64);
+        assert_eq!(
+            std::fs::read(corpus.base.join("destination/changing")).unwrap(),
+            changed
+        );
+        assert_eq!(outputs(&corpus), 2, "no duplicate output records");
+        let warm = corpus.run().unwrap();
+        assert!(warm.refusals.is_empty());
+        assert_eq!((warm.reused, warm.source_bytes_read), (2, 0));
+        assert_eq!(
+            std::fs::read_dir(corpus.base.join("destination"))
+                .unwrap()
+                .count(),
+            2,
+            "no beside copies after repeated source reboots"
+        );
+    }
+}

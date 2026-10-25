@@ -169,6 +169,8 @@ const PRIVATE_SUFFIXES: &[&str] = &[
     ".carried",
     // A streamed fetch's resume marks (B1).
     ".objects",
+    // A source-bound empty root claimed before its first object fetch.
+    ".first-fetch",
 ];
 
 /// A ledger's interrupted publication: `estate::write_bytes` writes
@@ -466,6 +468,7 @@ mod tests {
             "carry/move-source.notes",
             "private/estate.lock",
             "private/abc.outcome",
+            "private/abc.first-fetch",
             "private/abc-def.beside",
             "private/abc-def.beside-reason",
             "private/abc-def.refs-in",

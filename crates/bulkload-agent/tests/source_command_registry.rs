@@ -151,16 +151,17 @@ const BYPASSES: &[Bypass] = &[
         id: "agent::main::pull_command(\"ssh\")",
         shape: Some(
             "Command::new(\"ssh\");\
-             ssh.args([\"-T\",\"-oBatchMode=yes\",\"-oConnectTimeout=15\"]);\
+             ssh.args([\"-T\",\"-oBatchMode=yes\",\"-oConnectTimeout=15\",\"-oServerAliveInterval=15\",\"-oServerAliveCountMax=2\",]);\
              ifletSome(config)=args.get(6){if!Path::new(config).is_absolute(){returnErr(BulkloadRefusal::PathNotAbsolute);\
              }ssh.arg(\"-F\").arg(config);\
              }ssh.arg(\"--\").arg(host).arg(remote);\
              ifbulkload_agent::durable::durability()==bulkload_agent::durable::Durability::Strict{ssh.arg(\"--durability=strict\");\
              }ifbulkload_agent::durable::ledger_sync()==bulkload_agent::durable::LedgerSync::Full{ssh.arg(\"--source-ledger-sync=full\");\
              }letrelay=matchmode{Remote::Serve(_)=>false,Remote::Negotiate=>{ssh.arg(\"negotiate\");false}\
+             Remote::Retire=>{ssh.arg(\"retire-source\");false}\
              Remote::UploadPack(repo)=>{ifrepo.contains('\\'')||!repo.starts_with('/'){returnErr(BulkloadRefusal::PathNotPortable);\
              }ssh.arg(\"upload-pack\").arg(format!(\"'{repo}'\"));true}};\
-             if!relay&&!matches!(mode,Remote::Negotiate){forflaginbulkload_agent::transfer::serve_flags(){ssh.arg(flag);\
+             if!relay&&!matches!(mode,Remote::Negotiate|Remote::Retire){forflaginbulkload_agent::transfer::serve_flags(){ssh.arg(flag);\
              }ssh.arg(\"serve\");\
              }ifkind==bulkload_agent::transfer::RootKind::File{ssh.arg(\"--file\");\
              }let(wire_in,wire_out)=ifrelay{(Stdio::inherit(),Stdio::inherit())}else{(Stdio::piped(),Stdio::piped())};\

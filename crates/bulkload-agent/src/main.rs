@@ -18,6 +18,7 @@ use bulkload_proto::{BulkloadRefusal, Control, FileKind, Frame, Result, RowSchem
 // `estate-move-source` and `estate-move` (M2 item 7): the verbs above,
 // composed.
 mod estate_move;
+mod reconnect;
 
 const USAGE: &str = "\
 bulkload-agent -- ordinary-file transport and offline SQLite composition
@@ -26,6 +27,7 @@ USAGE:
     bulkload-agent [--durability=group|strict] [--min-free-percent=N]
                    [--priority=background|normal|auto] [--escalate-after=SECONDS]
                    [--source-ledger-sync=relaxed|full]
+                   [--reconnect-seconds=N]
                    [--sqlite=refuse|snapshot] [--sqlite-carry-wall=SECONDS]
                    [--sqlite-rows] <SUBCOMMAND>
 
@@ -91,6 +93,12 @@ SUBCOMMANDS:
                 config a PATH ssh cannot read (sting: a nix openssh against
                 Rocky's crypto-policies, refused TRANSPORT_LOST), put the
                 system ssh first: env PATH=/usr/bin:$PATH bulkload-agent ...
+                --reconnect-seconds=N: retry a lost file-transfer connection
+                within this admission/backoff window, using the same durable
+                states. It never cancels an in-flight attempt. Default 0
+                returns the failure immediately. Applies to estate-move's
+                native file pulls too. Typed holds, SQLite row unions, Git
+                upload-pack and source retirement are never retried.
     serve [--file]
                 Serve one framed request on stdin/stdout (for SSH). With
                 --file the root the request names is one file or symlink,
@@ -474,7 +482,7 @@ SUBCOMMANDS:
     estate-handoff [--check | --clear [--clear-carried | --legacy-only] | --dry-run] [--item ID]...
                 [--workspace PATH]... [--sibling LANDED_PREFIX=LIVE_PREFIX]...
                 [--place SOURCE_PREFIX=LIVE_PREFIX]...
-                [--readme] [--renew] [--as-of NS] [--keep-going]
+                [--readme] [--renew] [--as-of NS] [--keep-going] [--dispositions LEDGER]
                 (PLAN CORPUS PRIVATE_STATE | --move-state MOVE_STATE) SOURCE
     estate-handoff --clear --orphaned --workspace PATH [--workspace PATH]... [--keep-going] SOURCE
                 TIN-6569, OI-1003-Q183: write a dated hand-off block at byte 0 of
@@ -524,6 +532,10 @@ SUBCOMMANDS:
                 after each workspace line, one open-row line per open row
                 its open field counts, uncapped (class ref, dest-only, sibling,
                 refused or behind; the row's ref, path or item; the reason).
+                --dispositions LEDGER closes only exact item-instance accept
+                reviews bound to this plan and SOURCE. Stale reviews, policies,
+                re-carry and abandon leave rows open. Accepted refusals remain
+                visible as reviewed-refusal lines, with instance and reviewer.
                 --clear --orphaned clears SOURCE's blocks in each absolute
                 --workspace PATH whose plan, corpus and state are gone,
                 reading none of them: each block naming SOURCE in the chain
@@ -1224,6 +1236,17 @@ fn global_flags(
             .and_then(|value| value.strip_prefix("--priority="))
         {
             *priority = Some(class.parse()?);
+            continue;
+        }
+        if let Some(seconds) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--reconnect-seconds="))
+        {
+            reconnect::set_budget(
+                seconds
+                    .parse()
+                    .map_err(|_| BulkloadRefusal::FieldDomainViolation)?,
+            );
             continue;
         }
         if let Some(seconds) = arg
@@ -2809,6 +2832,10 @@ fn handoff_options(
                 move_state = Some(PathBuf::from(value(at + 1)?));
                 at += 1;
             }
+            "--dispositions" if options.dispositions.is_none() => {
+                options.dispositions = Some(PathBuf::from(value(at + 1)?));
+                at += 1;
+            }
             "--item" => {
                 options.items.push(
                     value(at + 1)?
@@ -3508,16 +3535,25 @@ fn pull_tree(
             .map(Path::new)
             .ok_or(BulkloadRefusal::RequiredFieldMissing)
     };
-    pull_serve(kind, args, |input, output| {
-        bulkload_agent::transfer::receive_kind(
-            input,
-            output,
-            path(1)?,
-            path(3)?,
-            path(2)?,
-            path(4)?,
-            kind,
-        )
+    reconnect::pull(|| {
+        use bulkload_agent::counters::{Counter, Counters};
+        let before = Counters::snapshot();
+        let outcome = pull_serve(kind, args, |input, output| {
+            bulkload_agent::transfer::receive_kind(
+                input,
+                output,
+                path(1)?,
+                path(3)?,
+                path(2)?,
+                path(4)?,
+                kind,
+            )
+        });
+        let changed = Counters::snapshot()
+            .since(before)
+            .get(Counter::DestPayloadCommitted)
+            > 0;
+        (outcome, changed)
     })
 }
 
@@ -3581,7 +3617,13 @@ fn pull_command<T>(
         }
     };
     let mut ssh = Command::new("ssh");
-    ssh.args(["-T", "-oBatchMode=yes", "-oConnectTimeout=15"]);
+    ssh.args([
+        "-T",
+        "-oBatchMode=yes",
+        "-oConnectTimeout=15",
+        "-oServerAliveInterval=15",
+        "-oServerAliveCountMax=2",
+    ]);
     if let Some(config) = args.get(6) {
         if !Path::new(config).is_absolute() {
             return Err(BulkloadRefusal::PathNotAbsolute);

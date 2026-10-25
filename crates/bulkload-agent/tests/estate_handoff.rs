@@ -101,6 +101,9 @@
 #[path = "estate_adopt/gftb.rs"]
 mod gftb;
 
+#[path = "estate_handoff/dispositions.rs"]
+mod dispositions;
+
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;

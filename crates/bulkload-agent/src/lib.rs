@@ -69,6 +69,7 @@ pub mod estate;
 pub mod extents;
 #[cfg(feature = "fault-injection")]
 pub mod fault;
+pub mod first_fetch;
 pub mod freshness;
 pub mod git_carry;
 pub mod hash;

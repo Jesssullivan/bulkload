@@ -2624,6 +2624,17 @@ impl PublishSink {
             }
         }
         let mut records = Vec::with_capacity(items.len());
+        let changed: std::collections::HashSet<Vec<u8>> = items
+            .iter()
+            .filter_map(|item| match item {
+                Publication::Staged { record, .. } | Publication::Superseding { record, .. } => {
+                    Some(record.rel_path.clone())
+                }
+                Publication::Adopted { record, .. } => {
+                    record.extended.map(|_| record.rel_path.clone())
+                }
+            })
+            .collect();
         let mut touched = TouchedDevices::default();
         let mut superseding = Vec::new();
         for item in items {
@@ -2723,6 +2734,15 @@ impl PublishSink {
                 .commit_outputs_finishing(&records, &settled, &completed)
         });
         if committed.is_ok() {
+            // Count payload changes only after both data and records
+            // are durable. Equal adoptions never reset reconnect.
+            counters::add_len(
+                Counter::DestPayloadCommitted,
+                records
+                    .iter()
+                    .filter(|record| changed.contains(&record.rel_path))
+                    .count(),
+            );
             if let Some(finish) = &finish {
                 finish
                     .folded
