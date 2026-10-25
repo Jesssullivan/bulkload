@@ -295,6 +295,29 @@ fn reconnect_is_opt_in_and_never_retries_a_typed_hold() {
 }
 
 #[test]
+fn reconnect_owns_its_connection_and_default_pulls_keep_sharing_available() {
+    for budget in [None, Some("0"), Some("1")] {
+        let world = World::new("online");
+        let output = world.pull(budget);
+        assert!(output.status.success(), "{}", shown(&output));
+        let args = fs::read_to_string(world.path("ssh-args")).unwrap();
+        let enabled = budget == Some("1");
+        assert_eq!(
+            args.lines().any(|arg| arg == "-oControlMaster=no"),
+            enabled,
+            "{args}"
+        );
+        assert_eq!(
+            args.lines().any(|arg| arg == "-oControlPath=none"),
+            enabled,
+            "{args}"
+        );
+        assert!(args.lines().any(|arg| arg == "-oServerAliveInterval=15"));
+        assert!(args.lines().any(|arg| arg == "-oServerAliveCountMax=2"));
+    }
+}
+
+#[test]
 fn an_invalid_reconnect_budget_is_refused_before_a_transport_starts() {
     for budget in ["-1", "forever", "18446744073709551616"] {
         let world = World::new("offline");

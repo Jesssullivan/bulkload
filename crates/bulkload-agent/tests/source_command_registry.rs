@@ -152,6 +152,7 @@ const BYPASSES: &[Bypass] = &[
         shape: Some(
             "Command::new(\"ssh\");\
              ssh.args([\"-T\",\"-oBatchMode=yes\",\"-oConnectTimeout=15\",\"-oServerAliveInterval=15\",\"-oServerAliveCountMax=2\",]);\
+             ifreconnect::enabled(){ssh.args([\"-oControlMaster=no\",\"-oControlPath=none\"]);}\
              ifletSome(config)=args.get(6){if!Path::new(config).is_absolute(){returnErr(BulkloadRefusal::PathNotAbsolute);\
              }ssh.arg(\"-F\").arg(config);\
              }ssh.arg(\"--\").arg(host).arg(remote);\
@@ -179,6 +180,8 @@ const BYPASSES: &[Bypass] = &[
               read, its framed question and answer on stdin and stdout, no \
               path on its command line. The \
               remote word is `bulkload-agent` or a validated absolute path, \
+              and an opted-in reconnect uses a dedicated connection through \
+              fixed ControlMaster=no and ControlPath=none arguments, \
               and the ssh child touches no local source. The three mode flags \
               it may pass (`--durability=strict`, WP0(g)'s \
               `--source-ledger-sync=full`, OI-1003-Q109, and `serve --file` \

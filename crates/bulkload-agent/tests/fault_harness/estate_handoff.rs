@@ -36,6 +36,9 @@
 //! edit before the rerun that finishes it: the removal is still recorded.
 //!
 //! `_exit` models a process crash only (see the harness header).
+//! Each legacy-target scenario runs in its own test subprocess with
+//! `BULKLOAD_HANDOFF_TRACKED_TARGETS` set on that command. Other scenarios
+//! retain the production default, `CLAUDE.local.md`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -45,6 +48,7 @@ use std::sync::Mutex;
 
 use bulkload_agent::estate::{self, HandoffMode, HandoffOptions, Item};
 use bulkload_agent::fault::{Point, FAULT_ENV, FAULT_EXIT_CODE};
+use bulkload_agent::git_carry::converge::handoff::TRACKED_TARGETS_ENV;
 
 use super::{Scenario, CHILD_DEADLINE, CHILD_WATCHDOG, CHILD_WATCHDOG_EXIT_CODE, NEXT};
 
@@ -90,6 +94,32 @@ pub enum EstateHandoff {
 impl Scenario for EstateHandoff {
     fn run(self, point: Point, nth: u64) {
         scenario(point, nth, self);
+    }
+
+    fn run_named(self, point: Point, nth: u64, test: &str) {
+        if std::env::var_os(TRACKED_TARGETS_ENV).is_some() {
+            self.run(point, nth);
+            return;
+        }
+        // The fixture's assertions cover the two legacy targets. Select
+        // them for this scenario alone, including its crash children.
+        // No environment variable in the parallel harness is changed.
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--test-threads", "1", "--nocapture"])
+            .env(TRACKED_TARGETS_ENV, "1")
+            .env_remove(FAULT_ENV)
+            .env_remove(CHILD_ENV)
+            .env_remove(super::CHILD_ENV)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{test}: {stdout}\n{stderr}");
+        assert!(
+            stdout.contains(&format!("test {test} ... ok")),
+            "{test}: the exact fixture did not run: {stdout}\n{stderr}"
+        );
     }
 }
 
@@ -307,6 +337,7 @@ fn crash(world: &World, mode: &str, fault: &str) {
         ])
         .env(CHILD_ENV, &world.base)
         .env(CHILD_MODE_ENV, mode)
+        .env(TRACKED_TARGETS_ENV, "1")
         .env(FAULT_ENV, fault)
         .env_remove(super::CHILD_ENV)
         .stdin(Stdio::null())

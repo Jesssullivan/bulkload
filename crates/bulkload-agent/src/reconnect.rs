@@ -16,6 +16,12 @@ pub fn set_budget(seconds: u64) {
     SECONDS.store(seconds, Ordering::Relaxed);
 }
 
+/// Whether this process opted into reconnect and must own its SSH transport.
+#[must_use]
+pub fn enabled() -> bool {
+    SECONDS.load(Ordering::Relaxed) > 0
+}
+
 fn wait(budget: Duration, elapsed: Duration, failures: u32) -> Option<Duration> {
     let left = budget.checked_sub(elapsed)?;
     let seconds = 1_u64

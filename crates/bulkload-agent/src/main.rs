@@ -3624,6 +3624,11 @@ fn pull_command<T>(
         "-oServerAliveInterval=15",
         "-oServerAliveCountMax=2",
     ]);
+    // A multiplexed session inherits the existing master's transport.
+    // Reconnect needs its own keepalive settings and never alters a master.
+    if reconnect::enabled() {
+        ssh.args(["-oControlMaster=no", "-oControlPath=none"]);
+    }
     if let Some(config) = args.get(6) {
         if !Path::new(config).is_absolute() {
             return Err(BulkloadRefusal::PathNotAbsolute);

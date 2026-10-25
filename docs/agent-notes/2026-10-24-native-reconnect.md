@@ -20,6 +20,15 @@ The option applies to file pulls composed inside `estate-move`.
 It does not replay Git imports, SQLite unions or source retirement.
 The existing SSH builder sends keepalives every fifteen seconds.
 Two unanswered keepalives end an established connection.
+With reconnect enabled, `ControlMaster=no` and `ControlPath=none` give each
+attempt its own connection. Existing owner masters are never changed.
+With reconnect disabled, SSH retains its configured sharing behavior.
+
+Local authority: OpenSSH 9.9p1, `/usr/share/man/man5/ssh_config.5.gz`,
+`ControlMaster`, `ControlPath`, `ServerAliveInterval` and `ServerAliveCountMax`.
+The manual says clients can reuse a master even with `ControlMaster=no`.
+It names `ControlPath=none` as the way to disable sharing.
+Existing transport settings therefore cannot be replaced by a mux client's flags.
 
 An absent remote root can close its stream before `Start`.
 That presently appears as `TRANSPORT_LOST`, too. The option remains explicit.
@@ -39,6 +48,8 @@ A fake clock verifies repeated productive intervals longer than the reconnect
 budget. Each subsequent outage still receives its full reconnect budget.
 Persistent lost SSH status is bounded for empty, warm, equal-adopted and cold
 roots. This guards against resetting the window on an unchanged receive.
+The fake SSH also checks dedicated connections only for a positive reconnect
+budget. Default and explicit zero leave sharing available.
 
 Source: `crates/bulkload-agent/src/reconnect.rs`, `src/main.rs`,
 `tests/reconnect.rs` and `src/transfer/tests/source_dev.rs`.
