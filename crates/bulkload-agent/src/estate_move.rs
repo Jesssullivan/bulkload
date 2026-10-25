@@ -193,6 +193,7 @@ fn source_command(args: &[OsString]) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     // SPEC rule 2 (reset 2026-10-20): a retired staging format in the state
     // is named and refused before anything is read, written or reused.
+    out("estate-move-source event=phase-start phase=preflight")?;
     bulkload_agent::state_payload::refuse_retired(&[&state], &mut |path| {
         out(&format!("estate-move-source state=retired path={path:?}"))
     })?;
@@ -235,6 +236,7 @@ fn source_pass(
         moving::write_report(&carry.join(SOURCE_HOME), home.as_os_str().as_bytes())?;
     }
     let plan = carry.join("plan.postcard");
+    out("estate-move-source event=phase-start phase=inventory")?;
     let found = moving::inventory(roots, maps)?;
     for planned in &found.items {
         out(&format!(
@@ -315,6 +317,7 @@ fn source_pass(
     // bundled, copied or staged. The destination fetches the objects from
     // the live repository and lands the seats from the live files.
     let _ = count;
+    out("estate-move-source event=phase-start phase=capture")?;
     let capture = (|| -> Result<()> {
         let mut first = None;
         for item in estate::inspect(&plan)? {
