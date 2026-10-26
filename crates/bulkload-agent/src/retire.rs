@@ -45,6 +45,14 @@ use crate::{BulkloadRefusal, Result, RowSchema};
 
 const SITE: &str = "retire";
 
+/// Each checked candidate holds its parent directory open until its final
+/// identity check. Use at most a quarter of the soft descriptor limit,
+/// leaving the rest for existing handles, the holder probe and traversal.
+/// The cap keeps Darwin's `lsof` arguments within its existing batch size.
+fn check_batch(soft_limit: u64) -> usize {
+    usize::try_from((soft_limit / 4).clamp(1, 200)).unwrap_or(16)
+}
+
 /// A file's identity: device, inode, size, modification and change times
 /// (nanoseconds).
 pub type Identity = (u64, u64, u64, i128, i128);
@@ -580,10 +588,30 @@ pub fn answer(ask: &Ask) -> Vec<Done> {
     let Ok(root) = crate::io::sys::open_root(&root_path) else {
         return skip_all("the source root cannot be opened");
     };
-    let mut checked = Vec::new();
-    let mut done = Vec::new();
-    for want in &ask.files {
-        match check(&root, want) {
+    // Resolved through the root as opened: the names a holder's open file
+    // links resolve to.
+    let base = std::fs::canonicalize(&root_path).unwrap_or_else(|_| root_path.clone());
+    let mut done = Vec::with_capacity(ask.files.len());
+    let batch = crate::io::limits::descriptor_limit().map_or(16, |(soft, _)| check_batch(soft));
+    for files in ask.files.chunks(batch) {
+        done.extend(answer_batch(&root, &base, files, ask.dry_run));
+    }
+    done
+}
+
+/// Hold, prove and retire only this batch before opening the next. The
+/// holder probe runs after the content checks, and removal still verifies
+/// each identity through its held directory immediately before unlinking.
+fn answer_batch(
+    root: &std::os::fd::OwnedFd,
+    base: &Path,
+    wants: &[Want],
+    dry_run: bool,
+) -> Vec<Done> {
+    let mut checked = Vec::with_capacity(wants.len());
+    let mut done = Vec::with_capacity(wants.len());
+    for want in wants {
+        match check(root, want) {
             Ok(found) => checked.push((want, found)),
             Err(why) => done.push(Done {
                 rel: want.rel.clone(),
@@ -593,12 +621,9 @@ pub fn answer(ask: &Ask) -> Vec<Done> {
             }),
         }
     }
-    // Resolved through the root as opened: the names a holder's open file
-    // links resolve to.
-    let base = std::fs::canonicalize(&root_path).unwrap_or_else(|_| root_path.clone());
     let files: Vec<(PathBuf, u64)> = checked
         .iter()
-        .map(|(want, found)| (path_of(&base, &want.rel), found.stat.node.ino))
+        .map(|(want, found)| (path_of(base, &want.rel), found.stat.node.ino))
         .collect();
     let held = held_open(&files);
     for (index, (want, found)) in checked.into_iter().enumerate() {
@@ -615,7 +640,7 @@ pub fn answer(ask: &Ask) -> Vec<Done> {
             Some(held) if held.contains(&index) => {
                 Verdict::Skipped("a process holds it open".to_owned())
             }
-            Some(_) if ask.dry_run => Verdict::WouldRemove,
+            Some(_) if dry_run => Verdict::WouldRemove,
             Some(_) => remove(&found),
         };
         done.push(answer);

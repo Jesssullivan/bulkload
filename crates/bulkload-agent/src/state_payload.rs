@@ -18,14 +18,17 @@
 //!   would stage payload under a state directory.
 //! - [`measure`] counts what a state directory holds, file by file: a file
 //!   is a ledger or a resume mark only when this module's table names it
-//!   ([`ledger`]); every other file is payload. A verb prints the result on
+//!   ([`ledger`]), or is the validated legacy refusal listing; every other
+//!   file is payload. A verb prints the result on
 //!   its state line (`state_payload_bytes=`) at the end of every pass and
 //!   refuses `STATE_PAYLOAD_LEFT` when it is not zero. A new ledger is added
 //!   to the table, never let through by size.
 
 use std::ffi::OsStr;
 use std::fs;
+use std::io::{BufRead as _, Read as _};
 use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use crate::refuse::RefuseAt as _;
@@ -169,6 +172,8 @@ const PRIVATE_SUFFIXES: &[&str] = &[
     ".carried",
     // A streamed fetch's resume marks (B1).
     ".objects",
+    // A source-bound empty root claimed before its first object fetch.
+    ".first-fetch",
 ];
 
 /// A ledger's interrupted publication: `estate::write_bytes` writes
@@ -235,6 +240,110 @@ pub fn ledger(rel: &[&OsStr]) -> bool {
         [home, ..] if STORE_HOMES.contains(home) => STORE_LEDGERS.contains(&name),
         _ => false,
     }
+}
+
+/// Legacy homes listings have no header: each LF-terminated row is exactly
+/// `REFUSAL<TAB>SESSION<TAB>RELATIVE_SEAT`. Only their known root filename
+/// and complete record shape qualify. The listing is evidence, never payload
+/// or an input to current closure decisions.
+fn legacy_refusals(path: &Path, rel: &[&OsStr], listed: &fs::Metadata) -> bool {
+    const MAX_ROW: u64 = 4096;
+    if rel != [OsStr::new("refused.tsv")] || !listed.is_file() {
+        return false;
+    }
+    let Ok(file) = crate::hash::open_nofollow(path) else {
+        return false;
+    };
+    if !file
+        .metadata()
+        .is_ok_and(|opened| same_listing(listed, &opened))
+    {
+        return false;
+    }
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = Vec::new();
+    let mut rows = 0_u64;
+    let mut bytes = 0_u64;
+    loop {
+        line.clear();
+        let Ok(read) = (&mut reader).take(MAX_ROW + 1).read_until(b'\n', &mut line) else {
+            return false;
+        };
+        if read == 0 {
+            break;
+        }
+        bytes = bytes.saturating_add(read as u64);
+        if read as u64 > MAX_ROW || bytes > listed.len() || !legacy_refusal_row(&line) {
+            return false;
+        }
+        rows += 1;
+    }
+    rows > 0
+        && bytes == listed.len()
+        && reader
+            .get_ref()
+            .metadata()
+            .is_ok_and(|finished| same_listing(listed, &finished))
+        && fs::symlink_metadata(path).is_ok_and(|named| same_listing(listed, &named))
+}
+
+fn same_listing(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    after.is_file()
+        && (
+            before.dev(),
+            before.ino(),
+            before.len(),
+            before.mtime(),
+            before.mtime_nsec(),
+            before.ctime(),
+            before.ctime_nsec(),
+        ) == (
+            after.dev(),
+            after.ino(),
+            after.len(),
+            after.mtime(),
+            after.mtime_nsec(),
+            after.ctime(),
+            after.ctime_nsec(),
+        )
+}
+
+fn legacy_refusal_row(line: &[u8]) -> bool {
+    let Some(line) = line.strip_suffix(b"\n") else {
+        return false;
+    };
+    let mut fields = line.split(|byte| *byte == b'\t');
+    let (Some(code), Some(session), Some(seat), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return false;
+    };
+    let known_code = matches!(
+        code,
+        b"HOMES_CONSOLIDATE_UNSUPPORTED"
+            | b"SQLITE_STATE_CHANGED"
+            | b"DESTINATION_OCCUPIED"
+            | b"HOMES_CONSOLIDATE_RACED"
+            | b"SQLITE_UNION_SCHEMA_UNSUPPORTED"
+            | b"SQLITE_UNION_SOURCE_NOT_WAL"
+            | b"SQLITE_UNION_SOURCE_UNREADABLE"
+            | b"BUDGET_EXCEEDED"
+            | b"SQLITE_BACKUP_FAILED"
+            | b"FIELD_DOMAIN_VIOLATION"
+            | b"SQLITE_SCHEMA_MISMATCH"
+    );
+    let known_session = matches!(session, b"claude" | b"codex")
+        || [b"claude-link-".as_slice(), b"codex-link-"]
+            .iter()
+            .filter_map(|prefix| session.strip_prefix(*prefix))
+            .any(|hash| hash.len() == 16 && hash.iter().all(u8::is_ascii_hexdigit));
+    known_code
+        && known_session
+        && !seat.is_empty()
+        && seat.iter().all(|byte| *byte >= b' ' && *byte != 127)
+        && seat
+            .split(|byte| *byte == b'/')
+            .all(|part| !part.is_empty() && part != b"." && part != b"..")
 }
 
 /// Whether the directory at `rel` is a retired staging format, named and
@@ -331,7 +440,10 @@ pub fn measure(state: &Path) -> Result<Measure> {
                 continue;
             }
             let bytes = meta.len();
-            if !inside_retired && meta.is_file() && ledger(&rel) {
+            if !inside_retired
+                && meta.is_file()
+                && (ledger(&rel) || legacy_refusals(&path, &rel, &meta))
+            {
                 measured.ledger_bytes = measured.ledger_bytes.saturating_add(bytes);
             } else {
                 measured.add(Measure {
@@ -466,6 +578,7 @@ mod tests {
             "carry/move-source.notes",
             "private/estate.lock",
             "private/abc.outcome",
+            "private/abc.first-fetch",
             "private/abc-def.beside",
             "private/abc-def.beside-reason",
             "private/abc-def.refs-in",
@@ -493,6 +606,7 @@ mod tests {
         for path in [
             "capture.bundle",
             "notes.txt",
+            "refused.tsv",
             "carry/corpus",
             "carry/x.bundle",
             "carry/plan.postcard.bak",
@@ -509,6 +623,77 @@ mod tests {
         ] {
             assert!(!ledger(&rel(path)), "{path} is payload");
         }
+    }
+
+    const LEGACY_REFUSALS: &[u8] = b"HOMES_CONSOLIDATE_UNSUPPORTED\tclaude\t.last-cleanup\n\
+SQLITE_STATE_CHANGED\tclaude-link-856f8189468d4c9a\trescue/store.sqlite-wal\n\
+SQLITE_UNION_SOURCE_UNREADABLE\tcodex\tlogs_2.sqlite\n";
+
+    #[test]
+    fn the_root_legacy_refusal_listing_is_ledger_only_after_validation() {
+        let scratch = Scratch::new("legacy-listing");
+        let listing = scratch.file("refused.tsv", LEGACY_REFUSALS);
+        let before = fs::read(&listing).unwrap();
+        let measured = measure(&scratch.0).unwrap();
+        assert_eq!(measured.payload_files, 0);
+        assert_eq!(measured.payload_bytes, 0);
+        assert_eq!(measured.ledger_bytes, LEGACY_REFUSALS.len() as u64);
+        assert_eq!(fs::read(&listing).unwrap(), before);
+        assert!(!ledger(&rel("refused.tsv")));
+        scratch.file("other.tsv", LEGACY_REFUSALS);
+        scratch.file("pull/refused.tsv", LEGACY_REFUSALS);
+        scratch.file("landing/refused.tsv", LEGACY_REFUSALS);
+        let measured = measure(&scratch.0).unwrap();
+        assert_eq!(measured.payload_files, 3);
+        assert_eq!(measured.ledger_bytes, LEGACY_REFUSALS.len() as u64);
+    }
+
+    #[test]
+    fn malformed_or_unrecognized_legacy_listings_remain_payload() {
+        let scratch = Scratch::new("legacy-malformed");
+        for bytes in [
+            b"".as_slice(),
+            b"arbitrary payload\n",
+            b"UNKNOWN\tclaude\tfile\n",
+            b"BUDGET_EXCEEDED\tunknown\tfile\n",
+            b"BUDGET_EXCEEDED\tclaude-link-short\tfile\n",
+            b"BUDGET_EXCEEDED\tcodex\t\n",
+            b"BUDGET_EXCEEDED\tcodex\t/absolute\n",
+            b"BUDGET_EXCEEDED\tcodex\t../outside\n",
+            b"BUDGET_EXCEEDED\tcodex\tpath/../outside\n",
+            b"BUDGET_EXCEEDED\tcodex\tpath//file\n",
+            b"BUDGET_EXCEEDED\tcodex\tfile\textra\n",
+            b"BUDGET_EXCEEDED\tcodex\tfile\0\n",
+            b"BUDGET_EXCEEDED\tcodex\tfile\r\n",
+            b"BUDGET_EXCEEDED\tcodex\tfile",
+        ] {
+            scratch.file("refused.tsv", bytes);
+            let measured = measure(&scratch.0).unwrap();
+            assert_eq!(measured.payload_files, 1, "{bytes:?}");
+            assert_eq!(measured.ledger_bytes, 0, "{bytes:?}");
+        }
+        let mixed = [LEGACY_REFUSALS, b"opaque bytes after valid rows\n"].concat();
+        scratch.file("refused.tsv", &mixed);
+        assert_eq!(measure(&scratch.0).unwrap().payload_files, 1);
+        let too_long = [b"BUDGET_EXCEEDED\tcodex\t".as_slice(), &[b'x'; 4096], b"\n"].concat();
+        scratch.file("refused.tsv", &too_long);
+        assert_eq!(measure(&scratch.0).unwrap().payload_files, 1);
+    }
+
+    #[test]
+    fn a_link_or_changed_legacy_listing_cannot_hide_payload() {
+        let scratch = Scratch::new("legacy-identity");
+        let other = scratch.file("other.tsv", LEGACY_REFUSALS);
+        let listing = scratch.0.join("refused.tsv");
+        std::os::unix::fs::symlink(&other, &listing).unwrap();
+        assert_eq!(measure(&scratch.0).unwrap().payload_files, 2);
+        fs::remove_file(&listing).unwrap();
+        scratch.file("refused.tsv", LEGACY_REFUSALS);
+        let listed = fs::symlink_metadata(&listing).unwrap();
+        // The record shape is still valid, but this is no longer the file
+        // identity and length the measurement observed.
+        fs::write(&listing, [LEGACY_REFUSALS, LEGACY_REFUSALS].concat()).unwrap();
+        assert!(!legacy_refusals(&listing, &rel("refused.tsv"), &listed));
     }
 
     // The retired formats are named, each once, and never entered; a

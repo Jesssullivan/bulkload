@@ -23,6 +23,8 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Read as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -92,6 +94,95 @@ impl Snapshot {
         }
         *hasher.finalize().as_bytes()
     }
+}
+
+/// Read a repository's explicit shallow boundary without following a link.
+/// The sorted, validated ids are metadata, never invented parent history.
+///
+/// # Errors
+/// IO, `GIT_INVENTORY_MALFORMED` or `BUDGET_EXCEEDED`.
+pub fn shallow_frontier(repo: &Path) -> Result<Vec<u8>> {
+    let common = super::common_repository(repo)?;
+    let format = text(git(repo).args(["rev-parse", "--show-object-format"]))?;
+    let frontier = read_frontier(&common.join("shallow"), &format)?;
+    if !frontier.is_empty() {
+        let kinds = input(
+            git(repo).args(["cat-file", "--batch-check=%(objecttype)"]),
+            &frontier,
+        )?;
+        if kinds
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .any(|line| line != b"commit")
+        {
+            return Err(BulkloadRefusal::GitHavesUnprovable);
+        }
+    }
+    Ok(frontier)
+}
+
+/// Read an administration's frontier, validating ids against its object format.
+///
+/// # Errors
+/// As [`shallow_frontier`].
+pub fn read_frontier(path: &Path, object_format: &str) -> Result<Vec<u8>> {
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(crate::refuse::io(&error, SITE)),
+    };
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .refuse_at(SITE)?;
+    normalize_frontier(&bytes, object_format)
+}
+
+/// Canonical frontier bytes, bounded and matched to the repository's hash format.
+///
+/// # Errors
+/// `BUDGET_EXCEEDED` or `GIT_INVENTORY_MALFORMED`.
+pub fn normalize_frontier(bytes: &[u8], object_format: &str) -> Result<Vec<u8>> {
+    if bytes.len() > 1024 * 1024 {
+        return Err(BulkloadRefusal::BudgetExceeded);
+    }
+    let width = match object_format {
+        "sha1" => 40,
+        "sha256" => 64,
+        _ => return Err(BulkloadRefusal::GitInventoryMalformed),
+    };
+    let content = std::str::from_utf8(bytes).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
+    if !bytes.is_empty()
+        && (!bytes.ends_with(b"\n") || content.lines().any(|line| !id_of_width(line, width)))
+    {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    Ok(content
+        .lines()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .fold(Vec::new(), |mut all, id| {
+            all.extend_from_slice(id.as_bytes());
+            all.push(b'\n');
+            all
+        }))
+}
+
+/// Bind shallow fetch marks to the boundary as well as the wanted objects.
+/// Full-source digests retain their existing value for old resume marks.
+#[must_use]
+pub fn fetch_digest(snapshot: &Snapshot, frontier: &[u8]) -> [u8; 32] {
+    if frontier.is_empty() {
+        return snapshot.digest();
+    }
+    let mut hash = blake3::Hasher::new_derive_key("bulkload 2026-10-24 shallow fetch v1");
+    hash.update(&snapshot.digest());
+    hash.update(frontier);
+    *hash.finalize().as_bytes()
 }
 
 // `%(objectname) %(refname)` lines.
@@ -649,11 +740,49 @@ pub fn fetch_into(
     snapshot: &Snapshot,
     marks: &Path,
 ) -> Result<Fetched> {
+    fetch_into_shallow(
+        objects,
+        object_format,
+        url,
+        upload_pack,
+        snapshot,
+        marks,
+        &[],
+    )
+}
+
+/// Fetch with an explicit source shallow boundary.
+///
+/// Only the scratch
+/// administration accepts Git's shallow updates. Its objects still enter
+/// the live store directly, and its boundary never replaces a live one.
+///
+/// # Errors
+/// As [`fetch_into`]; `CAPTURE_DRIFTED` if the source advertises a boundary
+/// absent from the captured one.
+pub fn fetch_into_shallow(
+    objects: &Path,
+    object_format: &str,
+    url: &str,
+    upload_pack: &str,
+    snapshot: &Snapshot,
+    marks: &Path,
+    frontier: &[u8],
+) -> Result<Fetched> {
+    let frontier = normalize_frontier(frontier, object_format)?;
     // The quarantines already in the store are another writer's: only the
     // ones that appear while this fetch runs are this pass's own
     // (2026-10-22: an in-flight fetch of a live user is never ours).
     let present = quarantine_left(objects)?;
-    let fetched = fetch_batches(objects, object_format, url, upload_pack, snapshot, marks);
+    let fetched = fetch_batches(
+        objects,
+        object_format,
+        url,
+        upload_pack,
+        snapshot,
+        marks,
+        &frontier,
+    );
     let after = quarantine_left(objects)?;
     let mut own = OWN.lock().map_err(|_| BulkloadRefusal::WorkerLost)?;
     own.extend(after.into_iter().filter(|path| !present.contains(path)));
@@ -685,8 +814,9 @@ fn fetch_batches(
     upload_pack: &str,
     snapshot: &Snapshot,
     marks: &Path,
+    frontier: &[u8],
 ) -> Result<Fetched> {
-    let digest = snapshot.digest();
+    let digest = fetch_digest(snapshot, frontier);
     let mut recorded = read_marks(marks, digest)?;
     let before = store_bytes(objects);
     let mut fetched = Fetched::default();
@@ -709,10 +839,13 @@ fn fetch_batches(
         let mut command = git(repo);
         durable(&mut command);
         super::into_store(&mut command, objects);
+        // Even a full capture may have become shallow before this read.
+        // Accept metadata only in scratch, then reject an uncaptured
+        // boundary before marking the batch or publishing any live refs.
+        command.arg("fetch").arg("--update-shallow");
         input(
             command
                 .args([
-                    "fetch",
                     "--quiet",
                     "--no-tags",
                     "--no-write-fetch-head",
@@ -726,6 +859,14 @@ fn fetch_batches(
                 .arg(url),
             request.as_bytes(),
         )?;
+        let advertised = read_frontier(&repo.join("shallow"), object_format)?;
+        let captured: BTreeSet<_> = frontier.split(|byte| *byte == b'\n').collect();
+        if advertised
+            .split(|byte| *byte == b'\n')
+            .any(|id| !captured.contains(id))
+        {
+            return Err(BulkloadRefusal::CaptureDrifted);
+        }
         recorded.done.insert(index);
         crate::estate::write_bytes(
             marks,
@@ -735,6 +876,54 @@ fn fetch_batches(
     }
     fetched.bytes = store_bytes(objects).saturating_sub(before);
     Ok(fetched)
+}
+
+/// Whether `roots` have complete history in the live store when read with
+/// exactly `frontier`. No live administration or ref is changed.
+///
+/// An empty frontier proves a full destination can keep its richer
+/// history. A shallow boundary is metadata only, in the disposable scratch
+/// administration. Missing objects return false, never fabricated parents.
+///
+/// # Errors
+/// IO, malformed metadata or a Git child that cannot read the graph.
+pub fn graph_complete(
+    objects: &Path,
+    object_format: &str,
+    roots: &[String],
+    frontier: &[u8],
+) -> Result<bool> {
+    let frontier = normalize_frontier(frontier, object_format)?;
+    let work = scratch(object_format)?;
+    if !frontier.is_empty() {
+        fs::write(work.0.join("shallow"), &frontier).refuse_at(SITE)?;
+    }
+    let request = roots.iter().fold(String::new(), |mut all, id| {
+        all.push_str(id);
+        all.push('\n');
+        all
+    });
+    let mut command = git(&work.0);
+    super::into_store(&mut command, objects);
+    let present = input(
+        command.args(["cat-file", "--batch-check=%(objectname)"]),
+        request.as_bytes(),
+    )?;
+    if present
+        .split(|byte| *byte == b'\n')
+        .any(|line| line.ends_with(b" missing"))
+    {
+        return Ok(false);
+    }
+    let mut command = git(&work.0);
+    super::into_store(&mut command, objects);
+    let listed = input(
+        command.args(["rev-list", "--objects", "--missing=print", "--stdin"]),
+        request.as_bytes(),
+    )?;
+    Ok(!listed
+        .split(|byte| *byte == b'\n')
+        .any(|line| line.starts_with(b"?")))
 }
 
 /// Index-pack's and the object writer's temporaries a pass must never

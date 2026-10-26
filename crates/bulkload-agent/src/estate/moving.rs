@@ -232,15 +232,19 @@ fn walk(roots: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<Note>)> {
 // `rebuildable-nest` note, never an item.
 fn nests(directory: &Path, stack: &mut Vec<PathBuf>, notes: &mut Vec<Note>) {
     use std::os::unix::ffi::OsStrExt as _;
-    let Ok(nests) = crate::git_carry::nested_repositories(directory) else {
-        return;
+    // Inventory needs names, never a full RowSchema census of the parent.
+    // Include rebuildable roots here so their nested repositories retain
+    // the same explicit notes. Each ordinary nest owns its capture checks.
+    let nests = match crate::git_carry::streamed_omissions(directory, true) {
+        Ok((nests, _)) => nests,
+        Err(refusal) => {
+            notes.push(typed_note(directory.to_path_buf(), &refusal));
+            return;
+        }
     };
     for nest in nests.iter().rev() {
-        if nest.kind != crate::git_carry::NestedRepositoryKind::Directory {
-            continue;
-        }
-        let path = directory.join(std::ffi::OsStr::from_bytes(&nest.rel_path));
-        if crate::git_carry::under_rebuildable_root(directory, &nest.rel_path).unwrap_or(false) {
+        let path = directory.join(std::ffi::OsStr::from_bytes(nest));
+        if crate::git_carry::under_rebuildable_root(directory, nest).unwrap_or(false) {
             notes.push(Note {
                 path,
                 what: REBUILDABLE_NEST,

@@ -8591,6 +8591,7 @@ impl<W: Write> Inbound<'_, W> {
                 row.rel_path.clone(),
                 crate::consolidate::rollout::EXTENDED.to_owned(),
             ));
+            counters::bump(Counter::DestPayloadCommitted);
             self.stats.completed += 1;
             self.answered_now = Some(true);
             return Ok(());
@@ -8747,6 +8748,9 @@ impl<W: Write> Inbound<'_, W> {
                 if !racy {
                     self.store.record_consolidated(key)?;
                 }
+                if outcome.written > 0 {
+                    counters::bump(Counter::DestPayloadCommitted);
+                }
                 self.stats
                     .consolidated
                     .push((row.rel_path.clone(), action.word().to_owned()));
@@ -8780,6 +8784,9 @@ impl<W: Write> Inbound<'_, W> {
             action => {
                 if !racy {
                     self.store.record_consolidated(key)?;
+                }
+                if outcome.written > 0 {
+                    counters::bump(Counter::DestPayloadCommitted);
                 }
                 self.stats
                     .consolidated

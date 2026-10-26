@@ -130,6 +130,19 @@ fn the_pass_makes_the_serve_directory_beside_carry_and_private() {
     let state = world.path("state");
     let ran = agent(&os(&[&"estate-move-source", &state, &world.path("live")]));
     assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
+    let starts: Vec<_> = ran
+        .stdout
+        .lines()
+        .filter(|line| line.contains("event=phase-start"))
+        .collect();
+    assert_eq!(
+        starts,
+        [
+            "estate-move-source event=phase-start phase=preflight",
+            "estate-move-source event=phase-start phase=inventory",
+            "estate-move-source event=phase-start phase=capture",
+        ]
+    );
     for name in ["carry", "serve", "serve/carry"] {
         let dir = state.join(name);
         assert!(dir.is_dir(), "{name} missing:\n{}", ran.stdout);

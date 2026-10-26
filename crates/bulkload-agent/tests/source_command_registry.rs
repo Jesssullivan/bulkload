@@ -151,20 +151,22 @@ const BYPASSES: &[Bypass] = &[
         id: "agent::main::pull_command(\"ssh\")",
         shape: Some(
             "Command::new(\"ssh\");\
-             ssh.args([\"-T\",\"-oBatchMode=yes\",\"-oConnectTimeout=15\"]);\
+             ssh.args([\"-T\",\"-oBatchMode=yes\",\"-oConnectTimeout=15\",\"-oServerAliveInterval=15\",\"-oServerAliveCountMax=2\",]);\
+             ifreconnect::enabled(){ssh.args([\"-oControlMaster=no\",\"-oControlPath=none\"]);}\
              ifletSome(config)=args.get(6){if!Path::new(config).is_absolute(){returnErr(BulkloadRefusal::PathNotAbsolute);\
              }ssh.arg(\"-F\").arg(config);\
              }ssh.arg(\"--\").arg(host).arg(remote);\
              ifbulkload_agent::durable::durability()==bulkload_agent::durable::Durability::Strict{ssh.arg(\"--durability=strict\");\
              }ifbulkload_agent::durable::ledger_sync()==bulkload_agent::durable::LedgerSync::Full{ssh.arg(\"--source-ledger-sync=full\");\
              }letrelay=matchmode{Remote::Serve(_)=>false,Remote::Negotiate=>{ssh.arg(\"negotiate\");false}\
+             Remote::Retire=>{ssh.arg(\"retire-source\");false}\
              Remote::UploadPack(repo)=>{ifrepo.contains('\\'')||!repo.starts_with('/'){returnErr(BulkloadRefusal::PathNotPortable);\
              }ssh.arg(\"upload-pack\").arg(format!(\"'{repo}'\"));true}};\
-             if!relay&&!matches!(mode,Remote::Negotiate){forflaginbulkload_agent::transfer::serve_flags(){ssh.arg(flag);\
+             if!relay&&!matches!(mode,Remote::Negotiate|Remote::Retire){forflaginbulkload_agent::transfer::serve_flags(){ssh.arg(flag);\
              }ssh.arg(\"serve\");\
              }ifkind==bulkload_agent::transfer::RootKind::File{ssh.arg(\"--file\");\
-             }let(wire_in,wire_out)=ifrelay{(Stdio::inherit(),Stdio::inherit())}else{(Stdio::piped(),Stdio::piped())};\
-             letmutchild=ssh.stdin(wire_in).stdout(wire_out).stderr(Stdio::inherit()).spawn()",
+             }let(wire_in,wire_out,wire_err)=ifrelay{(Stdio::inherit(),Stdio::inherit(),Stdio::inherit())}else{(Stdio::piped(),Stdio::piped(),Stdio::piped())};\
+             letmutchild=ssh.stdin(wire_in).stdout(wire_out).stderr(wire_err).spawn()",
         ),
         callers: &[],
         why: "Starts the remote `bulkload-agent serve`, which is the source \
@@ -178,7 +180,12 @@ const BYPASSES: &[Bypass] = &[
               read, its framed question and answer on stdin and stdout, no \
               path on its command line. The \
               remote word is `bulkload-agent` or a validated absolute path, \
-              and the ssh child touches no local source. The three mode flags \
+              and an opted-in reconnect uses a dedicated connection through \
+              fixed ControlMaster=no and ControlPath=none arguments, \
+              and the ssh child touches no local source. Outside the relay \
+              its stderr is piped and relayed byte for byte to this \
+              process's stderr, the remote's last `refused:` line typing a \
+              refusal sent before any frame (MG-1). The three mode flags \
               it may pass (`--durability=strict`, WP0(g)'s \
               `--source-ledger-sync=full`, OI-1003-Q109, and `serve --file` \
               for a single-file root, #232) are fixed literals. \

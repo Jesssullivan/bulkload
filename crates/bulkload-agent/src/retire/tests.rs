@@ -376,3 +376,89 @@ fn a_state_a_pass_holds_is_refused_and_nothing_is_read() {
         Err(BulkloadRefusal::MoveStateBusy(_))
     ));
 }
+
+#[test]
+fn checked_handles_leave_a_reserve_without_making_large_runs_probe_one_file_at_a_time() {
+    assert_eq!(check_batch(0), 1);
+    assert_eq!(check_batch(3), 1);
+    assert_eq!(check_batch(64), 16);
+    assert_eq!(check_batch(256), 64);
+    assert_eq!(check_batch(10_240), 200);
+    assert_eq!(check_batch(u64::MAX), 200);
+}
+
+/// The regression runs alone in a subprocess: lowering the soft descriptor
+/// limit must not affect unrelated tests. Every candidate has its own parent
+/// directory, so keeping all checked directory handles exhausts the limit.
+#[test]
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn more_candidates_than_the_descriptor_limit_remain_provable() {
+    use std::os::unix::ffi::OsStrExt as _;
+    const CHILD: &str = "BULKLOAD_RETIRE_LOW_NOFILE_CHILD";
+    const TEST: &str = "retire::tests::more_candidates_than_the_descriptor_limit_remain_provable";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([TEST, "--exact", "--test-threads=1", "--nocapture"])
+            .env(CHILD, "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains(&format!("test {TEST} ... ok")));
+        return;
+    }
+
+    crate::io::limits::set_soft_descriptor_limit(64).unwrap();
+    let world = World::new();
+    let content = b"a proven source file\n";
+    let mut files = Vec::new();
+    for index in 0..256 {
+        let rel = format!("sessions/{index}/rollout.jsonl");
+        private(world.source.join(&rel).parent().unwrap());
+        std::fs::write(world.source.join(&rel), content).unwrap();
+        let row = world.row(&rel);
+        files.push(Want {
+            rel: rel.into_bytes(),
+            allowed: vec![(
+                (row.dev, row.ino, row.size, row.mtime_ns, row.ctime_ns),
+                Proof::Blake3(*blake3::hash(content).as_bytes()),
+            )],
+        });
+    }
+    let mut ask = Ask {
+        root: world.source.as_os_str().as_bytes().to_vec(),
+        dry_run: true,
+        files,
+    };
+    let dry = answer(&ask);
+    assert_eq!(dry.len(), ask.files.len());
+    assert!(
+        dry.iter().all(|one| one.verdict == Verdict::WouldRemove),
+        "{dry:?}"
+    );
+    for want in &ask.files {
+        assert!(path_of(&world.source, &want.rel).is_file());
+    }
+
+    ask.dry_run = false;
+    let removed = answer(&ask);
+    assert_eq!(removed.len(), ask.files.len());
+    assert!(
+        removed.iter().all(|one| one.verdict == Verdict::Removed),
+        "{removed:?}"
+    );
+    for want in &ask.files {
+        assert!(!path_of(&world.source, &want.rel).exists());
+    }
+    let again = answer(&ask);
+    assert_eq!(again.len(), ask.files.len());
+    assert!(again
+        .iter()
+        .all(|one| one.verdict == skipped("the source is absent")));
+    assert_eq!(crate::io::limits::descriptor_limit().unwrap().0, 64);
+}

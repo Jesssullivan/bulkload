@@ -28,6 +28,7 @@
 //! worktree blobs.
 
 use std::fs;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -54,8 +55,8 @@ pub struct ItemSnapshot {
     /// repositories.
     pub excluded: Vec<Vec<u8>>,
     /// Host-path files under the item's source path (relative), with their
-    /// bytes as read: written mapped at the destination, never by the
-    /// engine.
+    /// bytes as read. The exclude is metadata for proving a hand-off's
+    /// own appended policy. Other entries are written with mapped paths.
     pub host_files: Vec<(Vec<u8>, Vec<u8>)>,
     /// When the pass that read it started (Unix nanoseconds).
     pub started_ns: i128,
@@ -73,7 +74,47 @@ pub struct ItemSnapshot {
     /// `--separate-git-dir`): its path on the source, landed (mapped) as
     /// this item's own, its objects fetched into it.
     pub separate_admin: Option<PathBuf>,
+    /// The common repository's explicit shallow boundary, sorted and
+    /// validated. Settled separately from the seat transfer, never copied
+    /// over a destination's richer history.
+    pub shallow: Vec<u8>,
 }
+
+// The exact postcard layout before shallow support. Old captures were all
+// full repositories, so their frontier is empty. Keep their resume digests.
+#[derive(Serialize, Deserialize)]
+struct LegacyItemSnapshot {
+    item: Item,
+    snapshot: stream::Snapshot,
+    excluded: Vec<Vec<u8>>,
+    host_files: Vec<(Vec<u8>, Vec<u8>)>,
+    started_ns: i128,
+    history: stream::History,
+    index: Option<Vec<u8>>,
+    head_branch: Option<String>,
+    head: String,
+    separate_admin: Option<PathBuf>,
+}
+
+impl From<LegacyItemSnapshot> for ItemSnapshot {
+    fn from(old: LegacyItemSnapshot) -> Self {
+        Self {
+            item: old.item,
+            snapshot: old.snapshot,
+            excluded: old.excluded,
+            host_files: old.host_files,
+            started_ns: old.started_ns,
+            history: old.history,
+            index: old.index,
+            head_branch: old.head_branch,
+            head: old.head,
+            separate_admin: old.separate_admin,
+            shallow: Vec::new(),
+        }
+    }
+}
+
+const SNAPSHOT_V2: &[u8] = b"bulkload.item.snapshot.v2\0";
 
 impl ItemSnapshot {
     /// The digest a landing's journal is bound to.
@@ -86,6 +127,10 @@ impl ItemSnapshot {
             hasher.update(path);
             hasher.update(&(bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
+        }
+        if !self.shallow.is_empty() {
+            hasher.update(b"shallow\0");
+            hasher.update(&self.shallow);
         }
         *hasher.finalize().as_bytes()
     }
@@ -105,15 +150,35 @@ pub fn marks_path(state: &Path, identity: &str) -> PathBuf {
 }
 
 fn rel_bytes(path: &Path) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt as _;
     path.as_os_str().as_bytes().to_vec()
+}
+
+// Old full-source snapshots predate the shallow exclusion. Apply the
+// exclusion at landing too, without changing their persisted digests.
+fn seat_exclusions(snapshot: &ItemSnapshot) -> Vec<Vec<u8>> {
+    let mut excluded = snapshot.excluded.clone();
+    for path in &snapshot.excluded {
+        if let Some(admin) = path.strip_suffix(b"objects") {
+            if admin.is_empty() || admin.ends_with(b"/") {
+                let mut path = admin.to_vec();
+                path.extend_from_slice(b"shallow");
+                excluded.push(path);
+            }
+        }
+    }
+    excluded.sort();
+    excluded.dedup();
+    excluded
+}
+
+fn is_exclude(path: &[u8]) -> bool {
+    path == b"info/exclude" || path.ends_with(b"/info/exclude")
 }
 
 /// Read `item`'s streamed capture on the source.
 ///
-/// Refused, typed, before anything is read further: a partial clone (`GIT_SOURCE_PARTIAL_CLONE`),
-/// a shallow repository (`GIT_HAVES_UNPROVABLE`) or one that borrows
-/// objects (`GIT_SOURCE_ALTERNATES`): each is a hold until it has a test.
+/// Partial clones refuse before a lazy fetch can read them. Shallow
+/// repositories carry their explicit boundary, never invented parents.
 ///
 /// # Errors
 /// As above, and the snapshot's refusals.
@@ -125,13 +190,21 @@ pub fn capture_source(
     let source = &item.source;
     crate::git_carry::refuse_partial_clone(source)?;
     let common = crate::git_carry::common_repository(source)?;
-    if common.join("shallow").try_exists().refuse_at(SITE)? {
-        return Err(BulkloadRefusal::GitHavesUnprovable);
-    }
+    let shallow = stream::shallow_frontier(source)?;
     // A store that borrows objects through `objects/info/alternates` is
     // carried whole: the fetch by id is served from the source's alternates
     // too, so the live store holds every object itself (2026-10-22).
-    let snapshot = stream::snapshot(source)?;
+    let mut snapshot = stream::snapshot(source)?;
+    // The frontier itself names commits, even when no remaining ref does.
+    // Carry those objects before publishing its administration.
+    snapshot.wants.extend(
+        std::str::from_utf8(&shallow)
+            .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?
+            .lines()
+            .map(str::to_owned),
+    );
+    snapshot.wants.sort();
+    snapshot.wants.dedup();
     let mut excluded = Vec::new();
     let mut host_files = Vec::new();
     // The administration directory under this item's path: the main
@@ -152,10 +225,14 @@ pub fn capture_source(
     match &admin {
         Some(admin) => {
             excluded.push(rel_bytes(&admin.join("objects")));
+            // Never copy a frontier that appeared after this snapshot.
+            // Full captures need this exclusion too.
+            excluded.push(rel_bytes(&admin.join("shallow")));
             // Submodules' administrations are their own items'.
             excluded.push(rel_bytes(&admin.join("modules")));
             let config = admin.join(CONFIG);
             host_files.push((rel_bytes(&config), read_file(&source.join(&config))?));
+            capture_exclude(source, admin, &mut host_files)?;
             if let Ok(read) = fs::read_dir(common.join("worktrees")) {
                 for entry in read {
                     let entry = entry.refuse_at(SITE)?;
@@ -181,7 +258,9 @@ pub fn capture_source(
     excluded.extend(nests);
     excluded.extend(rebuildable);
     for (rel, _) in &host_files {
-        excluded.push(rel.clone());
+        if !is_exclude(rel) {
+            excluded.push(rel.clone());
+        }
     }
     excluded.sort();
     excluded.dedup();
@@ -212,17 +291,22 @@ pub fn capture_source(
         excluded.sort();
         excluded.dedup();
     }
+    let history = stream::history(source)?;
+    if stream::shallow_frontier(source)? != shallow {
+        return Err(BulkloadRefusal::CaptureDrifted);
+    }
     Ok(ItemSnapshot {
         item: item.clone(),
         snapshot,
         excluded,
         host_files,
         started_ns,
-        history: stream::history(source)?,
+        history,
         index,
         head_branch,
         head,
         separate_admin,
+        shallow,
     })
 }
 
@@ -230,12 +314,28 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
     fs::read(path).refuse_at(SITE)
 }
 
+fn capture_exclude(
+    source: &Path,
+    admin: &Path,
+    host_files: &mut Vec<(Vec<u8>, Vec<u8>)>,
+) -> Result<()> {
+    let exclude = admin.join("info/exclude");
+    let path = source.join(&exclude);
+    if fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
+        if let Some(bytes) = read_regular_exclude(&path)? {
+            host_files.push((rel_bytes(&exclude), bytes));
+        }
+    }
+    Ok(())
+}
+
 /// Record `snapshot` at `carry/ITEM.snapshot`, durably.
 ///
 /// # Errors
 /// IO; `FRAME_CODEC`.
 pub fn record(carry: &Path, snapshot: &ItemSnapshot) -> Result<()> {
-    let bytes = postcard::to_allocvec(snapshot).map_err(|_| BulkloadRefusal::FrameCodec)?;
+    let mut bytes = SNAPSHOT_V2.to_vec();
+    bytes.extend(postcard::to_allocvec(snapshot).map_err(|_| BulkloadRefusal::FrameCodec)?);
     write_bytes(&snapshot_path(carry, &id(&snapshot.item)?), &bytes)
 }
 
@@ -249,9 +349,18 @@ pub fn recorded(carry: &Path, identity: &str) -> Result<Option<ItemSnapshot>> {
         return Ok(None);
     }
     let bytes = fs::read(&path).refuse_at(SITE)?;
-    postcard::from_bytes(&bytes)
-        .map(Some)
-        .map_err(|_| BulkloadRefusal::FrameCodec)
+    bytes.strip_prefix(SNAPSHOT_V2).map_or_else(
+        || {
+            postcard::from_bytes::<LegacyItemSnapshot>(&bytes)
+                .map(|old| Some(old.into()))
+                .map_err(|_| BulkloadRefusal::FrameCodec)
+        },
+        |current| {
+            postcard::from_bytes(current)
+                .map(Some)
+                .map_err(|_| BulkloadRefusal::FrameCodec)
+        },
+    )
 }
 
 /// Every `(source, live)` path pair of the plan, longest source first: what
@@ -351,6 +460,23 @@ pub fn land(
     reach: &Reach<'_>,
     fetched: stream::Fetched,
 ) -> Result<Landed> {
+    let provenance = id(&snapshot.item)?;
+    land_with_identity(snapshot, state, map, reach, fetched, &provenance)
+}
+
+/// Land using the original plan item's identity for recorded hand-off
+/// provenance. Home mapping changes paths, never that identity.
+///
+/// # Errors
+/// As [`land`].
+pub fn land_with_identity(
+    snapshot: &ItemSnapshot,
+    state: &Path,
+    map: &[(Vec<u8>, Vec<u8>)],
+    reach: &Reach<'_>,
+    fetched: stream::Fetched,
+    provenance: &str,
+) -> Result<Landed> {
     let item = &snapshot.item;
     let identity = id(item)?;
     let live = item
@@ -362,6 +488,7 @@ pub fn land(
         ..Landed::default()
     };
     let owns_store = store_of(snapshot, &live, map).is_some();
+    verify_frontier(snapshot, map)?;
     landed.batches = fetched.batches;
     landed.skipped = fetched.skipped;
     landed.object_bytes = fetched.bytes;
@@ -372,7 +499,8 @@ pub fn land(
     if let (Some(from), Some(to)) = (&snapshot.separate_admin, admin_of(snapshot, map)) {
         fs::create_dir_all(&to).refuse_at(SITE)?;
         let root = fs::canonicalize(&to).refuse_at(SITE)?;
-        crate::transfer::set_excluded(&root, Some(vec![b"objects".to_vec(), b"index".to_vec()]));
+        let excluded = vec![b"objects".to_vec(), b"index".to_vec(), b"shallow".to_vec()];
+        crate::transfer::set_excluded(&root, Some(excluded));
         let moved = (reach.transfer)(from, &to);
         crate::transfer::set_excluded(&root, None);
         moved?;
@@ -382,13 +510,22 @@ pub fn land(
         fs::create_dir_all(&live).refuse_at(SITE)?;
         fs::canonicalize(&live).refuse_at(SITE)?
     };
-    crate::transfer::set_excluded(&root, Some(snapshot.excluded.clone()));
+    let mut excluded = seat_exclusions(snapshot);
+    let preserved_exclude = preserved_handoff_exclude(snapshot, &live, provenance)?;
+    if let Some(path) = &preserved_exclude {
+        excluded.push(path.clone());
+    }
+    crate::transfer::set_excluded(&root, Some(excluded));
     let moved = (reach.transfer)(&item.source, &live);
     crate::transfer::set_excluded(&root, None);
     moved?;
     // 3. The host-path files, mapped.
     for (rel, bytes) in &snapshot.host_files {
-        use std::os::unix::ffi::OsStrExt as _;
+        // The engine carries excludes normally. Only the proved hand-off
+        // extension above keeps a longer live file, with every source byte.
+        if is_exclude(rel) {
+            continue;
+        }
         let path = live.join(std::ffi::OsStr::from_bytes(rel));
         let want = mapped(bytes, map);
         match fs::read(&path) {
@@ -421,13 +558,162 @@ pub fn land(
             return Err(BulkloadRefusal::StatePayloadLeft(rel_bytes(left)));
         }
     }
+    if let Some(path) = &preserved_exclude {
+        verify_preserved_exclude(snapshot, &live, path, provenance)?;
+    }
+    verify_frontier(snapshot, map)?;
     Ok(landed)
+}
+
+fn verify_preserved_exclude(
+    snapshot: &ItemSnapshot,
+    live: &Path,
+    relative: &[u8],
+    provenance: &str,
+) -> Result<()> {
+    if preserved_handoff_exclude(snapshot, live, provenance)?.is_some() {
+        return Ok(());
+    }
+    let source = snapshot
+        .host_files
+        .iter()
+        .find_map(|(path, bytes)| (path == relative).then_some(bytes))
+        .ok_or(BulkloadRefusal::GitIgnorePolicyConflict)?;
+    let path = live.join(std::ffi::OsStr::from_bytes(relative));
+    let parent = path.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?;
+    if !fs::symlink_metadata(parent).is_ok_and(|meta| meta.is_dir())
+        || read_regular_exclude(&path)?.as_deref() != Some(source.as_slice())
+    {
+        return Err(BulkloadRefusal::GitIgnorePolicyConflict);
+    }
+    Ok(())
+}
+
+// An unchanged source exclude remains a prefix of the file to which our
+// recorded hand-off appended its exact entry. Preserve that file, including
+// any destination patterns, only with both the byte proof and provenance.
+fn preserved_handoff_exclude(
+    snapshot: &ItemSnapshot,
+    live: &Path,
+    provenance: &str,
+) -> Result<Option<Vec<u8>>> {
+    let Some((rel, source)) = snapshot
+        .host_files
+        .iter()
+        .find(|(path, _)| is_exclude(path))
+    else {
+        return Ok(None);
+    };
+    let path = live.join(std::ffi::OsStr::from_bytes(rel));
+    if !fs::symlink_metadata(path.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)
+        .is_ok_and(|meta| meta.is_dir())
+    {
+        return Ok(None);
+    }
+    let Some(held) = read_regular_exclude(&path)? else {
+        return Ok(None);
+    };
+    if held == *source {
+        return Ok(None);
+    }
+    if held.len() > 1024 * 1024
+        || !held.starts_with(source)
+        || !held.ends_with(b"# bulkload hand-off (never tracked)\n/CLAUDE.local.md\n")
+        || !recorded_local_block(live, provenance)?
+    {
+        return Err(BulkloadRefusal::GitIgnorePolicyConflict);
+    }
+    Ok(Some(rel.clone()))
+}
+
+fn read_regular_exclude(path: &Path) -> Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(BulkloadRefusal::GitIgnorePolicyConflict);
+        }
+        Err(error) => return Err(crate::refuse::io(&error, SITE)),
+    };
+    let meta = file.metadata().refuse_at(SITE)?;
+    if !meta.is_file() || meta.len() > 1024 * 1024 {
+        return Err(BulkloadRefusal::GitIgnorePolicyConflict);
+    }
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .refuse_at(SITE)?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(BulkloadRefusal::GitIgnorePolicyConflict);
+    }
+    Ok(Some(bytes))
+}
+
+fn recorded_local_block(worktree: &Path, identity: &str) -> Result<bool> {
+    use crate::git_carry::{converge::handoff, landed};
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let Some(admin) = landed::worktree_git_dir(worktree)? else {
+        return Ok(false);
+    };
+    let root = admin.join(landed::LEDGER_ROOT);
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(crate::refuse::io(&error, SITE)),
+    };
+    for entry in entries {
+        let entry = entry.refuse_at(SITE)?;
+        if !entry.file_type().refuse_at(SITE)?.is_dir() {
+            continue;
+        }
+        let Some(record) =
+            landed::read::<handoff::HandoffLanded>(&entry.path().join(handoff::HANDOFF_LANDED))?
+        else {
+            continue;
+        };
+        if record.item != identity {
+            continue;
+        }
+        for file in record
+            .files
+            .iter()
+            .filter(|file| file.path == handoff::LOCAL.as_bytes())
+        {
+            if file.block_len > 16 * 1024 * 1024 {
+                return Err(BulkloadRefusal::BudgetExceeded);
+            }
+            let held = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(worktree.join(handoff::LOCAL))
+                .refuse_at(SITE)?;
+            if !held.metadata().refuse_at(SITE)?.is_file() {
+                return Err(BulkloadRefusal::GitIgnorePolicyConflict);
+            }
+            let mut block = Vec::new();
+            held.take(file.block_len)
+                .read_to_end(&mut block)
+                .refuse_at(SITE)?;
+            if u64::try_from(block.len()).ok() == Some(file.block_len)
+                && blake3::hash(&block).as_bytes() == &file.block
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 // The live object store an item owns (a main or bare repository's), from
 // its excluded `objects` path.
 fn store_of(snapshot: &ItemSnapshot, live: &Path, map: &[(Vec<u8>, Vec<u8>)]) -> Option<PathBuf> {
-    use std::os::unix::ffi::OsStrExt as _;
     if let Some(admin) = admin_of(snapshot, map) {
         return Some(admin.join("objects"));
     }
@@ -440,7 +726,6 @@ fn store_of(snapshot: &ItemSnapshot, live: &Path, map: &[(Vec<u8>, Vec<u8>)]) ->
 
 // A separate administration's live path: the source's, mapped.
 fn admin_of(snapshot: &ItemSnapshot, map: &[(Vec<u8>, Vec<u8>)]) -> Option<PathBuf> {
-    use std::os::unix::ffi::OsStrExt as _;
     snapshot
         .separate_admin
         .as_ref()
@@ -469,10 +754,11 @@ pub fn fetch_objects(
     let Some(objects) = store_of(snapshot, &live, map) else {
         return Ok(stream::Fetched::default());
     };
+    let shallow = shallow_decision(snapshot, map)?;
     for dir in [objects.join("pack"), objects.join("info")] {
         fs::create_dir_all(&dir).refuse_at(SITE)?;
     }
-    stream::fetch_into(
+    let fetched = stream::fetch_into_shallow(
         &objects,
         &snapshot.snapshot.object_format,
         item.source
@@ -481,7 +767,138 @@ pub fn fetch_objects(
         upload_pack,
         &snapshot.snapshot,
         &marks_path(state, &id(item)?),
-    )
+        &snapshot.shallow,
+    )?;
+    if !snapshot.shallow.is_empty() {
+        let frontier = if shallow == "keep-full" {
+            &[][..]
+        } else {
+            snapshot.shallow.as_slice()
+        };
+        if !stream::graph_complete(
+            &objects,
+            &snapshot.snapshot.object_format,
+            &snapshot.snapshot.wants,
+            frontier,
+        )? {
+            return Err(BulkloadRefusal::GitHavesUnprovable);
+        }
+        let path = objects
+            .parent()
+            .ok_or(BulkloadRefusal::PathNotAbsolute)?
+            .join("shallow");
+        if shallow == "create" {
+            publish_frontier(&path, &snapshot.shallow, &id(item)?)?;
+        }
+        // A concurrent Git writer owns any new boundary. Never overwrite
+        // it or publish refs against an unproved frontier.
+        if stream::read_frontier(&path, &snapshot.snapshot.object_format)? != frontier {
+            return Err(BulkloadRefusal::GitHavesUnprovable);
+        }
+    }
+    Ok(fetched)
+}
+
+/// The shallow action a plan or execution can prove without changing the
+/// destination. Unsupported frontier changes remain typed holds.
+///
+/// `full`: a full source; `shared`: a linked worktree whose common
+/// repository settles the boundary; `create`: an absent administration;
+/// `same`: an equal boundary; `keep-full`: the destination already holds
+/// all ancestry behind the source's boundary and stays full.
+///
+/// # Errors
+/// `GIT_HAVES_UNPROVABLE` for differing frontiers or unavailable ancestry;
+/// IO and Git read refusals retain their types.
+pub fn shallow_decision(
+    snapshot: &ItemSnapshot,
+    map: &[(Vec<u8>, Vec<u8>)],
+) -> Result<&'static str> {
+    let live = snapshot
+        .item
+        .workspace
+        .as_ref()
+        .unwrap_or(&snapshot.item.repository);
+    let owns_store = store_of(snapshot, live, map);
+    let objects = if let Some(objects) = owns_store.as_ref() {
+        objects.clone()
+    } else {
+        // A linked worktree shares a main's frontier. The main can have
+        // been captured at a different moment, so inspect its destination
+        // administration before permitting this worktree's seats/index.
+        let common = crate::git_carry::common_repository(live)
+            .or_else(|_| crate::git_carry::common_repository(&snapshot.item.repository));
+        let Ok(common) = common else {
+            return Ok("shared");
+        };
+        common.join("objects")
+    };
+    let admin = objects.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?;
+    let held = stream::read_frontier(&admin.join("shallow"), &snapshot.snapshot.object_format)?;
+    if snapshot.shallow.is_empty() {
+        // A source that became full must not leave the previous landing's
+        // boundary hiding history. Boundary removal needs its own proved
+        // consolidation; until then this is an explicit hold.
+        return if held.is_empty() {
+            Ok("full")
+        } else {
+            Err(BulkloadRefusal::GitHavesUnprovable)
+        };
+    }
+    if held == snapshot.shallow {
+        return Ok("same");
+    }
+    if !held.is_empty() {
+        return Err(BulkloadRefusal::GitHavesUnprovable);
+    }
+    if owns_store.is_some() && crate::git_carry::common_repository(live).is_err() {
+        if admin.join("HEAD").try_exists().refuse_at(SITE)?
+            || admin.join(CONFIG).try_exists().refuse_at(SITE)?
+        {
+            return Err(BulkloadRefusal::GitHavesUnprovable);
+        }
+        return Ok("create");
+    }
+    let boundary: Vec<String> = std::str::from_utf8(&snapshot.shallow)
+        .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    if stream::graph_complete(&objects, &snapshot.snapshot.object_format, &boundary, &[])? {
+        Ok("keep-full")
+    } else {
+        Err(BulkloadRefusal::GitHavesUnprovable)
+    }
+}
+
+// Fetch must already have settled any frontier before administration or
+// refs are published. Recheck at both ends of landing/consolidation.
+fn verify_frontier(snapshot: &ItemSnapshot, map: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+    if matches!(shallow_decision(snapshot, map)?, "create" | "shared") {
+        Err(BulkloadRefusal::GitHavesUnprovable)
+    } else {
+        Ok(())
+    }
+}
+
+// Publish a new frontier without replacing any concurrent writer's file.
+// The temporary shares the administration's filesystem and holds metadata
+// only. A crash leaves a valid frontier before any ref is landed.
+fn publish_frontier(path: &Path, bytes: &[u8], identity: &str) -> Result<()> {
+    use crate::counters::CountedSync as _;
+    let temporary = path.with_file_name(format!("bulkload-shallow-{identity}"));
+    write_bytes(&temporary, bytes)?;
+    let linked = fs::hard_link(&temporary, path);
+    fs::remove_file(&temporary).refuse_at(SITE)?;
+    match linked {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(crate::refuse::io(&error, SITE)),
+    }
+    fs::File::open(path.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)
+        .refuse_at(SITE)?
+        .sync_dir_counted()
+        .refuse_at(SITE)
 }
 
 /// What a consolidation of a related live repository did ([`converge`]).
@@ -542,6 +959,7 @@ pub fn converge(
         ..Converged::default()
     };
     let owns_store = store_of(snapshot, &live, map).is_some();
+    verify_frontier(snapshot, map)?;
     let own = own_lacking(&live)?;
     done.dest_lacking_own = u64::try_from(own.len()).unwrap_or(u64::MAX);
     if owns_store {
@@ -612,6 +1030,7 @@ pub fn converge(
     if let Some(left) = stream::own_quarantine_left(&objects)?.first() {
         return Err(BulkloadRefusal::StatePayloadLeft(rel_bytes(left)));
     }
+    verify_frontier(snapshot, map)?;
     Ok(done)
 }
 
@@ -684,13 +1103,14 @@ fn top_up(
             ..stream::Snapshot::default()
         };
         let objects = stream::objects_dir(live)?;
-        let fetched = stream::fetch_into(
+        let fetched = stream::fetch_into_shallow(
             &objects,
             &snapshot.snapshot.object_format,
             url,
             upload_pack,
             &want,
             marks,
+            &snapshot.shallow,
         );
         let _ = fs::remove_file(marks);
         match fetched {
@@ -720,13 +1140,14 @@ fn top_up(
                 wants,
                 ..stream::Snapshot::default()
             };
-            let fetched = stream::fetch_into(
+            let fetched = stream::fetch_into_shallow(
                 &objects,
                 &snapshot.snapshot.object_format,
                 url,
                 upload_pack,
                 &want,
                 marks,
+                &snapshot.shallow,
             );
             let _ = fs::remove_file(marks);
             match fetched {
@@ -926,6 +1347,80 @@ pub(crate) fn bare_layout(path: &Path, object_format: &str) -> Result<()> {
 #[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    fn legacy_snapshot() -> LegacyItemSnapshot {
+        LegacyItemSnapshot {
+            item: Item {
+                source: PathBuf::from("/source/repo"),
+                repository: PathBuf::from("/destination/repo"),
+                workspace: Some(PathBuf::from("/destination/repo")),
+            },
+            snapshot: stream::Snapshot {
+                object_format: "sha1".to_owned(),
+                ..stream::Snapshot::default()
+            },
+            excluded: vec![b".git/objects".to_vec()],
+            host_files: vec![(b".git/config".to_vec(), b"[core]\n".to_vec())],
+            started_ns: 1,
+            history: stream::History::default(),
+            index: None,
+            head_branch: Some("refs/heads/main".to_owned()),
+            head: String::new(),
+            separate_admin: None,
+        }
+    }
+
+    #[test]
+    fn legacy_snapshot_records_and_full_source_digests_remain_compatible() {
+        let carry = tempfile::tempdir().unwrap();
+        let old = legacy_snapshot();
+        let identity = id(&old.item).unwrap();
+        let mut hash = blake3::Hasher::new_derive_key("bulkload 2026-10-20 item snapshot v1");
+        hash.update(&old.snapshot.digest());
+        for (path, bytes) in &old.host_files {
+            hash.update(&(path.len() as u64).to_le_bytes());
+            hash.update(path);
+            hash.update(&(bytes.len() as u64).to_le_bytes());
+            hash.update(bytes);
+        }
+        let digest = *hash.finalize().as_bytes();
+        fs::write(
+            snapshot_path(carry.path(), &identity),
+            postcard::to_allocvec(&old).unwrap(),
+        )
+        .unwrap();
+        let restored = recorded(carry.path(), &identity).unwrap().unwrap();
+        assert!(restored.shallow.is_empty());
+        assert!(seat_exclusions(&restored).contains(&b".git/shallow".to_vec()));
+        assert_eq!(restored.digest(), digest);
+        assert_eq!(
+            stream::fetch_digest(&restored.snapshot, &restored.shallow),
+            restored.snapshot.digest()
+        );
+        record(carry.path(), &restored).unwrap();
+        assert_eq!(
+            recorded(carry.path(), &identity).unwrap().unwrap(),
+            restored
+        );
+    }
+
+    #[test]
+    fn shallow_snapshot_records_bind_the_boundary_and_roundtrip() {
+        let carry = tempfile::tempdir().unwrap();
+        let mut snapshot = ItemSnapshot::from(legacy_snapshot());
+        let full_digest = snapshot.digest();
+        snapshot.shallow = format!("{}\n", "1".repeat(40)).into_bytes();
+        assert_ne!(snapshot.digest(), full_digest);
+        let identity = id(&snapshot.item).unwrap();
+        record(carry.path(), &snapshot).unwrap();
+        assert!(fs::read(snapshot_path(carry.path(), &identity))
+            .unwrap()
+            .starts_with(SNAPSHOT_V2));
+        assert_eq!(
+            recorded(carry.path(), &identity).unwrap().unwrap(),
+            snapshot
+        );
+    }
 
     #[test]
     fn host_paths_map_at_path_ends_only_longest_first() {

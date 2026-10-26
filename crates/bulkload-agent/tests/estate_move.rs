@@ -793,10 +793,9 @@ fn nested_repositories_and_submodules_land_as_their_own_items() {
     holds_no_payload(&world.state(), 3);
 }
 
-/// A shallow source is a typed hold until it has a test: refused on the
-/// source half, nothing recorded for it to land.
+/// A shallow source carries its boundary without copying objects into state.
 #[test]
-fn a_shallow_source_is_held_typed() {
+fn a_shallow_source_carries_its_frontier() {
     let world = World::new("shallow");
     world.estate();
     let src = world.src();
@@ -812,14 +811,28 @@ fn a_shallow_source_is_held_typed() {
         "{}",
         String::from_utf8_lossy(&ran.stderr)
     );
+    let source = src.join("shallow");
+    let frontier = fs::read(source.join(".git/shallow")).unwrap();
+    let before = admin_digest(&source.join(".git"));
     let sourced = world.source();
-    assert!(
-        sourced.stdout.lines().any(|line| line
-            .contains("outcome=refused code=GIT_HAVES_UNPROVABLE")
-            && line.contains("shallow")),
-        "{}",
-        sourced.stdout
+    assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
+    let moved = world.moved();
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    assert!(moved.ok, "{both}");
+    assert_eq!(closure(&moved.stdout)["applied"], "4", "{both}");
+    assert_eq!(closure(&moved.stdout)["unaccounted"], "0", "{both}");
+    assert_eq!(
+        fs::read(world.dst().join("shallow/.git/shallow")).unwrap(),
+        frontier
     );
+    assert_eq!(admin_digest(&source.join(".git")), before);
+    assert_eq!(
+        payload::measure(&world.source_state())
+            .unwrap()
+            .payload_bytes,
+        0
+    );
+    assert_eq!(payload::measure(&world.state()).unwrap().payload_bytes, 0);
 }
 
 // Every file under `admin` (a repository's administration), by path and
@@ -3724,6 +3737,14 @@ fn a_path_outside_the_maps_lands_under_the_destination_home() {
     assert!(!dst_home.join(".cache").exists(), "the plan makes nothing");
     let moved = agent_home(&args(false), &dst_home);
     let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    let totals = closure(&moved.stdout);
+    assert_eq!(totals["applied"], "2", "{both}");
+    assert_eq!(totals["unaccounted"], "0", "{both}");
+    let report = fs::read_to_string(world.state().join("closure.json")).unwrap();
+    assert!(
+        report.contains("\"foreign_outcome_records\":[]"),
+        "{report}"
+    );
     assert!(mapped.join("a.txt").is_file(), "{both}");
     // The hand-off reads the placed path, never the plan's source path.
     assert!(!moved.stdout.contains("HANDOFF_NOT_LANDED"), "{both}");
@@ -3748,6 +3769,182 @@ fn a_path_outside_the_maps_lands_under_the_destination_home() {
         2,
         "{both}"
     );
+    let again = agent_home(&args(false), &dst_home);
+    let both = format!("{}\n{}", again.stdout, again.stderr);
+    let totals = closure(&again.stdout);
+    assert_eq!(totals["applied"], "2", "{both}");
+    assert_eq!(totals["unaccounted"], "0", "{both}");
+    assert_eq!(
+        out(
+            &world.dst().join("land"),
+            &["worktree", "list", "--porcelain"]
+        )
+        .lines()
+        .filter(|line| line.starts_with("worktree "))
+        .count(),
+        2,
+        "a repeated pass keeps each mapped worktree registered once: {both}"
+    );
+}
+
+/// SPEC Done 2: a home-mapped worktree's typed refusal belongs to its
+/// original plan item, including when a pass is retried.
+#[test]
+fn a_home_mapped_capture_refusal_keeps_its_plan_identity() {
+    let world = World::new("homemap-refusal");
+    let (src_home, dst_home) = (world.base.join("src"), world.base.join("dst"));
+    let land = world.src().join("land");
+    repo(&land, "a.txt");
+    let outside = src_home.join(".cache/lanes/wt");
+    git(
+        &land,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "wt",
+            outside.to_str().unwrap(),
+        ],
+    );
+    git(&land, &["config", "core.repositoryformatversion", "1"]);
+    git(&land, &["config", "remote.origin.url", "/nowhere"]);
+    git(&land, &["config", "remote.origin.promisor", "true"]);
+    git(&land, &["config", "extensions.partialClone", "origin"]);
+    let map = format!("{}={}", world.src().display(), world.dst().display());
+    let sourced = agent_home(
+        &os(&[
+            &"estate-move-source",
+            &"--map",
+            &map,
+            &world.source_state(),
+            &world.src(),
+        ]),
+        &src_home,
+    );
+    assert!(
+        sourced.stdout.contains("code=GIT_SOURCE_PARTIAL_CLONE"),
+        "{}\n{}",
+        sourced.stdout,
+        sourced.stderr
+    );
+    let args = os(&[
+        &"estate-move",
+        &"--label",
+        &LABEL,
+        &"--source",
+        &"neo",
+        &"--dest-home",
+        &dst_home,
+        &"-",
+        &world.source_state(),
+        &world.state(),
+    ]);
+    for _ in 0..2 {
+        let moved = agent_home(&args, &dst_home);
+        let both = format!("{}\n{}", moved.stdout, moved.stderr);
+        let totals = closure(&moved.stdout);
+        assert_eq!(totals["planned"], "2", "{both}");
+        assert_eq!(totals["refused_pending_review"], "2", "{both}");
+        assert_eq!(totals["unaccounted"], "0", "{both}");
+        assert_eq!(totals["applied"], "0", "{both}");
+        let report = fs::read_to_string(world.state().join("closure.json")).unwrap();
+        assert!(
+            report.contains("\"foreign_outcome_records\":[]"),
+            "{report}"
+        );
+        assert!(!dst_home.join(".cache").exists(), "{both}");
+        assert!(!world.dst().join("land").exists(), "{both}");
+    }
+}
+
+/// SPEC rules 7 and 8: an older pass's placement-keyed records remain
+/// untouched while a retry writes outcomes under the original plan ID.
+#[test]
+fn a_home_mapped_retry_preserves_foreign_outcomes_and_journals() {
+    use bulkload_agent::estate::{self, streamed};
+
+    let world = World::new("homemap-foreign");
+    let (src_home, dst_home) = (world.base.join("src"), world.base.join("dst"));
+    let land = world.src().join("land");
+    repo(&land, "a.txt");
+    let outside = src_home.join(".cache/lanes/wt");
+    git(
+        &land,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "wt",
+            outside.to_str().unwrap(),
+        ],
+    );
+    let map = format!("{}={}", world.src().display(), world.dst().display());
+    let sourced = agent_home(
+        &os(&[
+            &"estate-move-source",
+            &"--map",
+            &map,
+            &world.source_state(),
+            &world.src(),
+        ]),
+        &src_home,
+    );
+    assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
+    let carry = world.source_state().join("carry");
+    let planned = estate::inspect(&carry.join("plan.postcard"))
+        .unwrap()
+        .into_iter()
+        .find(|item| item.source == outside)
+        .unwrap();
+    let planned_id = estate::item_id(&planned).unwrap();
+    let mut old = streamed::recorded(&carry, &planned_id).unwrap().unwrap();
+    old.item.workspace = Some(dst_home.join(".cache/lanes/wt"));
+    let foreign_id = estate::item_id(&old.item).unwrap();
+    assert_ne!(planned_id, foreign_id);
+    let private = world.state().join("private");
+    estate::moving::private_dir(&world.state()).unwrap();
+    estate::moving::private_dir(&private).unwrap();
+    streamed::record_outcome(&private, &old.item, "workspace-restored", None, None).unwrap();
+    streamed::journal(&private, &old, "neo").unwrap();
+    let legacy: Vec<_> = fs::read_dir(&private)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    assert_eq!(legacy.len(), 2);
+    let args = os(&[
+        &"estate-move",
+        &"--label",
+        &LABEL,
+        &"--source",
+        &"neo",
+        &"--dest-home",
+        &dst_home,
+        &"-",
+        &world.source_state(),
+        &world.state(),
+    ]);
+    for _ in 0..2 {
+        let moved = agent_home(&args, &dst_home);
+        let both = format!("{}\n{}", moved.stdout, moved.stderr);
+        let totals = closure(&moved.stdout);
+        assert_eq!(totals["applied"], "2", "{both}");
+        assert_eq!(totals["unaccounted"], "0", "{both}");
+        let report = fs::read_to_string(world.state().join("closure.json")).unwrap();
+        assert!(
+            report.contains(&format!("\"foreign_outcome_records\":[\"{foreign_id}\"]")),
+            "{report}"
+        );
+        assert!(private.join(format!("{planned_id}.outcome")).is_file());
+        for (path, bytes) in &legacy {
+            assert_eq!(&fs::read(path).unwrap(), bytes, "{}", path.display());
+        }
+    }
 }
 
 /// SPEC rule 3 ("Duplicates already on sting are consolidated into the
@@ -4334,4 +4531,94 @@ fn a_nest_under_a_rebuildable_root_is_never_an_item() {
     assert!(!live.join(".build").exists(), "{both}");
     assert!(!both.contains("swift-argument-parser"), "{both}");
     assert_eq!(closure(&moved.stdout)["not_moved"], "0", "{both}");
+}
+
+/// A source outage can end a fetch after its objects are durable but before
+/// the checkout and journal exist. The native rerun retains that custody.
+#[test]
+fn an_owned_first_fetch_resumes_through_the_native_mover() {
+    use bulkload_agent::git_carry::stream;
+    use bulkload_agent::{estate, first_fetch};
+    for shallow in [false, true] {
+        let world = World::new(if shallow {
+            "first-fetch-shallow"
+        } else {
+            "first-fetch-full"
+        });
+        let source = world.src().join("land");
+        if shallow {
+            let origin = world.base.join("origin");
+            repo(&origin, "a.txt");
+            fs::write(origin.join("a.txt"), "latest source work\n").unwrap();
+            git(&origin, &["commit", "--quiet", "-am", "advance"]);
+            let url = format!("file://{}", origin.display());
+            git(
+                &world.src(),
+                &["clone", "--quiet", "--depth=1", "--template=", &url, "land"],
+            );
+        } else {
+            repo(&source, "a.txt");
+        }
+        let sourced = world.source();
+        assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
+        let carry = world.source_state().join("carry");
+        let items = estate::inspect(&carry.join("plan.postcard")).unwrap();
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        let identity = estate::item_id(item).unwrap();
+        let snapshot = estate::streamed::recorded(&carry, &identity)
+            .unwrap()
+            .unwrap();
+        let private = world.state().join("private");
+        fs::create_dir_all(&private).unwrap();
+        fs::set_permissions(world.state(), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        let target = first_fetch::Target {
+            item: &identity,
+            source_label: "neo",
+            source_host: "-",
+            source_path: &item.source,
+            live_path: &item.repository,
+            expected_shallow: &snapshot.shallow,
+        };
+        first_fetch::begin(&private, &target).unwrap();
+        let upload = format!("git -c {} upload-pack", stream::UPLOAD_PACK_CONFIG);
+        let fetched = estate::streamed::fetch_objects(&snapshot, &private, &upload, &[]).unwrap();
+        assert!(fetched.bytes > 0);
+        assert!(!item.repository.join(".git/HEAD").exists());
+        let marker = private.join(format!("{identity}.first-fetch"));
+        let intent = fs::read(&marker).unwrap();
+        let preview = agent(&os(&[
+            &"estate-move",
+            &"--plan-only",
+            &"--label",
+            &LABEL,
+            &"--source",
+            &"neo",
+            &"-",
+            &world.source_state(),
+            &world.state(),
+        ]));
+        let shown = format!("{}\n{}", preview.stdout, preview.stderr);
+        assert!(!shown.contains("code=GIT_DESTINATION_OCCUPIED"), "{shown}");
+        assert_eq!(fs::read(&marker).unwrap(), intent);
+        assert!(!item.repository.join(".git/HEAD").exists());
+
+        let moved = world.moved();
+        let both = format!("{}\n{}", moved.stdout, moved.stderr);
+        assert!(moved.ok, "{both}");
+        assert_eq!(closure(&moved.stdout)["applied"], "1", "{both}");
+        assert_eq!(closure(&moved.stdout)["unaccounted"], "0", "{both}");
+        assert!(!both.contains("code=GIT_DESTINATION_OCCUPIED"), "{both}");
+        assert!(!marker.exists());
+        assert_eq!(
+            fs::read(item.repository.join("a.txt")).unwrap(),
+            fs::read(source.join("a.txt")).unwrap()
+        );
+        assert_eq!(payload::measure(&world.state()).unwrap().payload_bytes, 0);
+        let again = world.moved();
+        assert!(again.ok, "{}\n{}", again.stdout, again.stderr);
+        assert_eq!(closure(&again.stdout)["unaccounted"], "0");
+        assert!(again.stdout.contains("object_bytes=0"), "{}", again.stdout);
+    }
 }

@@ -3403,12 +3403,14 @@ pub fn streamed_omissions(repo: &Path, include_rebuildable: bool) -> Result<Omis
     let root = fs::canonicalize(repo).refuse_at(SITE)?;
     let common = common_repository(&root).ok();
     let (mut nests, mut omitted) = (Vec::new(), Vec::new());
-    let mut pending = vec![root.clone()];
-    while let Some(directory) = pending.pop() {
-        for entry in fs::read_dir(&directory).refuse_at(SITE)? {
+    // Keep one iterator per active depth, rather than every discovered
+    // directory or every file's metadata. Results retain paths only.
+    let mut pending = vec![(root.clone(), fs::read_dir(&root).refuse_at(SITE)?)];
+    while let Some((directory, entries)) = pending.last_mut() {
+        if let Some(entry) = entries.next() {
             let entry = entry.refuse_at(SITE)?;
             let path = entry.path();
-            if directory == root && entry.file_name() == ".git" {
+            if directory.as_path() == root.as_path() && entry.file_name() == ".git" {
                 continue;
             }
             if common.as_deref() == Some(path.as_path()) {
@@ -3450,7 +3452,10 @@ pub fn streamed_omissions(repo: &Path, include_rebuildable: bool) -> Result<Omis
                 omitted.push(relative.as_os_str().as_bytes().to_vec());
                 continue;
             }
-            pending.push(path);
+            let entries = fs::read_dir(&path).refuse_at(SITE)?;
+            pending.push((path, entries));
+        } else {
+            pending.pop();
         }
     }
     nests.sort();
