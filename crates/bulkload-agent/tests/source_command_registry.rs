@@ -165,8 +165,8 @@ const BYPASSES: &[Bypass] = &[
              if!relay&&!matches!(mode,Remote::Negotiate|Remote::Retire){forflaginbulkload_agent::transfer::serve_flags(){ssh.arg(flag);\
              }ssh.arg(\"serve\");\
              }ifkind==bulkload_agent::transfer::RootKind::File{ssh.arg(\"--file\");\
-             }let(wire_in,wire_out)=ifrelay{(Stdio::inherit(),Stdio::inherit())}else{(Stdio::piped(),Stdio::piped())};\
-             letmutchild=ssh.stdin(wire_in).stdout(wire_out).stderr(Stdio::inherit()).spawn()",
+             }let(wire_in,wire_out,wire_err)=ifrelay{(Stdio::inherit(),Stdio::inherit(),Stdio::inherit())}else{(Stdio::piped(),Stdio::piped(),Stdio::piped())};\
+             letmutchild=ssh.stdin(wire_in).stdout(wire_out).stderr(wire_err).spawn()",
         ),
         callers: &[],
         why: "Starts the remote `bulkload-agent serve`, which is the source \
@@ -182,7 +182,10 @@ const BYPASSES: &[Bypass] = &[
               remote word is `bulkload-agent` or a validated absolute path, \
               and an opted-in reconnect uses a dedicated connection through \
               fixed ControlMaster=no and ControlPath=none arguments, \
-              and the ssh child touches no local source. The three mode flags \
+              and the ssh child touches no local source. Outside the relay \
+              its stderr is piped and relayed byte for byte to this \
+              process's stderr, the remote's last `refused:` line typing a \
+              refusal sent before any frame (MG-1). The three mode flags \
               it may pass (`--durability=strict`, WP0(g)'s \
               `--source-ledger-sync=full`, OI-1003-Q109, and `serve --file` \
               for a single-file root, #232) are fixed literals. \

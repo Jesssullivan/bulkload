@@ -3674,15 +3674,15 @@ fn pull_command<T>(
     if kind == bulkload_agent::transfer::RootKind::File {
         ssh.arg("--file");
     }
-    let (wire_in, wire_out) = if relay {
-        (Stdio::inherit(), Stdio::inherit())
+    let (wire_in, wire_out, wire_err) = if relay {
+        (Stdio::inherit(), Stdio::inherit(), Stdio::inherit())
     } else {
-        (Stdio::piped(), Stdio::piped())
+        (Stdio::piped(), Stdio::piped(), Stdio::piped())
     };
     let mut child = ssh
         .stdin(wire_in)
         .stdout(wire_out)
-        .stderr(Stdio::inherit())
+        .stderr(wire_err)
         .spawn()
         .refuse_at("main::pull_command")?;
     if relay {
@@ -3693,6 +3693,17 @@ fn pull_command<T>(
             Err(BulkloadRefusal::TransportLost)
         };
     }
+    // MG-1 (2026-10-26): the remote's stderr is relayed as it was, and its
+    // last `refused:` line types a refusal the stream cannot carry.
+    let tap = match child.stderr.take() {
+        Some(stderr) => Some(
+            std::thread::Builder::new()
+                .name("bulkload-ssh-stderr".to_owned())
+                .spawn(move || reconnect::relay_stderr(stderr))
+                .refuse_at("main::pull_command")?,
+        ),
+        None => None,
+    };
     let result = {
         let mut output = child.stdin.take().ok_or(BulkloadRefusal::Io(None))?;
         let mut input = child.stdout.take().ok_or(BulkloadRefusal::Io(None))?;
@@ -3701,12 +3712,10 @@ fn pull_command<T>(
         receive(&mut input, &mut output)
     };
     let exit_status = child.wait().refuse_at("main::pull_command")?;
-    let stats = result?;
-    // S4 (TIN-6592): the session ended but its transport did not end clean.
-    if !exit_status.success() {
-        return Err(BulkloadRefusal::TransportLost);
-    }
-    Ok(Some(stats))
+    let said = tap.and_then(|tap| tap.join().ok()).flatten();
+    // S4 (TIN-6592): a session whose transport did not end clean is a lost
+    // transport, unless the remote agent refused it by name (MG-1).
+    reconnect::settle(result, exit_status.code(), said).map(Some)
 }
 
 // `relay-upload-pack HOST REMOTE_EXECUTABLE SSH_CONFIG REPO` (`-` for

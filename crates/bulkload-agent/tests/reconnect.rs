@@ -327,3 +327,53 @@ fn an_invalid_reconnect_budget_is_refused_before_a_transport_starts() {
         assert!(!world.path("attempts").exists());
     }
 }
+
+#[test]
+fn a_remote_source_root_missing_is_refused_at_once_with_its_code() {
+    // MG-1 (2026-10-26): neo's serve refused SOURCE_ROOT_MISSING before
+    // any frame, and every such item spent the whole reconnect budget.
+    let world = World::new("online");
+    fs::remove_dir(world.path("source")).unwrap();
+    let started = std::time::Instant::now();
+    let output = world.pull(Some("600"));
+    let text = shown(&output);
+    assert!(!output.status.success(), "{text}");
+    assert_eq!(
+        world.attempts(),
+        1,
+        "an explicit refusal is never redialled: {text}"
+    );
+    assert!(!text.contains("reconnect transport=lost"), "{text}");
+    assert!(!text.contains("TRANSPORT_LOST"), "{text}");
+    // The remote's own line is relayed, and this side refuses with it.
+    assert_eq!(
+        text.matches("bulkload-agent: refused: SOURCE_ROOT_MISSING")
+            .count(),
+        2,
+        "{text}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_mins(1),
+        "{text}"
+    );
+    assert!(names(&world.path("dest")).is_empty());
+}
+
+#[test]
+fn a_remote_that_ends_without_naming_a_refusal_still_reconnects() {
+    // Exit 1 with no `refused:` line is not an agent refusal: retried.
+    let world = World::new("online");
+    let ssh = world.path("bin/ssh");
+    let script = fs::read_to_string(&ssh).unwrap().replace(
+        "result = subprocess.run(remote)",
+        "result = subprocess.run(remote, stderr=subprocess.DEVNULL) if not (root / 'source').exists() else subprocess.run(remote)",
+    );
+    fs::write(&ssh, script).unwrap();
+    fs::remove_dir(world.path("source")).unwrap();
+    let output = world.pull(Some("3"));
+    let text = shown(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("reconnect transport=lost"), "{text}");
+    assert!(text.contains("TRANSPORT_LOST"), "{text}");
+    assert!(world.attempts() >= 2, "{text}");
+}

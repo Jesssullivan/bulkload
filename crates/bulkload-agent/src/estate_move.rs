@@ -2813,9 +2813,9 @@ fn pull_links(
     for link in links {
         // 2026-10-22: a link the home's completed walk never reached is one
         // the source does not have: nothing to merge, and no session run
-        // (a remote source refuses a missing root before any frame, which
-        // the pull can only read as TRANSPORT_LOST). A record an earlier
-        // pass left for it is removed.
+        // (a remote source refuses a missing root before any frame; the
+        // pull types it SOURCE_ROOT_MISSING from the remote's stderr). A
+        // record an earlier pass left for it is removed.
         if seen.is_some_and(|seen| !seen.contains(link.rel.as_os_str().as_bytes())) {
             let pull = format!(
                 "{name}-link-{}",
