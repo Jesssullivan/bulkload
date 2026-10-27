@@ -3121,7 +3121,7 @@ fn an_entry_that_outlives_its_code_is_refused() {
     for (module, expected) in [
         (
             "agent::git_carry::shallow",
-            &["WRITERS \"index-pack\": registered as 1, the tree holds 0"][..],
+            &["WRITERS \"index-pack\": registered as 2, the tree holds 1"][..],
         ),
         (
             "agent::git_carry::estimate",

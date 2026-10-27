@@ -1722,8 +1722,11 @@ fn sync_dir(dir: &Path) -> Result<()> {
 
 /// Copy an admin directory: directories, regular files (mode and
 /// modification time kept, each synced) and links. Anything else refuses.
+/// Each file is read and written, never `fs::copy`: on a reflink file
+/// system that clones its input, and the kept clone's files are a source
+/// (P84, OI-1003-Q165).
 fn copy_tree(from: &Path, to: &Path) -> Result<()> {
-    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
     let mode = fs::symlink_metadata(from)
         .refuse_at(SITE)?
         .permissions()
@@ -1743,13 +1746,16 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
             let link = fs::read_link(source).refuse_at(SITE)?;
             std::os::unix::fs::symlink(link, target).refuse_at(SITE)?;
         } else if kind.is_file() {
-            fs::copy(source, target).refuse_at(SITE)?;
-            let modified = fs::symlink_metadata(source)
-                .refuse_at(SITE)?
-                .modified()
+            let meta = fs::symlink_metadata(source).refuse_at(SITE)?;
+            let bytes = fs::read(source).refuse_at(SITE)?;
+            let mut copy = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(meta.permissions().mode() & 0o7777)
+                .open(target)
                 .refuse_at(SITE)?;
-            let copy = fs::File::open(target).refuse_at(SITE)?;
-            copy.set_times(fs::FileTimes::new().set_modified(modified))
+            copy.write_all(&bytes).refuse_at(SITE)?;
+            copy.set_times(fs::FileTimes::new().set_modified(meta.modified().refuse_at(SITE)?))
                 .refuse_at(SITE)?;
             copy.sync_all().refuse_at(SITE)?;
         } else {

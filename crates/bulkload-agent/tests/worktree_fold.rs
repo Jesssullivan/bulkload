@@ -111,7 +111,7 @@ fn agent(globals: &[&str], args: &[&str]) -> Ran {
 /// fold's 30-minute quiet check passes.
 fn age(root: &Path) {
     let then = SystemTime::now()
-        .checked_sub(Duration::from_secs(2 * 3600))
+        .checked_sub(Duration::from_hours(2))
         .unwrap();
     let mut pending = vec![root.to_path_buf()];
     while let Some(path) = pending.pop() {
@@ -318,8 +318,8 @@ fn a_kept_clone_folds_into_the_canonical_repository() {
     // parked outside `.git/worktrees`, never deleted.
     let kept_list = g(&estate.kept, &["worktree", "list", "--porcelain"]);
     assert_eq!(kept_list.matches("worktree ").count(), 1, "{kept_list}");
-    let parked = estate.kept.join(".git/worktrees-parked-kc2-test");
-    assert_eq!(fs::read_dir(&parked).unwrap().count(), 4 + 4);
+    let kept_parked = estate.kept.join(".git/worktrees-parked-kc2-test");
+    assert_eq!(fs::read_dir(&kept_parked).unwrap().count(), 4 + 4);
 
     let ran = estate.fold(&free, "verify", &[]);
     assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
