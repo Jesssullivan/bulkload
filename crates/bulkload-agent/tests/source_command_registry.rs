@@ -582,14 +582,21 @@ const WRITERS: &[(&str, usize, &str)] = &[
 /// exactly ([`stale_entries`]).
 const NOT_COMMANDS: &[(&str, usize, &str)] = &[
     (
+        "bundle",
+        1,
+        "The hand-off render's capture kind word (`snapshot` or `bundle`, \
+         converge/handoff/render.rs).",
+    ),
+    (
         "clean",
         2,
         "A filter driver's variable name (filter.NAME.clean).",
     ),
     (
         "commit",
-        4,
-        "An object type, as cat-file and for-each-ref print it.",
+        5,
+        "An object type, as cat-file and for-each-ref print it. Five since \
+         the streamed capture's frontier check (`stream.rs`, b\"commit\").",
     ),
     ("config", 2, "The repository's `config` file name."),
     ("fetch", 1, "The remote.origin.fetch configuration field."),
