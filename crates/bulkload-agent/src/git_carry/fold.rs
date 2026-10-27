@@ -425,11 +425,11 @@ fn git_dir(repo: &Path) -> Result<PathBuf> {
     }
 }
 
-/// Each admin directory of `git_dir/worktrees`, with its `gitdir` file
+/// Each admin directory of `COMMON/worktrees`, with its `gitdir` file
 /// (empty when it has none).
-fn admin_dirs(git_dir: &Path) -> Result<BTreeMap<String, String>> {
+fn admin_dirs(common: &Path) -> Result<BTreeMap<String, String>> {
     let mut found = BTreeMap::new();
-    let entries = match fs::read_dir(git_dir.join("worktrees")) {
+    let entries = match fs::read_dir(common.join("worktrees")) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(found),
         Err(error) => return Err(crate::refuse::io(&error, SITE)),
@@ -1641,16 +1641,17 @@ pub fn reattach(request: &Reattach<'_>) -> Result<String> {
         format!("gitdir: {}\n", admin.display()).as_bytes(),
     )?;
     output(git(request.worktree).args(["read-tree", "HEAD"]))?;
-    let head = resolve(request.worktree, "HEAD").unwrap_or_default();
+    let landed = resolve(request.worktree, "HEAD").unwrap_or_default();
     let (bytes, ok) = status(request.worktree)?;
     let listed = listing(request.canonical)?;
     let mine: Vec<&Listed> = listed
         .iter()
         .filter(|entry| same_place(&entry.path, request.worktree))
         .collect();
-    let verified = head == tip && ok && mine.len() == 1 && mine.iter().all(|entry| !entry.prunable);
+    let verified =
+        landed == tip && ok && mine.len() == 1 && mine.iter().all(|entry| !entry.prunable);
     let after = format!(
-        "gitdir: {} HEAD={head} {} status_entries={} listed={} prunable={}",
+        "gitdir: {} HEAD={landed} {} status_entries={} listed={} prunable={}",
         admin.display(),
         branch.unwrap_or("detached"),
         bytes.iter().filter(|byte| **byte == 0).count(),
