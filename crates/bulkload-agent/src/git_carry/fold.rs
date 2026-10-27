@@ -1,6 +1,8 @@
-//! `worktree-fold` and `worktree-reattach` (TIN-7491): fold the linked
-//! worktrees of a kept clone into the canonical repository on the same
-//! host, and give a worktree whose admin directory is gone a new one.
+//! `worktree-fold` and `worktree-reattach` (TIN-7491).
+//!
+//! They fold the linked worktrees of a kept clone into the canonical
+//! repository on the same host, and give a worktree whose admin directory
+//! is gone a new one.
 //!
 //! Operator rulings, Linear TIN-3692: `ae17f1bd` (BL-2 selected "Worktree
 //! fold/reattach verbs"), and `36925e2d`: BL2-Q2 "Dated exception, verbs
@@ -61,7 +63,7 @@ const SITE: &str = "git_carry::fold";
 pub const DEFAULT_MIN_FREE_PERCENT: u8 = 10;
 
 /// How long a worktree must have gone unwritten before it moves.
-const QUIET: Duration = Duration::from_secs(30 * 60);
+const QUIET: Duration = Duration::from_mins(30);
 
 /// The most refs one fetch batch carries (TIN-7491).
 const REF_BATCH: usize = 25_000;
@@ -524,6 +526,13 @@ fn status(path: &Path) -> Result<(Vec<u8>, bool)> {
     Ok((out.stdout, out.status.success()))
 }
 
+/// How many records a `-z` listing holds: its NUL bytes.
+fn nul_count(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .fold(0, |count, byte| count + usize::from(*byte == 0))
+}
+
 /// SHA-256 of a file's bytes, or `none` when it does not exist.
 fn file_sha256(path: &Path) -> Result<String> {
     match fs::read(path) {
@@ -766,7 +775,7 @@ fn census(
         branch,
         index: file_sha256(&admin.join("index"))?,
         status: sha256_hex(&bytes),
-        entries: bytes.iter().filter(|byte| **byte == 0).count(),
+        entries: nul_count(&bytes),
         kind,
         hold,
     })
@@ -1369,6 +1378,9 @@ fn move_row(
         fs::rename(staged.as_path(), aside).refuse_at(SITE)?;
         return Ok(Err(Hold::CopyMismatch));
     }
+    // A canonical repository with no linked worktree yet has no
+    // `.git/worktrees`; `git worktree add` makes it the same way.
+    fs::create_dir_all(dirs.canonical_git.join("worktrees")).refuse_at(SITE)?;
     fs::rename(staged.as_path(), target.as_path()).refuse_at(SITE)?;
     sync_dir(&dirs.canonical_git.join("worktrees"))?;
     done.installed = Some(target.clone());
@@ -1654,7 +1666,7 @@ pub fn reattach(request: &Reattach<'_>) -> Result<String> {
         "gitdir: {} HEAD={landed} {} status_entries={} listed={} prunable={}",
         admin.display(),
         branch.unwrap_or("detached"),
-        bytes.iter().filter(|byte| **byte == 0).count(),
+        nul_count(&bytes),
         mine.len(),
         mine.iter().filter(|entry| entry.prunable).count()
     );
