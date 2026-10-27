@@ -419,6 +419,9 @@ fn io_none_sites() -> BTreeMap<String, usize> {
 /// site lowers its count here in the same change.
 const IO_NONE_ALLOWLIST: &[(&str, usize)] = &[
     ("crates/bulkload-agent/src/freshness.rs", 2),
+    // capture_refusal: a just-in-time recapture's wire code `IO` carries no
+    // errno (914dfff7, merged without this row; TIN-4543, 2026-10-27).
+    ("crates/bulkload-agent/src/estate_move.rs", 1),
     ("crates/bulkload-agent/src/git_carry/batch_objects.rs", 3),
     ("crates/bulkload-agent/src/git_carry/estimate.rs", 5),
     (
