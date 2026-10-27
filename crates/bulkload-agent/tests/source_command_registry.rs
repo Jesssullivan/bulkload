@@ -818,6 +818,7 @@ const BUILDERS: &[&str] = &[
     "agent::git_carry::estimate::local_probe",
     "agent::git_carry::estimate::ssh_command",
     "agent::git_carry::git",
+    "agent::git_carry::git_fetch",
     "agent::git_carry::git_writer",
     "agent::git_carry::nest_status",
     "agent::git_carry::snapshot_command",
