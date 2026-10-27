@@ -41,6 +41,7 @@ pub mod exclude_union;
     clippy::unwrap_used
 )]
 mod fetch_tests;
+pub mod fold;
 pub mod in_band;
 #[cfg(test)]
 #[allow(

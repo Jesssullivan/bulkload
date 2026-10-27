@@ -387,8 +387,20 @@ const SPAWN_WITHOUT_COMMAND: &[&str] = &[
     "link_name",
 ];
 
+/// Functions that may name `pack-refs`, each argued; no other MAINTENANCE
+/// name has an exception.
+const REF_PACKERS: &[(&str, &str)] = &[(
+    "agent::git_carry::fold::fold_refs",
+    "worktree-fold refs (TIN-7491; KC-1's batches, TIN-3692 297b6576): \
+     `pack-refs --include NS/* --exclude refs/tags/*` in the canonical \
+     repository after each fetched batch, so up to 25,000 new refs never \
+     stay loose. It rewrites `packed-refs` only: no object, pack, reflog or \
+     ref value changes.",
+)];
+
 /// Git subcommands that rewrite or repack a repository's store. No non-test
-/// agent code may name one, for any repository.
+/// agent code may name one, for any repository, except a [`REF_PACKERS`]
+/// function its `pack-refs`.
 const MAINTENANCE: &[&str] = &[
     "gc",
     "maintenance",
@@ -519,7 +531,14 @@ const WRITERS: &[(&str, usize, &str)] = &[
         4,
         "The capture's private write store and a bundle's envelope repository.",
     ),
-    ("index-pack", 1, "shallow::unpack: the destination's store."),
+    (
+        "index-pack",
+        2,
+        "shallow::unpack: the destination's store. And `fold::pack_into` \
+         (TIN-7491, worktree-fold objects): the canonical repository of a \
+         fold, taking a pack the kept clone's `pack-objects --stdout` \
+         reads; never the kept clone.",
+    ),
     (
         "init",
         5,
@@ -533,9 +552,11 @@ const WRITERS: &[(&str, usize, &str)] = &[
     ),
     (
         "read-tree",
-        6,
+        7,
         "A private index (GIT_INDEX_FILE or a private repository) or the \
-         destination's, during repair, attachment and restore.",
+         destination's, during repair, attachment and restore. Seven since \
+         `fold::reattach` (TIN-7491): the index of the new admin directory \
+         it made in the canonical repository, read from HEAD.",
     ),
     (
         "symbolic-ref (writing form)",
@@ -544,12 +565,16 @@ const WRITERS: &[(&str, usize, &str)] = &[
     ),
     (
         "update-ref",
-        10,
+        12,
         "The capture's private repository, a chain's scratch repository, a \
          bundle's envelope, and the destination of an import or restore. Ten \
          since the streamed capture's B2 (SPEC rule 2 reset): \
          `union::refs` creates, fast-forwards or tracks a source ref in the \
-         live destination repository, compare-and-swap.",
+         live destination repository, compare-and-swap. Twelve since the \
+         worktree fold (TIN-7491): `fold::move_row` creates a branch the \
+         canonical repository lacks (old value empty), and `fold::undo` \
+         deletes only that branch at the tip it was created with \
+         (BL2-small, TIN-3692 `36925e2d`); the canonical repository only.",
     ),
     (
         "checkout",
@@ -2047,6 +2072,8 @@ struct ContractScan {
     open_forms: BTreeSet<(&'static str, &'static str)>,
     /// The [`CONFIG_INJECTORS`] functions that named an injecting variable.
     injectors: BTreeSet<&'static str>,
+    /// The [`REF_PACKERS`] functions that named `pack-refs`.
+    packers: BTreeSet<&'static str>,
 }
 
 /// Entries of the argued tables that the workspace no longer bears out, so a
@@ -2090,6 +2117,11 @@ fn stale_entries(sources: &[Source], tables: &Tables) -> Vec<String> {
             ));
         }
     }
+    for (function, _) in REF_PACKERS {
+        if !scan.packers.contains(function) {
+            stale.push(format!("REF_PACKERS {function}: it names no pack-refs"));
+        }
+    }
     for (function, _) in CONFIG_INJECTORS {
         if !scan.injectors.contains(function) {
             stale.push(format!(
@@ -2116,6 +2148,7 @@ fn contract_scan(sources: &[Source], tables: &Tables) -> ContractScan {
     let mut extra_config = BTreeSet::new();
     let mut open_forms = BTreeSet::new();
     let mut injectors = BTreeSet::new();
+    let mut packers = BTreeSet::new();
     let config = tables.config_pairs();
     let guarded_env: Vec<(&str, &str)> = tables
         .set
@@ -2219,7 +2252,13 @@ fn contract_scan(sources: &[Source], tables: &Tables) -> ContractScan {
             }
             // Subcommands.
             if MAINTENANCE.contains(&literal) {
-                found.push(format!("{at}: {literal:?} rewrites a repository's store"));
+                let function = file.path_at(&source.module, span.start);
+                let packer = REF_PACKERS.iter().find(|(id, _)| *id == function);
+                if let (Some((id, _)), "pack-refs") = (packer, literal) {
+                    packers.insert(*id);
+                } else {
+                    found.push(format!("{at}: {literal:?} rewrites a repository's store"));
+                }
             } else if in_git_carry && GIT_COMMANDS.contains(&literal) {
                 let function = file.path_at(&source.module, span.start);
                 let mut count = |writer: bool, name: &str, what: &str| {
@@ -2351,6 +2390,7 @@ fn contract_scan(sources: &[Source], tables: &Tables) -> ContractScan {
         extra_config,
         open_forms,
         injectors,
+        packers,
     }
 }
 
