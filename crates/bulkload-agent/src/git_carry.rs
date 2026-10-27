@@ -33,6 +33,14 @@ pub mod decide;
 mod decide_tests;
 pub mod estimate;
 pub mod exclude_union;
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unwrap_used
+)]
+mod fetch_tests;
 pub mod in_band;
 #[cfg(test)]
 #[allow(
@@ -185,6 +193,30 @@ fn git(repo: &Path) -> Command {
         command.env("GIT_CEILING_DIRECTORIES", ceiling);
     }
     command
+}
+
+/// The flags every `git fetch` the agent runs takes after the subcommand
+/// (TIN-7492; operator 2026-10-27, Linear TIN-3692 `ae17f1bd`: "gc-safe
+/// fetch by default"). [`git_env::CONFIG`] already passes `-c gc.auto=0`
+/// and `-c maintenance.auto=false` before it. With these a fetch never
+/// prunes a ref, even under a repository's own `fetch.prune` or
+/// `remote.NAME.prune`, never writes `FETCH_HEAD`, never starts gc or
+/// maintenance after it lands, and never recurses into submodules. An
+/// object that only a parked worktree admin directory, a reflog or an
+/// index reaches stays in the store.
+pub(crate) const FETCH_FLAGS: &[&str] = &[
+    "--no-prune",
+    "--no-write-fetch-head",
+    "--no-auto-gc",
+    "--no-auto-maintenance",
+    "--no-recurse-submodules",
+];
+
+/// `fetch` and [`FETCH_FLAGS`] after whatever `command` (a [`git`] child,
+/// perhaps with its store or durability set) already holds. Every Git
+/// fetch the agent runs is built here.
+fn git_fetch(command: &mut Command) -> &mut Command {
+    command.arg("fetch").args(FETCH_FLAGS)
 }
 
 /// Turn the commit-graph off in `command` (a [`git`] read run once more
@@ -2894,8 +2926,8 @@ fn retained_blobs(
     // not carry, and the fetch's `index-pack --fix-thin` reads each one from
     // the source object store to complete the pack it writes here.
     let storage_read = pack_child(
-        git(private)
-            .args(["fetch", "--no-tags", "--quiet"])
+        git_fetch(&mut git(private))
+            .args(["--no-tags", "--quiet"])
             .arg(retained.bundle)
             .args([
                 "+refs/carry-export/worktree:refs/carry-reuse/worktree",
