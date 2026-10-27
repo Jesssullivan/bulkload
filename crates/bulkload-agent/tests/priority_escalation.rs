@@ -11,7 +11,9 @@
 //!
 //! `serve` with an open, silent stdin is the idle process: it waits for its
 //! first frame and moves no counter. Closing stdin ends it; nothing here
-//! sends a signal (R-N11).
+//! sends a signal (R-N11). `serve` runs at normal priority by default
+//! since BL2-Q5 (operator 2026-10-27, Linear TIN-3692 `36925e2d`), so the
+//! escalation test asks for background with `--priority=background`.
 
 #![allow(
     clippy::unwrap_used,
@@ -112,7 +114,7 @@ fn idle_serve(flags: &[&str], probe: &dyn Fn(u32)) -> String {
 
 #[test]
 fn an_idle_background_process_escalates_once_after_the_threshold() {
-    let stderr = idle_serve(&["--escalate-after=1"], &|pid| {
+    let stderr = idle_serve(&["--priority=background", "--escalate-after=1"], &|pid| {
         #[cfg(target_os = "linux")]
         {
             // Background first (idle class 3), then moved off it.
@@ -141,7 +143,7 @@ fn an_idle_background_process_escalates_once_after_the_threshold() {
     });
     let (line, found) = counters(&stderr);
     assert!(
-        line.contains("priority=background priority_from=default priority_escalate_after=1"),
+        line.contains("priority=background priority_from=flag priority_escalate_after=1"),
         "{line}"
     );
     assert_eq!(found["priority_escalations"], "1", "{line}");
