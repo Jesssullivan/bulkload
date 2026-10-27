@@ -12,7 +12,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::Stdio;
 
-use super::{git, input, oid, output, refs, text};
+use super::{git, git_fetch, input, oid, output, refs, text};
 use crate::{BulkloadRefusal, Result};
 
 pub(super) const CUSTODY: &str = "refs/carry-export/shallow-custody-v1";
@@ -203,14 +203,8 @@ fn ensure_custody_objects(repository: &Path, bundle: &Path, value: &str) -> Resu
         return Ok(());
     }
     output(
-        git(repository)
-            .args([
-                "fetch",
-                "--no-write-fetch-head",
-                "--no-auto-maintenance",
-                "--no-tags",
-                "--no-recurse-submodules",
-            ])
+        git_fetch(&mut git(repository))
+            .arg("--no-tags")
             .arg(bundle)
             .arg(CUSTODY),
     )?;

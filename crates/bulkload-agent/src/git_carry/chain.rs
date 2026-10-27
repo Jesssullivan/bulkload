@@ -51,7 +51,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use super::{
-    bundle_object_format, copy_hashing, estimate, git, input, oid, output, shared, text,
+    bundle_object_format, copy_hashing, estimate, git, git_fetch, input, oid, output, shared, text,
     verify_bundle, PrivateDir, StagedBundle,
 };
 use crate::{BulkloadRefusal, Result};
@@ -247,8 +247,8 @@ pub fn flatten(
         }
         verify_bundle(&repository, &staged)?;
         output(
-            git(&repository)
-                .args(["fetch", "--no-tags", "--quiet"])
+            git_fetch(&mut git(&repository))
+                .args(["--no-tags", "--quiet"])
                 .arg(&staged)
                 .arg(format!("+refs/*:refs/carry-chain/base-{index}/*")),
         )?;
@@ -265,16 +265,16 @@ pub fn flatten(
         }
         verify_bundle(&repository, &staged)?;
         output(
-            git(&repository)
-                .args(["fetch", "--no-tags", "--quiet"])
+            git_fetch(&mut git(&repository))
+                .args(["--no-tags", "--quiet"])
                 .arg(&staged)
                 .arg(format!("+refs/*:refs/carry-chain/{index}/*")),
         )?;
     }
     verify_bundle(&repository, head.path())?;
     output(
-        git(&repository)
-            .args(["fetch", "--no-tags", "--quiet"])
+        git_fetch(&mut git(&repository))
+            .args(["--no-tags", "--quiet"])
             .arg(head.path())
             .arg("+refs/*:refs/*"),
     )?;

@@ -30,7 +30,7 @@ use std::process::Stdio;
 
 use serde::{Deserialize, Serialize};
 
-use super::{durable, git, input, oid, output, text};
+use super::{durable, git, git_fetch, input, oid, output, text};
 use crate::refuse::RefuseAt as _;
 use crate::{BulkloadRefusal, Result};
 
@@ -842,16 +842,12 @@ fn fetch_batches(
         // Even a full capture may have become shallow before this read.
         // Accept metadata only in scratch, then reject an uncaptured
         // boundary before marking the batch or publishing any live refs.
-        command.arg("fetch").arg("--update-shallow");
+        git_fetch(&mut command).arg("--update-shallow");
         input(
             command
                 .args([
                     "--quiet",
                     "--no-tags",
-                    "--no-write-fetch-head",
-                    "--no-recurse-submodules",
-                    "--no-auto-gc",
-                    "--no-auto-maintenance",
                     "--stdin",
                     "--upload-pack",
                     upload_pack,

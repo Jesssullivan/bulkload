@@ -475,7 +475,8 @@ const OPEN_FORMS: &[(&str, &str, &str)] = &[(
 /// that many ([`stale_entries`]), so a removed writer cannot leave room for a
 /// new one. It moves only with the code on main: down when a use is
 /// removed, and up only for a use that its entry argues and bulkload#188
-/// records (one so far: `fetch`, 4 to 5, for #199).
+/// records (one so far: `fetch`, 4 to 5, for #199; it fell to 1 when every
+/// fetch moved into `git_carry::git_fetch`, TIN-7492).
 const WRITERS: &[(&str, usize, &str)] = &[
     (
         "add",
@@ -500,15 +501,18 @@ const WRITERS: &[(&str, usize, &str)] = &[
     ),
     (
         "fetch",
-        6,
-        "From a bundle file into the capture's private repository, a chain's \
-         scratch repository or a destination; always aimed at the repository \
-         that takes the objects, never at a source. Five since #199: \
-         chain::flatten also fetches each bound plan base, a digest-checked \
-         private copy, into the chain's scratch repository. Six since the \
-         streamed capture (SPEC rule 2 reset, 2026-10-20): `stream::fetch` \
-         takes a snapshot's ids into the live destination repository from \
-         the source's `upload-pack`, which only reads the source.",
+        1,
+        "`git_fetch`, the one fetch builder (TIN-7492, 2026-10-27: every \
+         fetch passes `--no-prune`, `--no-write-fetch-head`, \
+         `--no-auto-gc`, `--no-auto-maintenance` and \
+         `--no-recurse-submodules` after git_env's gc.auto=0 and \
+         maintenance.auto=false). Its six callers fetch from a bundle file \
+         into the capture's private repository, a chain's scratch \
+         repository (each bound plan base since #199) or a destination, or \
+         (`stream::fetch`, SPEC rule 2 reset) a snapshot's ids into the \
+         live destination repository from the source's `upload-pack`, \
+         which only reads the source. Each is aimed at the repository that \
+         takes the objects, never at a source.",
     ),
     (
         "hash-object",
@@ -814,6 +818,7 @@ const BUILDERS: &[&str] = &[
     "agent::git_carry::estimate::local_probe",
     "agent::git_carry::estimate::ssh_command",
     "agent::git_carry::git",
+    "agent::git_carry::git_fetch",
     "agent::git_carry::git_writer",
     "agent::git_carry::nest_status",
     "agent::git_carry::snapshot_command",
