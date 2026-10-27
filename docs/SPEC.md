@@ -90,6 +90,15 @@ Each rule is testable, and a change that breaks one is a defect.
    2026-10-21: "the manually checking and offering to hceckout is a
    dangerous antipatterhn that has been recurring for months and must never
    happen again, this is the whole asdkfjasdjlk point of bulkload".
+   **Dated exception, 2026-10-27** (operator interview, Linear TIN-3692
+   comment `36925e2d`, BL2-Q2: "Dated exception, verbs next"). Two carries
+   of 2026-10-27 moved estate bytes outside bulkload, and the operator
+   accepted their result: NC-1, a read-only tar carry of neo-only items
+   (TIN-3692 `d10dcf3e`, `395ab4e0`), and KC-1, the worktree fold run by seat-written
+   scripts (`2aa6f9f4`, `297b6576`, verified in `a2c52e93`). The exception
+   covers those two lanes only. It admits no other tar, script or hand
+   carry. Every later carry goes through bulkload verbs, starting with the
+   worktree fold verbs (TIN-7491).
 2. **In place, copy once, streaming, on both machines.** Bytes go from
    neo's live paths straight over the wire into sting's live paths, through
    the path maps. Neither machine ever gets a staging copy: no capture
