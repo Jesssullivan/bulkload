@@ -345,7 +345,7 @@ PINNED_JUST_RECIPES = {
     "bazel-graph": (
         "bazel-graph:",
         (
-            "cd {{ root }} && bazelisk --max_idle_secs=60 query --lockfile_mode=error 'deps(//:bulkload + //:tests)' --output=label >/dev/null",
+            "cd {{ root }} && bazelisk --batch query --lockfile_mode=error 'deps(//:bulkload + //:tests)' --output=label >/dev/null",
             '@echo "bazel-graph: //:bulkload and //:tests loaded"',
         ),
     ),
@@ -4811,7 +4811,7 @@ class CiContractTest(unittest.TestCase):
                 "--lockfile_mode=off 'deps(//:bulkload)'",
                 1,
             ),
-            justfile.replace("bazelisk --max_idle_secs=60 query", "bazelisk build", 1),
+            justfile.replace("bazelisk --batch query", "bazelisk build", 1),
         ]
         for index, unsafe in enumerate(variants):
             with self.subTest(index=index):

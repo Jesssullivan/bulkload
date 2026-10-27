@@ -12,10 +12,12 @@ build:
 test:
     cd {{ root }} && just flywheel-test //:tests
 
-# Explicit source-only fallback for an unattached development shell. This is
-# not GloriousFlywheel enrollment or CI evidence.
+# Explicit source-only fallback for an unattached development shell: local,
+# non-qualifying. This is not GloriousFlywheel enrollment or CI evidence. The
+# server exits after 120 idle seconds (TIN-5770 R470, R471).
 test-local:
-    cd {{ root }} && bazelisk test //:tests
+    @echo "test-local: local, non-qualifying (not GloriousFlywheel execution)" >&2
+    cd {{ root }} && bazelisk --max_idle_secs=120 test //:tests
 
 repo-manifest-validate:
     cd {{ root }} && python3 scripts/validate_repo_manifest.py tinyland.repo.json
@@ -378,12 +380,12 @@ check-fast: check-source fault-harness contract-test
 # Bazel graph load (OI-1003-Q199, closing the OI-1003-Q65 residual gap):
 # resolve the bzlmod graph against MODULE.bazel.lock and load rules_python,
 # the //:bulkload globs and the //:tests suite. A query, not a build: nothing
-# is compiled, run or uploaded, and the Bazel
-# server exits after 60 idle seconds. The Flywheel wrapper
+# is compiled, run or uploaded, and --batch leaves no Bazel server
+# resident (TIN-5770 R472). The Flywheel wrapper
 # (`gloriousflywheel-bazel`) is not on the sting seat's PATH, so this runs
 # the flake's bazelisk, as `test-local` does.
 bazel-graph:
-    cd {{ root }} && bazelisk --max_idle_secs=60 query --lockfile_mode=error 'deps(//:bulkload + //:tests)' --output=label >/dev/null
+    cd {{ root }} && bazelisk --batch query --lockfile_mode=error 'deps(//:bulkload + //:tests)' --output=label >/dev/null
     @echo "bazel-graph: //:bulkload and //:tests loaded"
 
 # The merge gate (OI-1003-Q199, 2026-10-16), on sting, on the exact PR head
