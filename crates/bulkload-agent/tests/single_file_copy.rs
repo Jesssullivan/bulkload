@@ -86,12 +86,26 @@ impl Scratch {
     /// through an `ssh` stand-in first on `PATH` that runs the remote
     /// command here: the real wire between two processes.
     fn pull(&self, file: bool, source: &str, dest: &str, states: (&str, &str)) -> Ran {
+        self.pull_with(&["--min-free-percent=0"], file, source, dest, states)
+    }
+
+    /// [`Scratch::pull`] with `globals` before the verb in place of
+    /// `--min-free-percent=0`. The stand-in records its own arguments, one
+    /// per line, in `fake-bin/argv`.
+    fn pull_with(
+        &self,
+        globals: &[&str],
+        file: bool,
+        source: &str,
+        dest: &str,
+        states: (&str, &str),
+    ) -> Ran {
         let bin = self.path("fake-bin");
         if !bin.join("ssh").exists() {
             std::fs::create_dir_all(&bin).unwrap();
             std::fs::write(
                 bin.join("ssh"),
-                "#!/bin/sh\nwhile [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\nshift 2\nexec \"$@\"\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"${0%/ssh}/argv\"\nwhile [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\nshift 2\nexec \"$@\"\n",
             )
             .unwrap();
             std::fs::set_permissions(bin.join("ssh"), std::fs::Permissions::from_mode(0o755))
@@ -101,10 +115,7 @@ impl Scratch {
         path.push(":");
         path.push(std::env::var_os("PATH").unwrap_or_default());
         let mut command = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"));
-        command
-            .arg("--min-free-percent=0")
-            .arg("pull")
-            .env("PATH", path);
+        command.args(globals).arg("pull").env("PATH", path);
         if file {
             command.arg("--file");
         }
@@ -683,6 +694,76 @@ fn pull_file_types_its_leaf_over_the_wire() {
         assert!(!both.contains("TRANSPORT_LOST"), "{both}");
         assert!(!scratch.path(&format!("destination/{leaf}")).exists());
     }
+}
+
+// BL2-Q5 (SPEC rule 6; operator 2026-10-27, Linear TIN-3692 `36925e2d`:
+// "Normal + forward flags"): the remote `serve` runs at normal priority by
+// default, and `pull` hands it its own free-space floor and the
+// `--priority=` it was given, before the verb.
+#[test]
+fn pull_forwards_its_floor_and_priority_and_serve_defaults_to_normal() {
+    let scratch = Scratch::new("forward");
+    std::fs::write(scratch.path("source/a.txt"), b"forwarded\n").unwrap();
+    settle(&scratch.path("source"));
+    let argv = || -> Vec<String> {
+        std::fs::read_to_string(scratch.path("fake-bin/argv"))
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+    let before_serve = |argv: &[String], flag: &str| {
+        let at = argv.iter().position(|arg| arg == flag);
+        let serve = argv.iter().position(|arg| arg == "serve");
+        assert!(
+            matches!((at, serve), (Some(at), Some(serve)) if at < serve),
+            "{flag} before serve in {argv:?}"
+        );
+    };
+
+    let ran = scratch.pull_with(
+        &["--min-free-percent=0"],
+        true,
+        "source/a.txt",
+        "destination/a.txt",
+        ("ss", "ds"),
+    );
+    assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
+    let first = argv();
+    before_serve(&first, "--min-free-percent=0");
+    assert!(
+        !first.iter().any(|arg| arg.starts_with("--priority=")),
+        "{first:?}"
+    );
+    assert!(
+        ran.stderr
+            .contains("verb=serve side=source scope=process priority=normal priority_from=default"),
+        "{}",
+        ran.stderr
+    );
+
+    let ran = scratch.pull_with(
+        &["--min-free-percent=1", "--priority=background"],
+        true,
+        "source/a.txt",
+        "destination/b.txt",
+        ("ss-b", "ds-b"),
+    );
+    assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
+    let second = argv();
+    before_serve(&second, "--min-free-percent=1");
+    before_serve(&second, "--priority=background");
+    assert!(
+        ran.stderr.contains(
+            "verb=serve side=source scope=process priority=background priority_from=flag"
+        ),
+        "{}",
+        ran.stderr
+    );
+    assert_eq!(
+        std::fs::read(scratch.path("destination/b.txt")).unwrap(),
+        b"forwarded\n"
+    );
 }
 
 // #283 review 4: a `--file` landing is keyed as a tree session of the

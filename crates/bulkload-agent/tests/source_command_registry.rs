@@ -158,6 +158,8 @@ const BYPASSES: &[Bypass] = &[
              }ssh.arg(\"--\").arg(host).arg(remote);\
              ifbulkload_agent::durable::durability()==bulkload_agent::durable::Durability::Strict{ssh.arg(\"--durability=strict\");\
              }ifbulkload_agent::durable::ledger_sync()==bulkload_agent::durable::LedgerSync::Full{ssh.arg(\"--source-ledger-sync=full\");\
+             }ssh.arg(format!(\"--min-free-percent={}\",bulkload_agent::space::min_free_percent()));\
+             ifletSome(requested)=FORWARDED_PRIORITY.get(){ssh.arg(requested.flag());\
              }letrelay=matchmode{Remote::Serve(_)=>false,Remote::Negotiate=>{ssh.arg(\"negotiate\");false}\
              Remote::Retire=>{ssh.arg(\"retire-source\");false}\
              Remote::UploadPack(repo)=>{ifrepo.contains('\\'')||!repo.starts_with('/'){returnErr(BulkloadRefusal::PathNotPortable);\
@@ -170,7 +172,8 @@ const BYPASSES: &[Bypass] = &[
         ),
         callers: &[],
         why: "Starts the remote `bulkload-agent serve`, which is the source \
-              reader and enters background priority itself (OI-1003-Q25), \
+              reader and runs at normal priority unless this side forwards a \
+              `--priority=` (SPEC rule 6; BL2-Q5, TIN-3692 `36925e2d`), \
               or (SPEC rule 2 reset, B1) the remote `bulkload-agent \
               upload-pack REPO` a streamed fetch relays to, its stdio the \
               local `git fetch`'s, REPO an absolute path, single-quoted and \
@@ -188,7 +191,10 @@ const BYPASSES: &[Bypass] = &[
               refusal sent before any frame (MG-1). The three mode flags \
               it may pass (`--durability=strict`, WP0(g)'s \
               `--source-ledger-sync=full`, OI-1003-Q109, and `serve --file` \
-              for a single-file root, #232) are fixed literals. \
+              for a single-file root, #232) are fixed literals. It also \
+              passes `--min-free-percent=N`, digits rendered from this \
+              process's parsed floor, and the `--priority=` this process \
+              was given, one fixed literal per class (BL2-Q5). \
               `transfer::serve_flags` adds only `--sqlite-rows` (a fixed \
               literal; operator ruling 2026-10-20: the remote serve then \
               streams one store's rows from a held read snapshot, the \

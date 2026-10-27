@@ -834,11 +834,15 @@ BOUNDARIES:
     so the session continues and stays resumable. estate-apply refuses before
     any item, planning the bundle bytes each destination repository does not
     already hold (a lower bound).
-    --priority=background|normal|auto (WP0(f)): serve, snapshot,
+    --priority=background|normal|auto (WP0(f)): snapshot,
     git-carry-estimate, git-export and copy read a live source, so they enter
     background CPU and IO priority before anything else (Linux nice 19 and the
     idle IO class; Darwin IOPOL_THROTTLE, QOS_CLASS_BACKGROUND and nice 19),
     inherited by every thread and child; other verbs run at normal priority.
+    serve runs at normal priority (SPEC rule 6; BL2-Q5, 2026-10-27). pull
+    hands its remote source half its own --min-free-percent=N, and its
+    --priority= when one was given, so the source side keeps the floor and
+    the class the operator asked for.
     estate-capture defaults to auto (M2 item 3): background when a terminal
     was read or written within 300 s, normal otherwise. --priority=normal is
     the explicit opt-out (gate (a)); every counters line records priority=
@@ -983,9 +987,10 @@ COUNTERS:
 /// OI-1003-Q17), except the [`AUTO_VERBS`], whose default is `auto` (M2
 /// item 3). `copy` is here because it reads the source in-process (it is
 /// gate (a)'s verb); `pull` is not, since its source half is the remote
-/// `serve`.
+/// `serve`. `serve` is not here either: it runs at normal priority unless
+/// its `pull` forwards a `--priority=` (SPEC rule 6; operator 2026-10-27,
+/// Linear TIN-3692 `36925e2d`, BL2-Q5: "Normal + forward flags").
 const SOURCE_SIDE_VERBS: &[&str] = &[
-    "serve",
     "retire-source",
     "upload-pack",
     "estate-capture",
@@ -1006,6 +1011,23 @@ enum Requested {
     Class(bulkload_agent::priority::PriorityClass),
     Auto,
 }
+
+impl Requested {
+    /// The `--priority=` flag that asks for this value, as `pull` forwards
+    /// it to its remote source half (BL2-Q5). A fixed literal per value.
+    const fn flag(self) -> &'static str {
+        use bulkload_agent::priority::PriorityClass;
+        match self {
+            Self::Auto => "--priority=auto",
+            Self::Class(PriorityClass::Normal) => "--priority=normal",
+            Self::Class(PriorityClass::Background) => "--priority=background",
+        }
+    }
+}
+
+/// The `--priority=` this process was given, if any. `pull` forwards it to
+/// the remote `serve` (BL2-Q5); without it the remote takes its own default.
+static FORWARDED_PRIORITY: std::sync::OnceLock<Requested> = std::sync::OnceLock::new();
 
 impl std::str::FromStr for Requested {
     type Err = BulkloadRefusal;
@@ -1051,6 +1073,7 @@ impl Priority {
     }
 }
 
+#[allow(clippy::too_many_lines)] // Global flags, priority, then one arm per verb.
 fn main() -> ExitCode {
     let started = std::time::Instant::now();
     // OI-1001-Q2: the binary keeps a 25% free-space floor unless told otherwise.
@@ -1067,6 +1090,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Some(requested) = requested {
+        let _ = FORWARDED_PRIORITY.set(requested);
+    }
     let command = args.next();
     let verb = command
         .as_ref()
@@ -3642,6 +3668,16 @@ fn pull_command<T>(
     // The remote `serve` is the source half: its ledger takes this mode.
     if bulkload_agent::durable::ledger_sync() == bulkload_agent::durable::LedgerSync::Full {
         ssh.arg("--source-ledger-sync=full");
+    }
+    // SPEC rule 6, BL2-Q5: the source half keeps this side's free-space
+    // floor, and its priority when one was asked for. Without a forwarded
+    // `--priority=`, `serve` runs at normal priority.
+    ssh.arg(format!(
+        "--min-free-percent={}",
+        bulkload_agent::space::min_free_percent()
+    ));
+    if let Some(requested) = FORWARDED_PRIORITY.get() {
+        ssh.arg(requested.flag());
     }
     let relay = match mode {
         Remote::Serve(_) => false,
