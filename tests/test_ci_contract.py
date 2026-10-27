@@ -27,8 +27,8 @@ NIXOS_CACHE = "https://cache.nixos.org/"
 NIXOS_PUBLIC_KEY = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
 REVIEWED_PATH = "/nix/var/nix/profiles/default/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 REVIEWED_STEP_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
-ACTION_SHA256 = "22ee18ceb8260b2e44a6b5ac0cfb6ee1d919e259313265ce454106dd91fc7876"
-GUARD_SHA256 = "752df5abcd7c07d9ffbe18bac6f5ddad7309f52266b4349e5a38306f4b408bc4"
+ACTION_SHA256 = "10806cf19c933d218d26d39f27a3fc5e3fec0ec390707d1be5546e73cc48ae9c"
+GUARD_SHA256 = "58975d5e1aa3633e96a0508f6d293510331639db8e4cd5611f022fb8c23007f8"
 FAULT_HARNESS_STEP_SHA256 = (
     "fc226b95e6553343298eb65a434df43ec6a07fdda7821b47a66e0ecff06a1bbe"
 )
@@ -40,7 +40,7 @@ EFFECTIVE_NIX_STEP_SHA256 = (
 )
 BAZELRC_SHA256 = "f5a7f5116ce0a69471e71b44666fc868e361ed540a40c28a4ee8adc344c87592"
 WORKSPACE_BAZELRC_SHA256 = (
-    "15aa8306cc530bbc4d143dd7a6a2f0cfd3efbed19c01503d35bbec0c5e7cd357"
+    "0a175beba22fce7a2f4125f9cd054484d90bd07f94d1367f48aae7a6faba63bb"
 )
 BOOTSTRAP_IMPL_LINE = (
     "common --@rules_python//python/config_settings:bootstrap_impl=script"
@@ -345,7 +345,7 @@ PINNED_JUST_RECIPES = {
     "bazel-graph": (
         "bazel-graph:",
         (
-            "cd {{ root }} && bazelisk --max_idle_secs=60 query --lockfile_mode=error 'deps(//:bulkload + //:tests)' --output=label >/dev/null",
+            "cd {{ root }} && bazelisk --batch query --lockfile_mode=error 'deps(//:bulkload + //:tests)' --output=label >/dev/null",
             '@echo "bazel-graph: //:bulkload and //:tests loaded"',
         ),
     ),
@@ -4811,7 +4811,7 @@ class CiContractTest(unittest.TestCase):
                 "--lockfile_mode=off 'deps(//:bulkload)'",
                 1,
             ),
-            justfile.replace("bazelisk --max_idle_secs=60 query", "bazelisk build", 1),
+            justfile.replace("bazelisk --batch query", "bazelisk build", 1),
         ]
         for index, unsafe in enumerate(variants):
             with self.subTest(index=index):

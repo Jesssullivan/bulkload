@@ -1,3 +1,6 @@
+# The client server exits after 120 s idle (TIN-5770 R470). A later rc such as
+# ~/.bazelrc can override it.
+startup --max_idle_secs=120
 common --enable_bzlmod
 common --@rules_python//python/config_settings:bootstrap_impl=script
 build --announce_rc
