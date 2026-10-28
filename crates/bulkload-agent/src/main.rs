@@ -160,6 +160,40 @@ SUBCOMMANDS:
     retire-source
                 The source end of pull-retire-source: one framed question on
                 stdin, each file's verdict framed on stdout
+    worktree-fold STEP CANONICAL KEPT STATE [ARG...] [--ruling TEXT]
+                Fold a kept clone's linked worktrees into the canonical
+                repository on this host (TIN-7491; operator 2026-10-27,
+                Linear TIN-3692 ae17f1bd and 36925e2d). The free-space
+                floor is 10% here (BL2-Q3) unless --min-free-percent=N is
+                given, which the receipts record. Every step appends its
+                receipt lines, with the floor and --ruling TEXT, to
+                STATE/worktree-fold.receipts; every step but plan needs
+                --ruling. No step runs worktree repair, prune or gc, and
+                no step deletes a file.
+                plan TAG: read-only census; STATE/plan.tsv records each
+                worktree's .git, HEAD, branch, admin index and status -z
+                SHA-256 and what HEAD becomes in the canonical repository
+                (create, attach, detached, detach); TAG ([a-z0-9-]+) names
+                the parked and staging directories.
+                refs NAMESPACE: every kept ref into the canonical
+                repository under NAMESPACE (refs/kept-[a-z0-9-]+), at most
+                25,000 a batch, each batch packed; additive, resumable.
+                objects: one new pack with every object the kept clone
+                reaches from refs, reflogs, indexes and worktree HEADs that
+                the canonical repository lacks.
+                attach [NAME...]: move each planned worktree once it is
+                quiet (no process inside, nothing written for 30 minutes)
+                and unchanged since the plan; its kept admin directory is
+                parked in .git/worktrees-parked-TAG. A move that does not
+                verify is undone by renames, and a branch the same pass
+                created is deleted; nothing else is.
+                verify: every moved worktree against the plan, and fsck
+                --connectivity-only of the canonical repository
+    worktree-reattach CANONICAL WORKTREE NAME HEAD STATE --ruling TEXT
+                Give WORKTREE, whose .git names a missing admin directory, a
+                new one in CANONICAL/.git/worktrees/NAME with HEAD (a commit
+                or ref: refs/heads/BRANCH) and an index read from HEAD; the
+                worktree's files are not touched
     negotiate   The source end of estate-move --plan-only's B2 preview: one
                 framed question on stdin (refs ancestry and fetch bytes, or a
                 worktree's status, files and merge base), its answer framed
@@ -1155,6 +1189,8 @@ fn main() -> ExitCode {
         Some("relay-upload-pack") => relay_upload_pack_command(&args.collect::<Vec<_>>()),
         Some("negotiate") => negotiate_command(&args.collect::<Vec<_>>()),
         Some(name @ ("pull-retire-source" | "retire-source")) => retire(name, args),
+        Some("worktree-fold") => worktree_fold_command(&args.collect::<Vec<_>>()),
+        Some("worktree-reattach") => worktree_reattach_command(&args.collect::<Vec<_>>()),
         Some("help" | "--help" | "-h") => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -1324,9 +1360,12 @@ fn global_flags(
                 .to_str()
                 .and_then(|value| value.strip_prefix("--min-free-percent="))
             {
-                Some(percent) => bulkload_agent::space::set_min_free_percent(
-                    bulkload_agent::space::parse_percent(percent)?,
-                ),
+                Some(percent) => {
+                    bulkload_agent::space::set_min_free_percent(
+                        bulkload_agent::space::parse_percent(percent)?,
+                    );
+                    FLOOR_GIVEN.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 None => rest.push(arg),
             },
         }
@@ -1398,6 +1437,113 @@ fn negotiate_command(args: &[std::ffi::OsString]) -> Result<()> {
         .write_all(&bulkload_agent::git_carry::preview::frame(&answer)?)
         .refuse_at("main::negotiate_command")?;
     output.flush().refuse_at("main::negotiate_command")
+}
+
+/// Whether `--min-free-percent=` was given: the fold verbs' own default
+/// (BL2-Q3) applies only without it.
+static FLOOR_GIVEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The floor a fold verb runs at: the flag's, or 10% (BL2-Q3).
+fn fold_floor() -> bulkload_agent::git_carry::fold::Floor {
+    use bulkload_agent::git_carry::fold::{Floor, DEFAULT_MIN_FREE_PERCENT};
+    if FLOOR_GIVEN.load(std::sync::atomic::Ordering::Relaxed) {
+        Floor {
+            percent: bulkload_agent::space::min_free_percent(),
+            from_flag: true,
+        }
+    } else {
+        Floor {
+            percent: DEFAULT_MIN_FREE_PERCENT,
+            from_flag: false,
+        }
+    }
+}
+
+/// Split `--ruling TEXT` out of `args`; every other argument is a word.
+fn ruling_and_words(args: &[std::ffi::OsString]) -> Result<(Option<String>, Vec<String>)> {
+    let mut ruling = None;
+    let mut words = Vec::new();
+    let mut at = 0;
+    while let Some(arg) = args.get(at) {
+        let arg = arg.to_str().ok_or(BulkloadRefusal::PathNotPortable)?;
+        if arg == "--ruling" {
+            let text = args
+                .get(at + 1)
+                .and_then(|value| value.to_str())
+                .filter(|text| !text.trim().is_empty())
+                .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+            ruling = Some(text.to_owned());
+            at += 1;
+        } else {
+            words.push(arg.to_owned());
+        }
+        at += 1;
+    }
+    Ok((ruling, words))
+}
+
+// `worktree-fold STEP CANONICAL KEPT STATE [ARG...] [--ruling TEXT]`
+// (TIN-7491; operator 2026-10-27, Linear TIN-3692 ae17f1bd, 36925e2d).
+fn worktree_fold_command(args: &[std::ffi::OsString]) -> Result<()> {
+    use bulkload_agent::git_carry::fold;
+    let (ruling, words) = ruling_and_words(args)?;
+    let [step, canonical, kept, state, rest @ ..] = words.as_slice() else {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
+    };
+    for path in [canonical, kept, state] {
+        if !Path::new(path).is_absolute() {
+            return Err(BulkloadRefusal::PathNotAbsolute);
+        }
+    }
+    if step != "plan" && ruling.is_none() {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
+    }
+    let cx = fold::Context {
+        canonical: Path::new(canonical),
+        kept: Path::new(kept),
+        state: Path::new(state),
+        floor: fold_floor(),
+        ruling: ruling.as_deref().unwrap_or("-"),
+    };
+    let summary = match (step.as_str(), rest) {
+        ("plan", [tag]) => fold::plan(&cx, tag),
+        ("refs", [namespace]) => fold::fold_refs(&cx, namespace),
+        ("objects", []) => fold::fold_objects(&cx),
+        ("attach", only) => fold::attach(&cx, only),
+        ("verify", []) => fold::verify(&cx),
+        _ => return Err(BulkloadRefusal::FieldDomainViolation),
+    };
+    let line = summary?;
+    println!("worktree-fold {step}: {line} {}", cx.floor.field());
+    Ok(())
+}
+
+// `worktree-reattach CANONICAL WORKTREE NAME HEAD STATE --ruling TEXT`
+// (TIN-7491, from KC-1's broken-repair.sh).
+fn worktree_reattach_command(args: &[std::ffi::OsString]) -> Result<()> {
+    use bulkload_agent::git_carry::fold;
+    let (ruling, words) = ruling_and_words(args)?;
+    let ([canonical, worktree, name, head, state], Some(ruling)) = (words.as_slice(), ruling)
+    else {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
+    };
+    for path in [canonical, worktree, state] {
+        if !Path::new(path).is_absolute() {
+            return Err(BulkloadRefusal::PathNotAbsolute);
+        }
+    }
+    let request = fold::Reattach {
+        canonical: Path::new(canonical),
+        worktree: Path::new(worktree),
+        name,
+        head,
+        state: Path::new(state),
+        floor: fold_floor(),
+        ruling: &ruling,
+    };
+    let line = fold::reattach(&request)?;
+    println!("worktree-reattach: {line} {}", request.floor.field());
+    Ok(())
 }
 
 // `pull-retire-source` and its source end `retire-source`.
