@@ -266,10 +266,10 @@ mod darwin {
     /// `PROC_PIDFDVNODEINFO` (`sys/proc_info.h`); libc does not export it.
     const PROC_PIDFDVNODEINFO: c_int = 1;
 
-    /// `struct proc_fileinfo` (`sys/proc_info.h`). The kernel writes it; only
-    /// the layout is used.
+    /// `struct proc_fileinfo` (`sys/proc_info.h`), with its C field names.
+    /// The kernel writes it; only the layout is used.
     #[repr(C)]
-    #[allow(dead_code)]
+    #[allow(dead_code, clippy::struct_field_names)]
     struct ProcFileinfo {
         fi_openflags: u32,
         fi_status: u32,
