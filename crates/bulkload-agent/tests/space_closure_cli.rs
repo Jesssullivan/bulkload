@@ -3,7 +3,7 @@
 //!
 //! Every run takes its free-space reading from `BULKLOAD_TEST_SPACE`
 //! (BL2-F5, Linear TIN-3692 `952e2fb6`), so no result depends on the host's
-//! disk; the floor, its default and the refusal are the binary's own.
+//! disk. The floor, its default and the refusal are the binary's own.
 
 #![allow(
     clippy::unwrap_used,
@@ -60,10 +60,10 @@ const fn gib_with(available: u64) -> Space {
 }
 
 // BL2-F5 (TIN-3692 `952e2fb6`): the binary's own floor, driven through the
-// faked reading. 200 MiB free of 1 GiB (19.5%) is under the binary's
-// default (25%, `DEFAULT_MIN_FREE_PERCENT`) and refuses before writing,
-// with the reading in the refusal line; 512 MiB free passes at the default;
-// the flag overrides the default either way.
+// faked reading. 200 MiB free of 1 GiB is 19.5%, under the binary's
+// default of 25% (`DEFAULT_MIN_FREE_PERCENT`). It refuses before writing,
+// with the reading in the refusal line. 512 MiB free passes at the default.
+// The flag overrides the default either way.
 #[test]
 fn the_default_floor_and_the_flag_are_judged_on_the_faked_reading() {
     let root = tempfile::tempdir().unwrap();

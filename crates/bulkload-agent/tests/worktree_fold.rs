@@ -415,9 +415,9 @@ fn a_recent_write_or_a_process_inside_holds_the_worktree() {
 }
 
 // BL2-F5 (TIN-3692 `952e2fb6`): the fold's own floor, driven through the
-// faked reading on the `refs` step, which has no live-process check (that
-// check answers unknown on Darwin). 5% free of 1 GiB is under the fold's
-// default (10%, BL2-Q3): the batch is held with `floor`, recorded
+// faked reading on the `refs` step. That step has no live-process check,
+// which answers unknown on Darwin. 5% free of 1 GiB is under the fold's
+// default of 10% (BL2-Q3): the batch is held with `floor`, recorded
 // `from=default`, and nothing is carried. A flag under the reading carries
 // it, recorded `from=flag`. 20% free, with no flag, carries another
 // estate's batch at the default.

@@ -164,13 +164,15 @@ fn counts(name: &std::ffi::CStr) -> Result<(u128, u128, u128)> {
 /// the host's disk. The floor, its default, its flag and the refusal are
 /// unchanged: only the reading is faked. Every item of the seam is
 /// `cfg(debug_assertions)`, so a release build has none of it: its binary
-/// is byte for byte the binary without the seam. The hand-off's
+/// is byte for byte the binary without the seam. The integration tests name
+/// these items, so they compile only in a profile with debug assertions,
+/// which is every test entrypoint the justfile has. The hand-off's
 /// `TRACKED_TARGETS_ENV` is the precedent for a debug-only test variable.
 #[cfg(debug_assertions)]
 pub const TEST_SPACE_ENV: &str = "BULKLOAD_TEST_SPACE";
 
 /// A reading with room for every test fixture: 1 TiB, three quarters free,
-/// over any floor up to 75%.
+/// over any floor under 75%.
 #[cfg(debug_assertions)]
 pub const TEST_SPACE_ROOMY: Space = Space {
     total: 1 << 40,
@@ -186,11 +188,14 @@ impl Space {
     }
 }
 
-/// The faked reading, when [`TEST_SPACE_ENV`] is set (debug builds only).
+/// The faked reading, when [`TEST_SPACE_ENV`] is set. Only a debug build
+/// has it.
 ///
 /// # Errors
-/// `FIELD_DOMAIN_VIOLATION` for a value that is not `TOTAL:AVAILABLE` with
-/// AVAILABLE at most TOTAL.
+/// `FIELD_DOMAIN_VIOLATION` for a value that is not `TOTAL:AVAILABLE` in
+/// decimal digits, with TOTAL above zero and AVAILABLE at most TOTAL. A
+/// malformed value never falls back to a real probe. A caller that discards
+/// a probe error handles it as it handles any failed probe.
 #[cfg(debug_assertions)]
 fn test_space() -> Result<Option<Space>> {
     std::env::var_os(TEST_SPACE_ENV)
@@ -204,11 +209,17 @@ fn test_space() -> Result<Option<Space>> {
 /// As [`test_space`].
 #[cfg(debug_assertions)]
 fn parse_test_space(value: &std::ffi::OsStr) -> Result<Space> {
+    let bytes = |field: &str| -> Option<u64> {
+        if field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        field.parse().ok()
+    };
     let (total, available) = value
         .to_str()
         .and_then(|value| value.split_once(':'))
-        .and_then(|(total, available)| Some((total.parse().ok()?, available.parse().ok()?)))
-        .filter(|(total, available)| available <= total)
+        .and_then(|(total, available)| Some((bytes(total)?, bytes(available)?)))
+        .filter(|&(total, available)| total > 0 && available <= total)
         .ok_or(BulkloadRefusal::FieldDomainViolation)?;
     Ok(Space { total, available })
 }
@@ -745,7 +756,10 @@ mod tests {
                 available: 100
             })
         );
-        for bad in ["", "100", "100:", ":100", "100:101", "-1:0", "1:x", "1:2:3"] {
+        for bad in [
+            "", "100", "100:", ":100", "100:101", "-1:0", "1:x", "1:2:3", "+1:0", "1:+0", "0:0",
+            " 1:0",
+        ] {
             assert_eq!(
                 parse_test_space(std::ffi::OsStr::new(bad)),
                 Err(BulkloadRefusal::FieldDomainViolation),
