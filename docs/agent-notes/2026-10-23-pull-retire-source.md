@@ -87,6 +87,10 @@ archive.
 ## Not proven here
 
 (Superseded 2026-10-28 by #339: the lsof path is gone, and the libproc
-path passed `darwin-check` on pzm.) The Darwin `lsof` path has not been built or run: pzm is on hold and neo
+path passed `darwin-check` on pzm.) (Correction 2026-10-28, review of
+#339: `darwin-check` exited 1 on pzm at #339's head and on main. What
+passed there is the retire holder test, which is no longer ignored on
+Darwin, and the registry test of the holder check. #339 added no new
+Darwin failure.) The Darwin `lsof` path has not been built or run: pzm is on hold and neo
 is never a build host. The coordinator pair-builds the verb and runs it
 with `--dry-run` first.
