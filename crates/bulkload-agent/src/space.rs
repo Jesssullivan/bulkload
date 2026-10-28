@@ -156,13 +156,71 @@ fn counts(name: &std::ffi::CStr) -> Result<(u128, u128, u128)> {
     ))
 }
 
+/// The variable a debug build takes its free-space reading from instead of
+/// the filesystem: `TOTAL:AVAILABLE`, in bytes (BL2-F5, operator
+/// 2026-10-28, Linear TIN-3692 `952e2fb6`: "Hermetic test floor").
+///
+/// The test fixtures set it, so no test result depends on the free space of
+/// the host's disk. The floor, its default, its flag and the refusal are
+/// unchanged: only the reading is faked. A release build never reads it
+/// (the seam is compiled out), as with the hand-off's
+/// `TRACKED_TARGETS_ENV`.
+pub const TEST_SPACE_ENV: &str = "BULKLOAD_TEST_SPACE";
+
+/// A reading with room for every test fixture: 1 TiB, three quarters free,
+/// over any floor up to 75%.
+pub const TEST_SPACE_ROOMY: Space = Space {
+    total: 1 << 40,
+    available: 3 << 38,
+};
+
+impl Space {
+    /// The [`TEST_SPACE_ENV`] value that fakes this reading.
+    #[must_use]
+    pub fn test_env_value(self) -> String {
+        format!("{}:{}", self.total, self.available)
+    }
+}
+
+/// The faked reading, when [`TEST_SPACE_ENV`] is set (debug builds only).
+///
+/// # Errors
+/// `FIELD_DOMAIN_VIOLATION` for a value that is not `TOTAL:AVAILABLE` with
+/// AVAILABLE at most TOTAL.
+#[cfg(debug_assertions)]
+fn test_space() -> Result<Option<Space>> {
+    std::env::var_os(TEST_SPACE_ENV)
+        .map(|value| parse_test_space(&value))
+        .transpose()
+}
+
+/// Parse a [`TEST_SPACE_ENV`] value.
+///
+/// # Errors
+/// As [`test_space`].
+#[cfg(debug_assertions)]
+fn parse_test_space(value: &std::ffi::OsStr) -> Result<Space> {
+    let (total, available) = value
+        .to_str()
+        .and_then(|value| value.split_once(':'))
+        .and_then(|(total, available)| Some((total.parse().ok()?, available.parse().ok()?)))
+        .filter(|(total, available)| available <= total)
+        .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+    Ok(Space { total, available })
+}
+
 /// Probe the filesystem holding `path`, which must exist (`statvfs`;
-/// `statfs` on Darwin).
+/// `statfs` on Darwin). A debug build with [`TEST_SPACE_ENV`] set returns
+/// that reading instead.
 ///
 /// # Errors
 /// Refuses a path with an interior NUL, and the OS error of a failed call.
 pub fn probe(path: &Path) -> Result<Space> {
     use std::os::unix::ffi::OsStrExt as _;
+    #[cfg(debug_assertions)]
+    if let Some(space) = test_space()? {
+        return Ok(space);
+    }
     let name = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| BulkloadRefusal::PathNotPortable)?;
     let (blocks, available, fragment) = counts(&name)?;
@@ -660,6 +718,32 @@ mod tests {
         for bad in ["101", "-1", "", "25%", "2.5", "256"] {
             assert_eq!(
                 parse_percent(bad),
+                Err(BulkloadRefusal::FieldDomainViolation),
+                "{bad}"
+            );
+        }
+    }
+
+    // BL2-F5: the faked reading round-trips, and a malformed one is a
+    // refusal, never a silent real probe.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_test_space_value_round_trips_and_a_malformed_one_is_refused() {
+        let value = TEST_SPACE_ROOMY.test_env_value();
+        assert_eq!(
+            parse_test_space(std::ffi::OsStr::new(&value)),
+            Ok(TEST_SPACE_ROOMY)
+        );
+        assert_eq!(
+            parse_test_space(std::ffi::OsStr::new("100:100")),
+            Ok(Space {
+                total: 100,
+                available: 100
+            })
+        );
+        for bad in ["", "100", "100:", ":100", "100:101", "-1:0", "1:x", "1:2:3"] {
+            assert_eq!(
+                parse_test_space(std::ffi::OsStr::new(bad)),
                 Err(BulkloadRefusal::FieldDomainViolation),
                 "{bad}"
             );

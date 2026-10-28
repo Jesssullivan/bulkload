@@ -66,6 +66,10 @@ fn git(repo: &Path, args: &[&str]) {
 /// deadline; a child past it is reported and left alone, never signalled.
 fn agent(args: &[OsString], fault: Option<&str>) -> (Option<i32>, String) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"));
+    command.env(
+        bulkload_agent::space::TEST_SPACE_ENV,
+        bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+    );
     command
         .arg("--min-free-percent=0")
         .args(args)

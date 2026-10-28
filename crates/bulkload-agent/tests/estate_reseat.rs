@@ -102,6 +102,10 @@ impl World {
 
     fn reseat(&self, extra: &[&str]) -> (bool, String, String) {
         let out = Command::new(agent())
+            .env(
+                bulkload_agent::space::TEST_SPACE_ENV,
+                bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+            )
             .arg("estate-reseat")
             .arg("--managed-settings")
             .arg(self.base.join("managed-settings.json"))
@@ -200,6 +204,10 @@ fn cli_space_floor_refuses_before_writing() {
     let world = World::new();
     let run = |floor: &str| {
         Command::new(agent())
+            .env(
+                bulkload_agent::space::TEST_SPACE_ENV,
+                bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+            )
             .arg(format!("--min-free-percent={floor}"))
             .arg("estate-reseat")
             .arg("--managed-settings")

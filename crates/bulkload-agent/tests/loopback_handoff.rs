@@ -227,6 +227,10 @@ fn relay(mut from: impl Read, mut into: UnixStream, corrupt: Option<usize>) -> S
 /// destination half here, joined by its pipes through [`relay`].
 fn cross_process(scratch: &Scratch, corrupt: Option<usize>) -> (TransferStats, Counters, Seen) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .arg("serve")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

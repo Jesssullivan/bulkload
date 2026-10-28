@@ -234,6 +234,10 @@ fn timed_import(repository: &Path, bundle: &Path, log: &str) -> Duration {
     let out = repository.with_file_name(format!("{log}.out"));
     let err = repository.with_file_name(format!("{log}.err"));
     let child = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .args([
             OsStr::new("git-import"),
             repository.as_os_str(),

@@ -11,6 +11,10 @@ use std::process::Command;
 /// The selftest's `interpreter` and `gc roots` lines, after their labels.
 fn selftest(roots: &std::path::Path) -> (String, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .arg("selftest")
         .env("BULKLOAD_GCROOTS", roots)
         .output()

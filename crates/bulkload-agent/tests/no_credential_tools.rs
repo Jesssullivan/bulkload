@@ -48,6 +48,10 @@ fn no_agent_source_spawns_a_credential_or_agent_tool() {
 #[test]
 fn the_agent_has_no_handoff_verb() {
     let output = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .arg("handoff-verify")
         .output()
         .unwrap();

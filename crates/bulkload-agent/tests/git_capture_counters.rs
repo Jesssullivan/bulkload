@@ -62,6 +62,10 @@ fn noise(len: usize, mut state: u32) -> Vec<u8> {
 /// Run one verb and return its exit status and its `counters` line as a map.
 fn verb(args: &[&std::ffi::OsStr]) -> (bool, BTreeMap<String, u64>) {
     let result = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .args(args)
         .output()
         .unwrap();

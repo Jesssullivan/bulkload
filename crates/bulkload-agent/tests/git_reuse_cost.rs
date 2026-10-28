@@ -156,6 +156,10 @@ fn verb(scratch: &Path, args: &[&std::ffi::OsStr]) -> Ran {
     let out = scratch.join("verb.stdout");
     let err = scratch.join("verb.stderr");
     let child = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .args(args)
         .stdin(Stdio::null())
         .stdout(std::fs::File::create(&out).unwrap())

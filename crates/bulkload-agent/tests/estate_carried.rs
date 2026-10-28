@@ -33,6 +33,10 @@ struct Ran {
 
 fn agent(args: &[OsString]) -> Ran {
     let out = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .arg("--min-free-percent=0")
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")

@@ -1,5 +1,9 @@
 //! OI-1001-Q2 at the binary: the `--min-free-percent` preflight on `copy`
 //! and the `closure-report` verb's exit status and JSON.
+//!
+//! Every run takes its free-space reading from `BULKLOAD_TEST_SPACE`
+//! (BL2-F5, Linear TIN-3692 `952e2fb6`), so no result depends on the host's
+//! disk; the floor, its default and the refusal are the binary's own.
 
 #![allow(
     clippy::unwrap_used,
@@ -11,8 +15,16 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
+use bulkload_agent::space::{Space, TEST_SPACE_ENV, TEST_SPACE_ROOMY};
+
 fn agent(args: &[&std::ffi::OsStr]) -> Output {
+    agent_at(TEST_SPACE_ROOMY, args)
+}
+
+/// Run the binary with `reading` as its free-space reading.
+fn agent_at(reading: Space, args: &[&std::ffi::OsStr]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(TEST_SPACE_ENV, reading.test_env_value())
         .args(args)
         .output()
         .expect("run bulkload-agent")
@@ -20,14 +32,134 @@ fn agent(args: &[&std::ffi::OsStr]) -> Output {
 
 fn copy_with_floor(root: &Path, floor: &str) -> Output {
     let flag = format!("--min-free-percent={floor}");
-    agent(&[
-        flag.as_ref(),
+    copy_at(root, TEST_SPACE_ROOMY, &[flag.as_str()])
+}
+
+/// `copy` of ROOT's fixture with `globals` first, judged on `reading`.
+fn copy_at(root: &Path, reading: Space, globals: &[&str]) -> Output {
+    let mut args: Vec<&std::ffi::OsStr> = globals.iter().map(std::ffi::OsStr::new).collect();
+    let (source, destination) = (root.join("source"), root.join("destination"));
+    let (source_state, destination_state) =
+        (root.join("source-state"), root.join("destination-state"));
+    args.extend([
         "copy".as_ref(),
-        root.join("source").as_os_str(),
-        root.join("destination").as_os_str(),
-        root.join("source-state").as_os_str(),
-        root.join("destination-state").as_os_str(),
-    ])
+        source.as_os_str(),
+        destination.as_os_str(),
+        source_state.as_os_str(),
+        destination_state.as_os_str(),
+    ]);
+    agent_at(reading, &args)
+}
+
+/// A 1 GiB filesystem with `available` bytes free.
+const fn gib_with(available: u64) -> Space {
+    Space {
+        total: 1 << 30,
+        available,
+    }
+}
+
+// BL2-F5 (TIN-3692 `952e2fb6`): the binary's own floor, driven through the
+// faked reading. 200 MiB free of 1 GiB (19.5%) is under the binary's
+// default (25%, `DEFAULT_MIN_FREE_PERCENT`) and refuses before writing,
+// with the reading in the refusal line; 512 MiB free passes at the default;
+// the flag overrides the default either way.
+#[test]
+fn the_default_floor_and_the_flag_are_judged_on_the_faked_reading() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("source")).unwrap();
+    std::fs::create_dir(root.path().join("destination")).unwrap();
+    std::fs::write(root.path().join("source").join("payload"), vec![7u8; 4096]).unwrap();
+    let payload = root.path().join("destination").join("payload");
+    let (tight, roomy) = (gib_with(200 << 20), gib_with(512 << 20));
+    let shown = |out: &Output| {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    assert_eq!(
+        bulkload_agent::space::DEFAULT_MIN_FREE_PERCENT,
+        25,
+        "the binary's default floor"
+    );
+
+    // Below the default floor: refused, the reading and the floor recorded.
+    let below = copy_at(root.path(), tight, &[]);
+    let text = shown(&below);
+    assert!(!below.status.success(), "{text}");
+    assert!(
+        text.contains("refused payload: DESTINATION_SPACE_INSUFFICIENT"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            " min_free_percent=25 filesystem_total_bytes=1073741824 \
+             filesystem_available_bytes=209715200 quota=none "
+        ),
+        "{text}"
+    );
+    assert!(!payload.exists(), "{text}");
+
+    // A flag above the reading refuses on room the default would allow.
+    let raised = copy_at(root.path(), roomy, &["--min-free-percent=60"]);
+    let text = shown(&raised);
+    assert!(!raised.status.success(), "{text}");
+    assert!(
+        text.contains(
+            " min_free_percent=60 filesystem_total_bytes=1073741824 \
+             filesystem_available_bytes=536870912 quota=none "
+        ),
+        "{text}"
+    );
+    assert!(!payload.exists(), "{text}");
+
+    // The flag lowers the floor under the same tight reading: it passes.
+    let lowered = copy_at(root.path(), tight, &["--min-free-percent=10"]);
+    let text = shown(&lowered);
+    assert!(lowered.status.success(), "{text}");
+    assert!(!text.contains("space_refusal"), "{text}");
+    assert_eq!(std::fs::read(&payload).unwrap(), vec![7u8; 4096]);
+
+    // Above the default floor, with no flag: passes.
+    let fresh = tempfile::tempdir().unwrap();
+    std::fs::create_dir(fresh.path().join("source")).unwrap();
+    std::fs::create_dir(fresh.path().join("destination")).unwrap();
+    std::fs::write(fresh.path().join("source").join("payload"), vec![7u8; 4096]).unwrap();
+    let above = copy_at(fresh.path(), roomy, &[]);
+    let text = shown(&above);
+    assert!(above.status.success(), "{text}");
+    assert!(!text.contains("space_refusal"), "{text}");
+    assert_eq!(
+        std::fs::read(fresh.path().join("destination").join("payload")).unwrap(),
+        vec![7u8; 4096]
+    );
+}
+
+#[test]
+fn a_malformed_faked_reading_is_refused_never_a_real_probe() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("source")).unwrap();
+    std::fs::create_dir(root.path().join("destination")).unwrap();
+    std::fs::write(root.path().join("source").join("payload"), vec![7u8; 4096]).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(TEST_SPACE_ENV, "10:20")
+        .arg("copy")
+        .args(
+            ["source", "destination", "source-state", "destination-state"]
+                .map(|name| root.path().join(name)),
+        )
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("FIELD_DOMAIN_VIOLATION"), "{text}");
+    assert!(!root.path().join("destination").join("payload").exists());
 }
 
 #[test]
@@ -203,6 +335,7 @@ fn closure_report_attestation_is_bound_and_never_changes_the_verdict() {
     let named = root.path().join("--attest");
     std::fs::create_dir(&named).unwrap();
     let positional = std::process::Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(TEST_SPACE_ENV, TEST_SPACE_ROOMY.test_env_value())
         .current_dir(root.path())
         .args([
             "closure-report".as_ref(),

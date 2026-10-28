@@ -120,6 +120,10 @@ sys.exit(255 if mode == 'statuslost' or (mode == 'reboot' and n in (1, 3)) else 
 
     fn pull(&self, budget: Option<&str>) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"));
+        command.env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        );
         let mut search = self.path("bin").into_os_string();
         search.push(":");
         search.push(std::env::var_os("PATH").unwrap_or_default());

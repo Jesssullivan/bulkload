@@ -61,6 +61,10 @@ impl Scratch {
         states: (&str, &str),
     ) -> Ran {
         let mut command = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"));
+        command.env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        );
         command
             .arg("--min-free-percent=0")
             .args(globals)
@@ -115,6 +119,10 @@ impl Scratch {
         path.push(":");
         path.push(std::env::var_os("PATH").unwrap_or_default());
         let mut command = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"));
+        command.env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        );
         command.args(globals).arg("pull").env("PATH", path);
         if file {
             command.arg("--file");
