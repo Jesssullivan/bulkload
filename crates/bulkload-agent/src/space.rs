@@ -162,18 +162,22 @@ fn counts(name: &std::ffi::CStr) -> Result<(u128, u128, u128)> {
 ///
 /// The test fixtures set it, so no test result depends on the free space of
 /// the host's disk. The floor, its default, its flag and the refusal are
-/// unchanged: only the reading is faked. A release build never reads it
-/// (the seam is compiled out), as with the hand-off's
-/// `TRACKED_TARGETS_ENV`.
+/// unchanged: only the reading is faked. Every item of the seam is
+/// `cfg(debug_assertions)`, so a release build has none of it: its binary
+/// is byte for byte the binary without the seam. The hand-off's
+/// `TRACKED_TARGETS_ENV` is the precedent for a debug-only test variable.
+#[cfg(debug_assertions)]
 pub const TEST_SPACE_ENV: &str = "BULKLOAD_TEST_SPACE";
 
 /// A reading with room for every test fixture: 1 TiB, three quarters free,
 /// over any floor up to 75%.
+#[cfg(debug_assertions)]
 pub const TEST_SPACE_ROOMY: Space = Space {
     total: 1 << 40,
     available: 3 << 38,
 };
 
+#[cfg(debug_assertions)]
 impl Space {
     /// The [`TEST_SPACE_ENV`] value that fakes this reading.
     #[must_use]
@@ -210,7 +214,7 @@ fn parse_test_space(value: &std::ffi::OsStr) -> Result<Space> {
 }
 
 /// Probe the filesystem holding `path`, which must exist (`statvfs`;
-/// `statfs` on Darwin). A debug build with [`TEST_SPACE_ENV`] set returns
+/// `statfs` on Darwin). A debug build with `BULKLOAD_TEST_SPACE` set returns
 /// that reading instead.
 ///
 /// # Errors
