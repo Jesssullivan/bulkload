@@ -595,7 +595,7 @@ fn answer_batch(
             }),
         }
     }
-    let files: Vec<(PathBuf, u64)> = checked
+    let files: Vec<(PathBuf, (u64, u64))> = checked
         .iter()
         .map(|(want, found)| {
             (

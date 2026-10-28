@@ -322,8 +322,7 @@ mod darwin {
             let bytes = c_int::try_from(capacity.checked_mul(size_of::<pid_t>())?).ok()?;
             // SAFETY: `buffer` holds `capacity` pids, `bytes` bytes, writable
             // and live for the call.
-            let filled =
-                unsafe { libc::proc_listallpids(buffer.as_mut_ptr().cast(), bytes) };
+            let filled = unsafe { libc::proc_listallpids(buffer.as_mut_ptr().cast(), bytes) };
             let filled = usize::try_from(filled).ok()?;
             if filled == 0 {
                 return None;
