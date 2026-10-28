@@ -17,7 +17,8 @@ SPEC rules 1, 2, 5 and 6. R-N13.
 
 What each PR does is in its body. Facts a later lane needs:
 
-- Main still fails one test:
+- (Superseded 2026-10-28 by #339, which removed the lsof child; see
+  `2026-10-28-bl2-f1-retire-libproc.md`.) Main still fails one test:
   `source_command_registry::every_child_goes_through_the_source_safe_builder`,
   on the Darwin `lsof` child of `retire::held_open` (#327). A bypass for
   it takes `FROZEN` past its cap of 17, and the registry says a bypass is

@@ -23,6 +23,8 @@ The content proof, holder check and final descriptor-relative identity check rem
 Unknown holders still skip retirement. The fix does not raise descriptor limits.
 
 Darwin already uses `/usr/sbin/lsof` in the base commit `5b5efd7`.
+(Superseded 2026-10-28 by #339: Darwin now reads libproc and starts no
+child.)
 No PATH fallback or executable change was needed.
 
 ## Verification
