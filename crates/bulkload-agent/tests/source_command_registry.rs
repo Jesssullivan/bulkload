@@ -3645,6 +3645,10 @@ fn fixture_repository(repo: &Path) {
 /// Run the agent with the recording wrapper first on `PATH`.
 fn agent(path: &std::ffi::OsStr, args: &[&std::ffi::OsStr]) {
     let output = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .env("PATH", path)
         .args(args)
         .output()

@@ -138,6 +138,10 @@ fn agent(args: &[OsString]) -> Ran {
 /// [`agent`] with the child's environment set by `environ`.
 fn agent_with(args: &[OsString], environ: impl FnOnce(&mut Command)) -> Ran {
     let mut command = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"));
+    command.env(
+        bulkload_agent::space::TEST_SPACE_ENV,
+        bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+    );
     command.args(args);
     // The prefix machinery's fixtures write the legacy tracked targets; a
     // release agent never does (2026-10-21: CLAUDE.local.md only).
@@ -1146,6 +1150,10 @@ fn h19_the_blocks_commands_run_as_printed() {
     let world = World::new();
     let relative = |path: PathBuf| path.strip_prefix(&world.root).unwrap().to_path_buf();
     let out = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .current_dir(&world.root)
         .arg("estate-handoff")
         .args([

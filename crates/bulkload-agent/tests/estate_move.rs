@@ -49,6 +49,10 @@ struct Ran {
 
 fn agent(args: &[OsString]) -> Ran {
     let out = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .arg("--min-free-percent=0")
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -3425,6 +3429,10 @@ fn agent_over_ssh(args: &[OsString], fake_bin: &Path) -> Ran {
     let mut paths = vec![fake_bin.to_path_buf()];
     paths.extend(std::env::split_paths(&path));
     let out = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .arg("--min-free-percent=0")
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -3440,6 +3448,10 @@ fn agent_over_ssh(args: &[OsString], fake_bin: &Path) -> Ran {
 
 fn agent_home(args: &[OsString], home: &Path) -> Ran {
     let out = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .arg("--min-free-percent=0")
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -4212,6 +4224,10 @@ fn the_hand_off_never_modifies_a_tracked_file() {
     assert!(world.source().ok);
     // An earlier pass (the legacy targets) wrote its block into both.
     let legacy = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .arg("--min-free-percent=0")
         .args(os(&[
             &"estate-move",

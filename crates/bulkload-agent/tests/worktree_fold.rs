@@ -24,6 +24,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
+use bulkload_agent::space::{Space, TEST_SPACE_ENV, TEST_SPACE_ROOMY};
+
 const RULING: &str = "TIN-7491 test";
 const NAMESPACE: &str = "refs/kept-test-20261027";
 
@@ -95,7 +97,14 @@ struct Ran {
 }
 
 fn agent(globals: &[&str], args: &[&str]) -> Ran {
+    agent_at(TEST_SPACE_ROOMY, globals, args)
+}
+
+/// Run the binary with `reading` as its free-space reading (BL2-F5,
+/// TIN-3692 `952e2fb6`): no result depends on the host's disk.
+fn agent_at(reading: Space, globals: &[&str], args: &[&str]) -> Ran {
     let out = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(TEST_SPACE_ENV, reading.test_env_value())
         .args(globals)
         .args(args)
         .output()
@@ -206,6 +215,10 @@ impl Estate {
     }
 
     fn fold(&self, globals: &[&str], step: &str, rest: &[&str]) -> Ran {
+        self.fold_at(TEST_SPACE_ROOMY, globals, step, rest)
+    }
+
+    fn fold_at(&self, reading: Space, globals: &[&str], step: &str, rest: &[&str]) -> Ran {
         let mut args = vec![
             "worktree-fold",
             step,
@@ -217,7 +230,7 @@ impl Estate {
         if step != "plan" {
             args.extend_from_slice(&["--ruling", RULING]);
         }
-        agent(globals, &args)
+        agent_at(reading, globals, &args)
     }
 
     fn receipts(&self) -> String {
@@ -399,6 +412,92 @@ fn a_recent_write_or_a_process_inside_holds_the_worktree() {
         estate.receipts()
     );
     assert_eq!(estate.dotgit("same"), before);
+}
+
+// BL2-F5 (TIN-3692 `952e2fb6`): the fold's own floor, driven through the
+// faked reading on the `refs` step. That step has no live-process check,
+// which answers unknown on Darwin. 5% free of 1 GiB is under the fold's
+// default of 10% (BL2-Q3): the batch is held with `floor`, recorded
+// `from=default`, and nothing is carried. A flag under the reading carries
+// it, recorded `from=flag`. 20% free, with no flag, carries another
+// estate's batch at the default.
+#[test]
+fn the_fold_floor_is_judged_on_the_faked_reading_and_says_where_it_came_from() {
+    use bulkload_agent::git_carry::fold::DEFAULT_MIN_FREE_PERCENT;
+    assert_eq!(DEFAULT_MIN_FREE_PERCENT, 10, "BL2-Q3");
+    let gib_with = |available: u64| Space {
+        total: 1 << 30,
+        available,
+    };
+    let (tight, roomy) = (
+        gib_with(5 * (1 << 30) / 100),
+        gib_with(20 * (1 << 30) / 100),
+    );
+    let batches = |estate: &Estate| -> Vec<String> {
+        estate
+            .receipts()
+            .lines()
+            .filter(|line| line.contains("\tfold-refs\t") && line.contains("\tbatch-0\t"))
+            .map(str::to_owned)
+            .collect()
+    };
+    let carried = |estate: &Estate| {
+        g(
+            &estate.canonical,
+            &["for-each-ref", "--format=%(refname)", NAMESPACE],
+        )
+    };
+
+    let estate = Estate::new("floor");
+    let ran = estate.fold(&[], "plan", &["kc2-floor"]);
+    assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
+
+    // Below the default floor: held, nothing carried.
+    let ran = estate.fold_at(tight, &[], "refs", &[NAMESPACE]);
+    assert!(!ran.ok, "{}{}", ran.stdout, ran.stderr);
+    assert!(
+        ran.stderr.contains("DESTINATION_SPACE_INSUFFICIENT"),
+        "{}",
+        ran.stderr
+    );
+    assert_eq!(carried(&estate), "");
+    let held = batches(&estate);
+    assert!(
+        held.len() == 1
+            && held.iter().all(|row| row.ends_with(&format!(
+                "\tfloor\tmin_free_percent=10 from=default\t{RULING}"
+            ))),
+        "{held:?}"
+    );
+
+    // The flag lowers the floor under the same reading: carried.
+    let ran = estate.fold_at(tight, &["--min-free-percent=1"], "refs", &[NAMESPACE]);
+    assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
+    assert!(ran.stdout.contains("missing=0 extra=0"), "{}", ran.stdout);
+    let rows = batches(&estate);
+    assert!(
+        rows.len() == 2
+            && rows.last().is_some_and(|row| row.ends_with(&format!(
+                "\tpacked\tok\tmin_free_percent=1 from=flag\t{RULING}"
+            ))),
+        "{rows:?}"
+    );
+
+    // Above the default floor, with no flag: carried at the default.
+    let other = Estate::new("floor-roomy");
+    let ran = other.fold(&[], "plan", &["kc2-floor-roomy"]);
+    assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
+    let ran = other.fold_at(roomy, &[], "refs", &[NAMESPACE]);
+    assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
+    let rows = batches(&other);
+    assert!(
+        rows.len() == 1
+            && rows.iter().all(|row| row.ends_with(&format!(
+                "\tpacked\tok\tmin_free_percent=10 from=default\t{RULING}"
+            ))),
+        "{rows:?}"
+    );
+    assert_ne!(carried(&other), "");
 }
 
 #[test]

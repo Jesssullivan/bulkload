@@ -41,6 +41,10 @@ use gftb::{git, settle};
 
 fn agent(args: &[OsString]) -> (bool, String, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .output()

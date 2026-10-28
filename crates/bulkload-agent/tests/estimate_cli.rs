@@ -74,6 +74,10 @@ fn a_refused_pair_prints_its_own_line_and_the_rest_are_still_measured() {
     let plain = root.0.join("plain");
     std::fs::create_dir(&plain).unwrap();
     let result = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .arg("git-carry-estimate")
         .arg(&source)
         .arg(&destination)
@@ -167,6 +171,10 @@ fn run_pairs(bin: &Path, state: &Path, pairs: &[(PathBuf, String)]) -> (String, 
     let (mut stdout, mut stderr) = (String::new(), String::new());
     for batch in pairs.chunks(400) {
         let mut command = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"));
+        command.env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        );
         command
             .env("PATH", &path)
             .arg("git-carry-estimate")
@@ -346,6 +354,10 @@ fn an_invalid_locale_never_classifies_a_refusal() {
     );
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     let result = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .env("PATH", path)
         .env("LC_ALL", "xx_XX.UTF-8")
         .env("LANG", "xx_XX.UTF-8")

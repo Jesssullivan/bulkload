@@ -779,6 +779,10 @@ fn cli_refused_as_root() {
         let out = private_dir(&root.path().join("out"));
         let before = scan(&source.dir);
         let output = Command::new(agent())
+            .env(
+                bulkload_agent::space::TEST_SPACE_ENV,
+                bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+            )
             .arg("snapshot")
             .arg(&source.database)
             .arg(out.join("snapshot.sqlite"))
@@ -826,6 +830,10 @@ fn p75_unprivileged_probe() {
     }
     assert_ne!(effective_uid(), 0, "the probe runs after the drop");
     Command::new(agent())
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .arg("help")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -952,6 +960,10 @@ fn the_counters_line_reports_both_exceptions() {
         let source = build(root.path(), &case);
         let out = private_dir(&root.path().join("out"));
         let output = Command::new(agent())
+            .env(
+                bulkload_agent::space::TEST_SPACE_ENV,
+                bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+            )
             .arg("snapshot")
             .arg(&source.database)
             .arg(out.join("snapshot.sqlite"))

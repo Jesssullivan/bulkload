@@ -22,7 +22,9 @@ Facts a later lane needs:
 - `darwin-check` exits 1 on main for reasons outside this lane. PZM's
   `/nix` has about 20 GB free of 170 GB, below the 25% free-space floor,
   so about 160 estate, adopt, handoff and fold tests refuse there. Three
-  lib tests fail as recorded on 2026-10-24.
+  lib tests fail as recorded on 2026-10-24. Superseded 2026-10-28 by
+  BL2-F5 (#342): the tests fake the free-space reading, so the floor no
+  longer refuses them on PZM.
 - `just darwin-check` stops each integration group at its first failing
   binary. To see every binary on Darwin, run
   `cargo test -p bulkload-agent --tests --no-fail-fast`.

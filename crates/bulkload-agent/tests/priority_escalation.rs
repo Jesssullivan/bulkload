@@ -87,6 +87,10 @@ fn watcher_running(pid: u32) -> bool {
 /// PID while it waits. Then close its stdin; its stderr.
 fn idle_serve(flags: &[&str], probe: &dyn Fn(u32)) -> String {
     let mut child = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .args(flags)
         .arg("serve")
         .stdin(Stdio::piped())
@@ -169,6 +173,10 @@ fn no_watcher_runs_unless_asked_or_auto() {
 #[test]
 fn estate_capture_defaults_to_auto_and_records_what_it_found() {
     let out = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .arg("estate-capture")
         .output()
         .unwrap();
@@ -189,6 +197,10 @@ fn estate_capture_defaults_to_auto_and_records_what_it_found() {
     // An explicit class still wins and keeps the default watcher of the verb;
     // a bad threshold is refused.
     let out = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .args(["--priority=background", "estate-capture"])
         .output()
         .unwrap();
@@ -198,6 +210,10 @@ fn estate_capture_defaults_to_auto_and_records_what_it_found() {
         "{line}"
     );
     let out = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .args(["--escalate-after=soon", "estate-capture"])
         .output()
         .unwrap();

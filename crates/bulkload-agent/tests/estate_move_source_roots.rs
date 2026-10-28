@@ -40,6 +40,10 @@ fn agent(args: &[OsString]) -> Ran {
 /// [`agent`], with `first` ahead of the inherited `PATH`.
 fn agent_with_path(args: &[OsString], first: Option<&Path>) -> Ran {
     let mut command = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"));
+    command.env(
+        bulkload_agent::space::TEST_SPACE_ENV,
+        bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+    );
     command
         .arg("--min-free-percent=0")
         .args(args)

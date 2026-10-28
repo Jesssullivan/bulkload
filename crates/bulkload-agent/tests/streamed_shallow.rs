@@ -111,6 +111,10 @@ impl Fixture {
 
     fn agent(args: &[&str]) -> std::process::Output {
         Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+            .env(
+                bulkload_agent::space::TEST_SPACE_ENV,
+                bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+            )
             .arg("--min-free-percent=0")
             .args(args)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -427,6 +431,10 @@ fn a_home_mapped_main_keeps_original_handoff_provenance_on_rerun() {
     );
     let run = |args: &[&str], home: &Path| {
         Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+            .env(
+                bulkload_agent::space::TEST_SPACE_ENV,
+                bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+            )
             .arg("--min-free-percent=0")
             .args(args)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")

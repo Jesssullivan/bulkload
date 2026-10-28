@@ -227,6 +227,10 @@ fn fields(output: &str, prefix: &str) -> BTreeMap<String, String> {
 
 fn copy(base: &Path, mode: &str) -> std::process::Output {
     Command::new(agent())
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .arg(format!("--sqlite={mode}"))
         .arg("copy")
         .arg(base.join("source"))
@@ -391,6 +395,10 @@ fn a_tree_of_live_stores_is_carried_by_snapshot_and_reused_warm() {
 
     // The default, refuse: v5's refusals, and nothing published over them.
     let refuse = Command::new(agent())
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .arg("copy")
         .arg(&source)
         .arg(&destination)
@@ -433,6 +441,10 @@ fn sqlite_carry_unprivileged_probe() {
     }
     assert_ne!(effective_uid(), 0, "the probe runs after the drop");
     Command::new(agent())
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .arg("help")
         .stdout(Stdio::null())
         .stderr(Stdio::null())

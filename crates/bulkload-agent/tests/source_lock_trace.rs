@@ -1107,6 +1107,10 @@ fn a_served_source_in_its_own_process_takes_no_lock() {
 
     let stderr = scratch.path("serve.stderr");
     let mut child = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .arg("serve")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2911,6 +2915,10 @@ fn p84_a_copy_and_a_serve_leave_no_source_extent_shared() {
     fs::create_dir(&served).unwrap();
     let stderr = scratch.path("serve.stderr");
     let mut child = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .arg("serve")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

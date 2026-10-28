@@ -32,6 +32,10 @@ impl Scratch {
 
     fn copy(&self, extend: Option<&str>) -> (bool, String, String) {
         let mut command = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"));
+        command.env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        );
         command.arg("copy").args(
             ["source", "destination", "source-state", "destination-state"]
                 .map(|name| self.path(name)),

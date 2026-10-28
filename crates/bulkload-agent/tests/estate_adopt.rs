@@ -70,6 +70,10 @@ fn agent(args: &[OsString]) -> Ran {
 
 fn agent_with(args: &[OsString], envs: &[(&str, &std::ffi::OsStr)]) -> Ran {
     let out = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .env(
+            bulkload_agent::space::TEST_SPACE_ENV,
+            bulkload_agent::space::TEST_SPACE_ROOMY.test_env_value(),
+        )
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         // The hand-off fixtures (p117, p122) use the legacy tracked targets.
