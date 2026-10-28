@@ -237,6 +237,195 @@ const fn scan_holders(
     Ok(None)
 }
 
+/// The (device, inode) of every vnode a process other than this one holds
+/// open through a descriptor; `None` when that cannot be said.
+///
+/// Darwin reads it in this process through libproc, with no child process
+/// (BL2-F1, Linear TIN-3692 `c10e9bec`: the registry admits no new child):
+/// `proc_listallpids`, then each process's `PROC_PIDLISTFDS` and, for each
+/// vnode descriptor, `PROC_PIDFDVNODEINFO`. The device is sign-extended as
+/// `io::sys` does for `st_dev`, so it equals a stat's. A process that exited,
+/// or whose descriptors this user may not read (another user's), is
+/// skipped, as Linux skips the `/proc` links it cannot read; any other
+/// failure answers `None`. A descriptor closed between the two reads is
+/// skipped. Memory mappings are not descriptors and are not seen, as on
+/// Linux.
+#[cfg(target_vendor = "apple")]
+#[must_use]
+pub fn open_vnodes() -> Option<std::collections::HashSet<(u64, u64)>> {
+    darwin::open_vnodes()
+}
+
+#[cfg(target_vendor = "apple")]
+mod darwin {
+    use std::collections::HashSet;
+    use std::mem::size_of;
+
+    use libc::{c_int, pid_t};
+
+    /// `PROC_PIDFDVNODEINFO` (`sys/proc_info.h`); libc does not export it.
+    const PROC_PIDFDVNODEINFO: c_int = 1;
+
+    /// `struct proc_fileinfo` (`sys/proc_info.h`), with its C field names.
+    /// The kernel writes it; only the layout is used.
+    #[repr(C)]
+    #[allow(dead_code, clippy::struct_field_names)]
+    struct ProcFileinfo {
+        fi_openflags: u32,
+        fi_status: u32,
+        fi_offset: libc::off_t,
+        fi_type: i32,
+        fi_guardflags: u32,
+    }
+
+    /// `struct vnode_fdinfo` (`sys/proc_info.h`), `PROC_PIDFDVNODEINFO_SIZE`
+    /// bytes. Only `pvi` is read.
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct VnodeFdinfo {
+        pfi: ProcFileinfo,
+        pvi: libc::vnode_info,
+    }
+
+    const _: () = assert!(size_of::<VnodeFdinfo>() == 176);
+
+    /// How many times a list that filled its whole buffer is read again
+    /// with twice the room.
+    const GROWTHS: usize = 4;
+
+    pub(super) fn open_vnodes() -> Option<HashSet<(u64, u64)>> {
+        let own = pid_t::try_from(std::process::id()).ok()?;
+        let mut open = HashSet::new();
+        for pid in pids()? {
+            if pid <= 0 || pid == own {
+                continue;
+            }
+            for fd in descriptors(pid)? {
+                if fd.proc_fdtype == libc::PROX_FDTYPE_VNODE.cast_unsigned() {
+                    if let Some(node) = vnode(pid, fd.proc_fd) {
+                        open.insert(node);
+                    }
+                }
+            }
+        }
+        Some(open)
+    }
+
+    /// Every pid, or `None`.
+    fn pids() -> Option<Vec<pid_t>> {
+        // SAFETY: a null buffer of size 0 asks only for an estimate of the
+        // count; nothing is written.
+        let estimate = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        let mut capacity = usize::try_from(estimate).ok()?.checked_add(64)?;
+        for _ in 0..GROWTHS {
+            let mut buffer: Vec<pid_t> = vec![0; capacity];
+            let bytes = c_int::try_from(capacity.checked_mul(size_of::<pid_t>())?).ok()?;
+            // SAFETY: `buffer` holds `capacity` pids, `bytes` bytes, writable
+            // and live for the call.
+            let filled = unsafe { libc::proc_listallpids(buffer.as_mut_ptr().cast(), bytes) };
+            let filled = usize::try_from(filled).ok()?;
+            if filled == 0 {
+                return None;
+            }
+            if filled < capacity {
+                buffer.truncate(filled);
+                return Some(buffer);
+            }
+            capacity = capacity.checked_mul(2)?;
+        }
+        None
+    }
+
+    /// The descriptors of `pid`, none when it exited or is not this user's
+    /// to read; `None` when nothing can be said.
+    fn descriptors(pid: pid_t) -> Option<Vec<libc::proc_fdinfo>> {
+        let entry = size_of::<libc::proc_fdinfo>();
+        clear_errno();
+        // SAFETY: a null buffer of size 0 asks only for the size needed;
+        // nothing is written.
+        let needed =
+            unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+        if needed <= 0 {
+            return failed();
+        }
+        let mut capacity = (usize::try_from(needed).ok()? / entry).checked_add(16)?;
+        for _ in 0..GROWTHS {
+            let mut buffer = vec![
+                libc::proc_fdinfo {
+                    proc_fd: 0,
+                    proc_fdtype: 0,
+                };
+                capacity
+            ];
+            let bytes = c_int::try_from(capacity.checked_mul(entry)?).ok()?;
+            clear_errno();
+            // SAFETY: `buffer` holds `capacity` entries, `bytes` bytes,
+            // writable and live for the call.
+            let filled = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDLISTFDS,
+                    0,
+                    buffer.as_mut_ptr().cast(),
+                    bytes,
+                )
+            };
+            if filled <= 0 {
+                return failed();
+            }
+            let count = usize::try_from(filled).ok()? / entry;
+            if count < capacity {
+                buffer.truncate(count);
+                return Some(buffer);
+            }
+            capacity = capacity.checked_mul(2)?;
+        }
+        None
+    }
+
+    /// After a libproc call returned no bytes: a process with no
+    /// descriptors, one that exited, or another user's, is skipped. Any
+    /// other failure says nothing.
+    fn failed<T>() -> Option<Vec<T>> {
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(0 | libc::ESRCH | libc::EPERM) => Some(Vec::new()),
+            _ => None,
+        }
+    }
+
+    /// The (device, inode) behind `fd` of `pid`; `None` when the
+    /// descriptor is gone or is no longer a vnode.
+    fn vnode(pid: pid_t, fd: i32) -> Option<(u64, u64)> {
+        // SAFETY: `VnodeFdinfo` holds only integers and integer arrays, for
+        // which all zero bits are a valid value.
+        let mut info: VnodeFdinfo = unsafe { std::mem::zeroed() };
+        let size = c_int::try_from(size_of::<VnodeFdinfo>()).ok()?;
+        // SAFETY: `info` is `size` bytes, writable and live for the call.
+        let filled = unsafe {
+            libc::proc_pidfdinfo(pid, fd, PROC_PIDFDVNODEINFO, (&raw mut info).cast(), size)
+        };
+        if filled != size {
+            return None;
+        }
+        let stat = &info.pvi.vi_stat;
+        Some((
+            i64::from(stat.vst_dev.cast_signed()).cast_unsigned(),
+            stat.vst_ino,
+        ))
+    }
+
+    /// Zero this thread's `errno`, so a call that returns 0 without an
+    /// error is told apart from one that failed.
+    fn clear_errno() {
+        // SAFETY: `__error` takes no arguments and returns this thread's
+        // errno slot.
+        let slot = unsafe { libc::__error() };
+        // SAFETY: `slot` is this thread's errno, a valid, aligned `c_int`
+        // that lives as long as the thread.
+        unsafe { *slot = 0 };
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     #![allow(clippy::unwrap_used)]

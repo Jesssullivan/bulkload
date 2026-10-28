@@ -310,10 +310,11 @@ fn only_a_provably_held_unchanged_source_file_goes_and_nothing_else_changes() {
 
 #[test]
 #[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "whether a process holds a file is told on Linux (and Darwin's lsof)"
+    not(any(target_os = "linux", target_vendor = "apple")),
+    ignore = "whether a process holds a file is told on Linux (/proc) and Darwin (libproc)"
 )]
 fn a_file_another_process_holds_open_is_skipped_and_left() {
+    use std::io::BufRead as _;
     let world = World::new();
     std::fs::write(world.source.join("sessions/open.jsonl"), b"{\"a\":1}\n").unwrap();
     std::fs::write(
@@ -323,28 +324,23 @@ fn a_file_another_process_holds_open_is_skipped_and_left() {
     .unwrap();
     world.record("outputs", "sessions/open.jsonl");
     world.closure(&[]);
-    // A child that holds the file open until its stdin closes.
+    // A child that holds the file open until its stdin closes. It says
+    // `open` once the descriptor is open, so no platform's process table is
+    // polled here.
     let mut child = std::process::Command::new("sh")
         .arg("-c")
-        .arg("exec 3<\"$1\"; read line")
+        .arg("exec 3<\"$1\" && echo open && read line")
         .arg("sh")
         .arg(world.source.join("sessions/open.jsonl"))
         .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let mut opened = false;
-    for _ in 0..200 {
-        let fds = std::fs::read_dir(format!("/proc/{}/fd", child.id())).unwrap();
-        if fds.filter_map(std::result::Result::ok).any(|fd| {
-            std::fs::read_link(fd.path())
-                .is_ok_and(|to| to == world.source.join("sessions/open.jsonl"))
-        }) {
-            opened = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(opened);
+    let mut said = String::new();
+    std::io::BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut said)
+        .unwrap();
+    assert_eq!(said, "open\n");
     let done = world.run(false);
     drop(child.stdin.take());
     child.wait().unwrap();
