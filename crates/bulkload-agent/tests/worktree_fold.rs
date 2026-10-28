@@ -415,81 +415,89 @@ fn a_recent_write_or_a_process_inside_holds_the_worktree() {
 }
 
 // BL2-F5 (TIN-3692 `952e2fb6`): the fold's own floor, driven through the
-// faked reading. 5% free of 1 GiB is under the fold's default (10%,
-// BL2-Q3): the worktree is held with `floor`, recorded `from=default`. A
-// flag under the reading moves it, recorded `from=flag`. 20% free, with no
-// flag, moves another at the default.
+// faked reading on the `refs` step, which has no live-process check (that
+// check answers unknown on Darwin). 5% free of 1 GiB is under the fold's
+// default (10%, BL2-Q3): the batch is held with `floor`, recorded
+// `from=default`, and nothing is carried. A flag under the reading carries
+// it, recorded `from=flag`. 20% free, with no flag, carries another
+// estate's batch at the default.
 #[test]
 fn the_fold_floor_is_judged_on_the_faked_reading_and_says_where_it_came_from() {
     use bulkload_agent::git_carry::fold::DEFAULT_MIN_FREE_PERCENT;
     assert_eq!(DEFAULT_MIN_FREE_PERCENT, 10, "BL2-Q3");
-    let estate = Estate::new("floor");
-    age(&estate.scratch.0);
-    let free = ["--min-free-percent=0"];
-    for (step, rest) in [
-        ("plan", vec!["kc2-floor"]),
-        ("refs", vec![NAMESPACE]),
-        ("objects", vec![]),
-    ] {
-        let ran = estate.fold(&free, step, &rest);
-        assert!(ran.ok, "{step}: {}{}", ran.stdout, ran.stderr);
-    }
     let gib_with = |available: u64| Space {
         total: 1 << 30,
         available,
     };
-    let rows = |estate: &Estate, leaf: &str| -> Vec<String> {
-        let path = estate.worktree(leaf);
-        let path = path.to_str().unwrap();
+    let (tight, roomy) = (
+        gib_with(5 * (1 << 30) / 100),
+        gib_with(20 * (1 << 30) / 100),
+    );
+    let batches = |estate: &Estate| -> Vec<String> {
         estate
             .receipts()
             .lines()
-            .filter(|line| line.contains("\tattach\t") && line.contains(path))
+            .filter(|line| line.contains("\tfold-refs\t") && line.contains("\tbatch-0\t"))
             .map(str::to_owned)
             .collect()
     };
+    let carried = |estate: &Estate| {
+        g(
+            &estate.canonical,
+            &["for-each-ref", "--format=%(refname)", NAMESPACE],
+        )
+    };
 
-    // Below the default floor: held, nothing moved.
-    let before = estate.dotgit("same");
-    let ran = estate.fold_at(gib_with(5 * (1 << 30) / 100), &[], "attach", &["same"]);
+    let estate = Estate::new("floor");
+    let ran = estate.fold(&[], "plan", &["kc2-floor"]);
+    assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
+
+    // Below the default floor: held, nothing carried.
+    let ran = estate.fold_at(tight, &[], "refs", &[NAMESPACE]);
     assert!(!ran.ok, "{}{}", ran.stdout, ran.stderr);
-    assert_eq!(estate.dotgit("same"), before);
-    let held = rows(&estate, "same");
     assert!(
-        held.iter().any(|row| row.contains("\tfloor\t")
-            && row.ends_with(&format!("\tmin_free_percent=10 from=default\t{RULING}"))),
+        ran.stderr.contains("DESTINATION_SPACE_INSUFFICIENT"),
+        "{}",
+        ran.stderr
+    );
+    assert_eq!(carried(&estate), "");
+    let held = batches(&estate);
+    assert!(
+        held.len() == 1
+            && held.iter().all(|row| row.ends_with(&format!(
+                "\tfloor\tmin_free_percent=10 from=default\t{RULING}"
+            ))),
         "{held:?}"
     );
 
-    // The flag lowers the floor under the same reading: it moves.
-    let ran = estate.fold_at(
-        gib_with(5 * (1 << 30) / 100),
-        &["--min-free-percent=1"],
-        "attach",
-        &["same"],
-    );
+    // The flag lowers the floor under the same reading: carried.
+    let ran = estate.fold_at(tight, &["--min-free-percent=1"], "refs", &[NAMESPACE]);
     assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
-    assert!(ran.stdout.contains("moved-attach=1"), "{}", ran.stdout);
-    assert_ne!(estate.dotgit("same"), before);
-    let moved = rows(&estate, "same");
+    assert!(ran.stdout.contains("missing=0 extra=0"), "{}", ran.stdout);
+    let rows = batches(&estate);
     assert!(
-        moved
-            .iter()
-            .any(|row| !row.contains("\tfloor\t")
-                && row.contains("\tmin_free_percent=1 from=flag\t")),
-        "{moved:?}"
+        rows.len() == 2
+            && rows.last().is_some_and(|row| row.ends_with(&format!(
+                "\tpacked\tok\tmin_free_percent=1 from=flag\t{RULING}"
+            ))),
+        "{rows:?}"
     );
 
-    // Above the default floor, with no flag: it moves at the default.
-    let ran = estate.fold_at(gib_with(20 * (1 << 30) / 100), &[], "attach", &["moved"]);
+    // Above the default floor, with no flag: carried at the default.
+    let other = Estate::new("floor-roomy");
+    let ran = other.fold(&[], "plan", &["kc2-floor-roomy"]);
     assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
-    let moved = rows(&estate, "moved");
+    let ran = other.fold_at(roomy, &[], "refs", &[NAMESPACE]);
+    assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
+    let rows = batches(&other);
     assert!(
-        !moved.is_empty()
-            && moved.iter().all(|row| !row.contains("\tfloor\t")
-                && row.contains("\tmin_free_percent=10 from=default\t")),
-        "{moved:?}"
+        rows.len() == 1
+            && rows.iter().all(|row| row.ends_with(&format!(
+                "\tpacked\tok\tmin_free_percent=10 from=default\t{RULING}"
+            ))),
+        "{rows:?}"
     );
+    assert_ne!(carried(&other), "");
 }
 
 #[test]
