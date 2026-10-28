@@ -47,6 +47,8 @@ locally for a `-` host. For each candidate:
 - No process may hold it open. Linux checks `/proc`; Darwin runs
   `/usr/sbin/lsof -F i` and matches by inode. Exit 1 counts as "none
   open" only with nothing on stderr. If that cannot be told, the file is skipped.
+  (Superseded 2026-10-28 by #339: Darwin reads libproc in the agent's own
+  process and matches by device and inode. No lsof child remains.)
 - When the proof is BLAKE3, the source file's BLAKE3 must equal the
   destination's, and its identity must be unchanged across the read.
 - The identity is checked once more, then `unlinkat` removes that one name
@@ -84,6 +86,7 @@ archive.
 
 ## Not proven here
 
-The Darwin `lsof` path has not been built or run: pzm is on hold and neo
+(Superseded 2026-10-28 by #339: the lsof path is gone, and the libproc
+path passed `darwin-check` on pzm.) The Darwin `lsof` path has not been built or run: pzm is on hold and neo
 is never a build host. The coordinator pair-builds the verb and runs it
 with `--dry-run` first.
