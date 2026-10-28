@@ -2765,6 +2765,49 @@ fn every_child_goes_through_the_source_safe_builder() {
     );
 }
 
+/// BL2-F1 (Linear TIN-3692 `c10e9bec`): `pull-retire-source` tells whether a
+/// process holds a file without a child, on Linux from `/proc` and on
+/// Darwin from libproc. Both modules are scanned, a platform `cfg` hides no
+/// child from the scan, and neither module builds one. The Darwin `lsof`
+/// child of #327 is the case: it is refused, and no bypass may admit it.
+#[test]
+fn the_holder_check_of_retire_builds_no_child_on_any_platform() {
+    let sources = workspace_sources();
+    let sites = all_sites(&sources);
+    for module in ["agent::retire", "agent::procs"] {
+        assert!(
+            sources.iter().any(|source| source.module == module),
+            "{module} not scanned"
+        );
+        let prefix = format!("{module}::");
+        let children: Vec<&str> = sites
+            .iter()
+            .filter(|site| site.id.starts_with(&prefix))
+            .map(|site| site.id.as_str())
+            .collect();
+        assert!(children.is_empty(), "{module} builds {children:?}");
+    }
+
+    let lsof = synthetic(
+        "agent::retire",
+        "fn held_open(files: &[(PathBuf, (u64, u64))]) -> Option<HashSet<usize>> {\n\
+         #[cfg(target_vendor = \"apple\")]\n\
+         { let output = std::process::Command::new(\"/usr/sbin/lsof\")\n\
+         .args([\"-w\", \"-F\", \"i\", \"--\"]).output().ok()?; }\n\
+         None }\n",
+    );
+    assert_eq!(ids(&lsof), ["agent::retire::held_open(\"/usr/sbin/lsof\")"]);
+    let found = registry_breaches(&all_sites(&[lsof]), BYPASSES);
+    assert!(
+        found.iter().any(|breach| breach.contains("not registered")),
+        "{found:?}"
+    );
+    assert!(
+        !FROZEN.iter().any(|id| id.starts_with("agent::retire::")),
+        "FROZEN admits a retire child"
+    );
+}
+
 /// The builder functions on the bypass list are called only where
 /// registered, with only the registered arguments: the probe children run
 /// the probe script and nothing else.

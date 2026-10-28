@@ -151,7 +151,7 @@ SUBCOMMANDS:
                 over pull's ssh builder, or here for a local source)
                 re-checks each file: beneath the root through no link, a
                 regular file of a recorded identity, held open by no process
-                (Linux /proc, Darwin lsof; unknown skips), its BLAKE3 the
+                (Linux /proc, Darwin libproc; unknown skips), its BLAKE3 the
                 destination's when that is the proof, its identity again
                 just before unlinkat. Anything else is skipped, typed, and
                 left. One receipt line per file is appended to

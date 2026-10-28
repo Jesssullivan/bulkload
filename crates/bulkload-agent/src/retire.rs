@@ -27,10 +27,10 @@
 //! ssh builder) re-verifies each file at removal time and removes only that
 //! file: its path is opened beneath the source root following no link; it
 //! must be a regular file whose identity is one recorded; no process may
-//! hold it open (Linux: `/proc`; Darwin: `lsof`; elsewhere, or when that
-//! cannot be said, it is skipped); its BLAKE3 must equal the destination's
-//! when that is the proof; and its identity is checked again just before
-//! the `unlinkat`. Anything else skips it with a typed reason and leaves it.
+//! hold it open (Linux: `/proc`; Darwin: libproc, read in this process;
+//! elsewhere, or when that cannot be said, it is skipped); its BLAKE3 must
+//! equal the destination's when that is the proof; and its identity is
+//! checked again just before the `unlinkat`. Anything else skips it with a typed reason and leaves it.
 //! Nothing on the destination or in an archive is ever written; the run's
 //! receipt lines are appended to `DEST_STATE/retire-source.receipts`.
 //! `--dry-run` answers every check and removes nothing.
@@ -48,7 +48,6 @@ const SITE: &str = "retire";
 /// Each checked candidate holds its parent directory open until its final
 /// identity check. Use at most a quarter of the soft descriptor limit,
 /// leaving the rest for existing handles, the holder probe and traversal.
-/// The cap keeps Darwin's `lsof` arguments within its existing batch size.
 fn check_batch(soft_limit: u64) -> usize {
     usize::try_from((soft_limit / 4).clamp(1, 200)).unwrap_or(16)
 }
@@ -414,9 +413,9 @@ pub fn plan(state: &Path, ledger: Option<&Path>, dry_run: bool) -> Result<Plan> 
     }
 }
 
-/// Which of `files` (path, inode) a process holds open, by index; `None`
-/// when this platform cannot say.
-fn held_open(files: &[(PathBuf, u64)]) -> Option<HashSet<usize>> {
+/// Which of `files` (path, (device, inode)) a process holds open, by
+/// index; `None` when this platform cannot say.
+fn held_open(files: &[(PathBuf, (u64, u64))]) -> Option<HashSet<usize>> {
     #[cfg(target_os = "linux")]
     {
         let mut held = HashSet::new();
@@ -429,40 +428,15 @@ fn held_open(files: &[(PathBuf, u64)]) -> Option<HashSet<usize>> {
     }
     #[cfg(target_vendor = "apple")]
     {
-        // `lsof -F i` names the inode of each open instance of the files it
-        // is given (matched by inode, not by a path spelling); exit 1 with
-        // nothing on stderr when it finds none. Any other status, anything
-        // on stderr, or no lsof, says nothing.
-        let mut open: HashSet<u64> = HashSet::new();
-        for chunk in files.chunks(200) {
-            let output = std::process::Command::new("/usr/sbin/lsof")
-                .args(["-w", "-F", "i", "--"])
-                .args(chunk.iter().map(|(path, _)| path))
-                .stdin(std::process::Stdio::null())
-                .output()
-                .ok()?;
-            // 1 is also lsof's error status: it counts as "none open" only
-            // when lsof said nothing on stderr.
-            match output.status.code() {
-                Some(0) => {}
-                Some(1) if output.stderr.is_empty() => {}
-                _ => return None,
-            }
-            for line in output.stdout.split(|byte| *byte == b'\n') {
-                if let Some(inode) = line
-                    .strip_prefix(b"i")
-                    .and_then(|inode| std::str::from_utf8(inode).ok())
-                    .and_then(|inode| inode.parse::<u64>().ok())
-                {
-                    open.insert(inode);
-                }
-            }
-        }
+        // Matched by device and inode, never by a path spelling, from the
+        // descriptors libproc lists in this process: no child is started
+        // (BL2-F1, Linear TIN-3692 `c10e9bec`).
+        let open = crate::procs::open_vnodes()?;
         Some(
             files
                 .iter()
                 .enumerate()
-                .filter(|(_, (_, inode))| open.contains(inode))
+                .filter(|(_, (_, node))| open.contains(node))
                 .map(|(index, _)| index)
                 .collect(),
         )
@@ -623,7 +597,12 @@ fn answer_batch(
     }
     let files: Vec<(PathBuf, u64)> = checked
         .iter()
-        .map(|(want, found)| (path_of(base, &want.rel), found.stat.node.ino))
+        .map(|(want, found)| {
+            (
+                path_of(base, &want.rel),
+                (found.stat.node.dev, found.stat.node.ino),
+            )
+        })
         .collect();
     let held = held_open(&files);
     for (index, (want, found)) in checked.into_iter().enumerate() {
